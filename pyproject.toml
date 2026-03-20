@@ -6,16 +6,46 @@ build-backend = "hatchling.build"
 name = "pdf-gantry"
 version = "0.1.0"
 description = "Agent-friendly CLI for managing academic PDF libraries"
-readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "click>=8.1",
+    "sqlite-vec>=0.1.6",
+    "pymupdf>=1.25",
+    "pymupdf4llm>=0.0.17",
+    "pyyaml>=6.0",
     "rich>=13.0",
-    "tomli>=2.0; python_version < '3.11'",
 ]
+
+[project.optional-dependencies]
+quality = [
+    "marker-pdf>=1.10",
+]
+ocr = [
+    "surya-ocr>=0.8",
+]
+embeddings = [
+    "sentence-transformers>=3.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.8",
+]
+all = ["pdf-gantry[quality,ocr,embeddings,dev]"]
 
 [project.scripts]
 gantry = "pdf_gantry.cli:cli"
 
 [tool.hatch.build.targets.wheel]
-packages = ["pdf_gantry"]
+packages = ["src/pdf_gantry"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
