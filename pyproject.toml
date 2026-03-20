@@ -8,40 +8,14 @@ version = "0.1.0"
 description = "Agent-friendly CLI for managing academic PDF libraries"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
 dependencies = [
     "click>=8.1",
     "rich>=13.0",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
     "tomli>=2.0; python_version < '3.11'",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "ruff>=0.4",
-    "mypy>=1.10",
 ]
 
 [project.scripts]
 gantry = "pdf_gantry.cli:cli"
-pdf-gantry = "pdf_gantry.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pdf_gantry"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-
-[tool.mypy]
-python_version = "3.11"
-strict = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

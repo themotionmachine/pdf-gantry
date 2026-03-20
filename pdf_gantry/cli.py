@@ -38,7 +38,7 @@ def status() -> None:
 
 
 @cli.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("path", type=click.Path(dir_okay=False))
 @click.option("--force", is_flag=True, help="Re-process even if already indexed.")
 def process(path: str, force: bool) -> None:
     """Process a PDF: extract text, generate markdown, compute embeddings."""
@@ -57,14 +57,9 @@ def ingest() -> None:
     pass
 
 
-@cli.group()
-def config() -> None:
-    """Show or set configuration values."""
-
-
-@config.command("show")
-def config_show() -> None:
-    """Print current configuration."""
+@cli.command("config")
+def config_cmd() -> None:
+    """Show current configuration. Use subcommands to set values."""
     cfg = load_config()
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("key", style="bold cyan")
@@ -73,14 +68,6 @@ def config_show() -> None:
     table.add_row("index_dir", str(cfg.index_dir))
     table.add_row("vault_dir", str(cfg.vault_dir) if cfg.vault_dir else "(not set)")
     console.print(table)
-
-
-@config.command("set")
-@click.argument("key")
-@click.argument("value")
-def config_set(key: str, value: str) -> None:
-    """Set a configuration value (persisted via env var or config file)."""
-    pass
 
 
 @cli.group()
