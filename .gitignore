@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Runtime data (the index lives in ~/.pdf-gantry, not in the repo)
+*.db
+*.faiss
+*.pkl
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
