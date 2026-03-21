@@ -30,6 +30,8 @@ def build_filter_query(
                 conditions.append("has_embeddings = 0")
             elif n == "ocr":
                 conditions.append("needs_ocr = 1 AND ocr_completed_at IS NULL")
+            elif n == "chunk_embeddings":
+                conditions.append("has_chunk_embeddings = 0")
             elif n == "metadata":
                 conditions.append("(doi IS NULL OR metadata_enriched_at IS NULL)")
 
@@ -41,6 +43,8 @@ def build_filter_query(
                 conditions.append("has_markdown = 1")
             elif h == "embeddings":
                 conditions.append("has_embeddings = 1")
+            elif h == "chunk_embeddings":
+                conditions.append("has_chunk_embeddings = 1")
             elif h == "errors":
                 conditions.append("error_count > 0")
 

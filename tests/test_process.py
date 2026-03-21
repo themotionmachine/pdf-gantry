@@ -104,3 +104,27 @@ def test_paper_text_stored(tmp_path, papers_dir):
         assert row["markdown_length"] > 0
     conn2.close()
     conn.close()
+
+
+def test_chunks_generated_after_processing(tmp_path, papers_dir):
+    """Processing generates chunks in the chunks table."""
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+
+    ingest_directory(conn, papers_dir)
+    process_documents(conn, papers_dir, db_path, workers=1)
+
+    conn2 = get_connection(str(db_path))
+    chunk_count = conn2.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    assert chunk_count > 0
+
+    # Each paper should have at least one chunk
+    papers = conn2.execute("SELECT id FROM papers WHERE has_text = 1").fetchall()
+    for paper in papers:
+        count = conn2.execute(
+            "SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (paper["id"],)
+        ).fetchone()[0]
+        assert count >= 1
+
+    conn2.close()
+    conn.close()

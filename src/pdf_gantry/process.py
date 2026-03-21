@@ -25,8 +25,8 @@ def extract_text_pymupdf(pdf_path: Path) -> tuple[str, str]:
     doc.close()
     raw_text = "\n".join(raw_pages)
 
-    # Markdown extraction
-    markdown = pymupdf4llm.to_markdown(str(pdf_path))
+    # Markdown extraction — table_strategy="lines" handles booktabs-style tables
+    markdown = pymupdf4llm.to_markdown(str(pdf_path), table_strategy="lines")
 
     return raw_text, markdown
 
@@ -91,10 +91,28 @@ def _process_single(
             (paper_id, row["filename"] or "", row["title"] or "", row["authors"] or "", row["abstract"] or "", raw_text),
         )
 
-        # Update processing flags
+        # Generate and store chunks
+        from .chunking import chunk_markdown
+        raw_chunks = chunk_markdown(markdown, title=row["title"])
+
+        # Clear old chunks (and their embeddings — vec0 has no CASCADE)
+        conn.execute(
+            "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+            (paper_id,),
+        )
+        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (paper_id,))
+
+        for i, chunk in enumerate(raw_chunks):
+            conn.execute(
+                """INSERT INTO chunks (doc_id, chunk_index, section_header, page_start, text, char_offset)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (paper_id, i, chunk.section_header, chunk.page_start, chunk.text, chunk.char_offset),
+            )
+
+        # Update processing flags (reset chunk embeddings since chunks changed)
         conn.execute(
             """UPDATE papers SET
-                has_text = 1, has_markdown = 1,
+                has_text = 1, has_markdown = 1, has_chunk_embeddings = 0,
                 text_method = ?, text_extracted_at = ?,
                 markdown_method = ?, markdown_extracted_at = ?,
                 updated_at = ?
