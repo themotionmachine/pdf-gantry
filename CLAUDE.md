@@ -51,3 +51,27 @@ Entry point: `gantry` → `pdf_gantry.cli:cli()` (Click group).
 **Exit codes:** 0=success, 1=error, 2=no results, 3=partial failure, 4=db error.
 
 **Every command supports `--json`** for structured output (to stdout; progress bars go to stderr).
+
+## Design Direction: Composable Agent Primitives
+
+Gantry's primary role is as a retrieval interface that shapes what an agent can know and how efficiently it can know it. The CLI should evolve toward a *query algebra* — composable operations that let agents chain retrieval steps without full serialization/deserialization round-trips or redundant context at each step.
+
+Current commands are independent. The gap is in composition: an agent today must parse full JSON output from one command to feed IDs into the next. Future primitives should support patterns like:
+
+- **ID-set piping** — `gantry search "X" --ids-only` outputs bare IDs that chain directly into other commands, avoiding full result parsing between steps
+- **Batch context retrieval** — "give me the top-scoring chunk from each of these N papers" in one call, not N calls
+- **Scoped context windows** — "give me K tokens of context around this chunk" so agents can zoom in without retrieving whole documents
+- **Cross-paper queries** — "which of these papers discuss topic X?" as a single filtered operation rather than N searches composed post-hoc
+
+Chunk-level embeddings (#2) are the substrate for this. Once chunks are addressable units, operations can be composed at chunk granularity — retrieve, filter, expand, compare — without agents touching raw PDFs or managing their own context windows. Every new command or flag should be evaluated against this principle: does it admit composition, and does it save tokens?
+
+## Next Steps
+
+All three PRD phases are structurally complete but untested against real data. Anticipated work:
+
+1. **Real corpus testing.** Ingest the ~2000 PDFs and fix edge cases: encrypted PDFs, zero-byte files, exotic encodings, special-character filenames. The iCloud dataless file fix (#1) was the first of these.
+2. **Tune scanned/digital classifier.** Current thresholds (0.05/0.15) were calibrated on synthetic PDFs. Two-column layouts, figure-heavy papers, and sparse title pages will likely misclassify. Spot-check with `gantry queue --is scanned`.
+3. **Test optional dependencies end-to-end.** Embeddings (sentence-transformers + Nomic), Marker, and Surya are wired up but haven't run on real data with real models. Expect integration issues around model downloads, memory, and Metal acceleration.
+4. **Search quality iteration.** Whole-document embeddings lose nuance for long papers — may need text chunking. RRF k parameter may need tuning. Possible new commands: `gantry read <filename>` to dump markdown, `gantry find <fragment>` for fuzzy filename lookup.
+5. **Workflow integration.** Test usage from Claude Code sessions. May surface needs for richer `--json` output, a `gantry summary` command, or other agent-oriented features.
+6. **Vault integration polish.** Real vaults have aliases, nested folders, varied reference conventions. May need refined reference extraction and a `gantry vault suggest` command for papers without notes.
