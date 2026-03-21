@@ -43,6 +43,33 @@ class SearchResult:
 
 
 @dataclass
+class Chunk:
+    """A text chunk from a document."""
+    chunk_id: int
+    doc_id: int
+    chunk_index: int
+    section_header: str | None
+    page_start: int | None
+    text: str
+    char_offset: int = 0
+
+
+@dataclass
+class ChunkResult:
+    """A search result at the chunk level."""
+    chunk_id: int
+    doc_id: int
+    chunk_index: int
+    section_header: str | None
+    page_start: int | None
+    chunk_text: str
+    score: float
+    filename: str
+    path: str
+    title: str | None = None
+
+
+@dataclass
 class IngestStats:
     """Statistics from an ingest operation."""
     total_pdfs: int = 0
@@ -72,5 +99,6 @@ class StatusInfo:
     with_embeddings: int = 0
     needs_ocr: int = 0
     has_errors: int = 0
+    with_chunk_embeddings: int = 0
     db_size_bytes: int = 0
     db_path: str = ""

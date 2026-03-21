@@ -76,6 +76,52 @@ def test_vec0_table_exists(tmp_db):
     assert row is not None
 
 
+def test_chunks_table_exists(tmp_db):
+    """Chunks table is created in schema v2."""
+    row = tmp_db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_chunk_vec_table_exists(tmp_db):
+    """chunk_vec virtual table is created."""
+    row = tmp_db.execute(
+        "SELECT name FROM sqlite_master WHERE name='chunk_vec'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_has_chunk_embeddings_column(tmp_db):
+    """papers table has has_chunk_embeddings column."""
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    tmp_db.commit()
+    row = tmp_db.execute("SELECT has_chunk_embeddings FROM papers WHERE path = 'test.pdf'").fetchone()
+    assert row["has_chunk_embeddings"] == 0
+
+
+def test_chunks_foreign_key_cascade(tmp_db):
+    """Deleting a paper cascades to its chunks."""
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    paper_id = tmp_db.execute("SELECT id FROM papers WHERE path = 'test.pdf'").fetchone()["id"]
+    tmp_db.execute(
+        "INSERT INTO chunks (doc_id, chunk_index, text, char_offset) VALUES (?, 0, 'some text', 0)",
+        (paper_id,),
+    )
+    tmp_db.commit()
+    assert tmp_db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+
+    tmp_db.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+    tmp_db.commit()
+    assert tmp_db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+
+
 def test_idempotent_connection(tmp_path):
     """Connecting to an existing database doesn't re-create schema."""
     db_path = tmp_path / "test.db"

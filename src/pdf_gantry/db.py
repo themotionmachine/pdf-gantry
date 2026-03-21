@@ -5,7 +5,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 -- Core papers table
@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS papers (
     has_text INTEGER NOT NULL DEFAULT 0,
     has_markdown INTEGER NOT NULL DEFAULT 0,
     has_embeddings INTEGER NOT NULL DEFAULT 0,
+    has_chunk_embeddings INTEGER NOT NULL DEFAULT 0,
     needs_ocr INTEGER NOT NULL DEFAULT 0,
     is_scanned INTEGER,
 
@@ -93,6 +94,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS paper_embeddings USING vec0(
     embedding FLOAT[768]
 );
 
+-- Document chunks for chunk-level embeddings
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    section_header TEXT,
+    page_start INTEGER,
+    text TEXT NOT NULL,
+    char_offset INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(doc_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
+
+-- Chunk-level embeddings via sqlite-vec
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
+    chunk_id INTEGER PRIMARY KEY,
+    embedding FLOAT[768]
+);
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL,
@@ -150,4 +171,30 @@ def migrate(conn: sqlite3.Connection) -> None:
     version = get_schema_version(conn)
     if version == 0:
         init_schema(conn)
-    # Future migrations go here: if version < 2: ...
+        return
+
+    if version < 2:
+        from .utils import now_iso
+        conn.execute(
+            "ALTER TABLE papers ADD COLUMN has_chunk_embeddings INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("""CREATE TABLE IF NOT EXISTS chunks (
+            chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            section_header TEXT,
+            page_start INTEGER,
+            text TEXT NOT NULL,
+            char_offset INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(doc_id, chunk_index)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
+        conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[768]
+        )""")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (2, now_iso()),
+        )
+        conn.commit()
