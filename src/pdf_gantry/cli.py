@@ -198,6 +198,7 @@ def ingest(ctx, dry_run, json_output):
             "new": stats.new,
             "changed": stats.changed,
             "missing": stats.missing,
+            "evicted": stats.evicted,
             "elapsed_seconds": stats.elapsed_seconds,
             "dry_run": dry_run,
         }, indent=2))
@@ -212,6 +213,15 @@ def ingest(ctx, dry_run, json_output):
         )
         if not dry_run and stats.new > 0:
             click.echo(f"Indexed {format_count(stats.new)} new documents in {stats.elapsed_seconds}s")
+        if stats.evicted > 0:
+            click.echo(
+                f"\n{format_count(stats.evicted)} files evicted from iCloud (skipped). "
+                f"To re-download:\n"
+                f"  find \"{cfg.papers_dir}\" -name '*.pdf' -exec brctl download {{}} +"
+            )
+
+    if stats.evicted > 0:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- status ---
