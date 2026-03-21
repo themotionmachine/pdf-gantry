@@ -28,10 +28,10 @@ err_console = Console(stderr=True)
 def filter_options(f):
     """Shared Click options for document filtering."""
     @click.option("--needs", multiple=True,
-                  type=click.Choice(["text", "markdown", "embeddings", "ocr", "metadata"]),
+                  type=click.Choice(["text", "markdown", "embeddings", "chunk_embeddings", "ocr", "metadata"]),
                   help="Filter to documents missing this property")
     @click.option("--has", "has_prop", multiple=True,
-                  type=click.Choice(["text", "markdown", "embeddings", "errors"]),
+                  type=click.Choice(["text", "markdown", "embeddings", "chunk_embeddings", "errors"]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice(["scanned", "digital"]),
@@ -252,6 +252,7 @@ def status(ctx, json_output):
     info.with_embeddings = conn.execute("SELECT COUNT(*) FROM papers WHERE has_embeddings = 1").fetchone()[0]
     info.needs_ocr = conn.execute("SELECT COUNT(*) FROM papers WHERE needs_ocr = 1").fetchone()[0]
     info.has_errors = conn.execute("SELECT COUNT(*) FROM papers WHERE error_count > 0").fetchone()[0]
+    info.with_chunk_embeddings = conn.execute("SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1").fetchone()[0]
     info.db_size_bytes = cfg.db_path.stat().st_size
 
     conn.close()
@@ -277,6 +278,7 @@ def status(ctx, json_output):
         click.echo(f"  With text:     {format_count(info.with_text)} ({format_pct(info.with_text, info.total)})")
         click.echo(f"  With markdown: {format_count(info.with_markdown)} ({format_pct(info.with_markdown, info.total)})")
         click.echo(f"  With embeddings: {format_count(info.with_embeddings)} ({format_pct(info.with_embeddings, info.total)})")
+        click.echo(f"  With chunk embeddings: {format_count(info.with_chunk_embeddings)} ({format_pct(info.with_chunk_embeddings, info.total)})")
         click.echo(f"  Needs OCR:     {format_count(info.needs_ocr)} ({format_pct(info.needs_ocr, info.total)})")
         click.echo(f"  Has errors:    {format_count(info.has_errors)} ({format_pct(info.has_errors, info.total)})")
         click.echo()
@@ -665,9 +667,10 @@ def errors(ctx, json_output):
 @cli.command()
 @click.argument("query")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
+@click.option("--doc-only", is_flag=True, help="Use doc-level embeddings only (skip chunk cascade)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def semantic(ctx, query, limit, json_output):
+def semantic(ctx, query, limit, doc_only, json_output):
     """Semantic similarity search (requires embeddings)."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -682,7 +685,7 @@ def semantic(ctx, query, limit, json_output):
         return
 
     from .embeddings import embed_query
-    from .search import semantic_search
+    from .search import semantic_search, cascade_search
 
     try:
         query_vec = embed_query(cfg.embedding.model, query)
@@ -695,7 +698,16 @@ def semantic(ctx, query, limit, json_output):
         return
 
     conn = get_connection(cfg.db_path)
-    results = semantic_search(conn, query_vec, limit=limit)
+
+    # Use cascade search if chunk embeddings exist, unless --doc-only
+    has_chunks = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
+    ).fetchone()[0] > 0
+
+    if has_chunks and not doc_only:
+        results = cascade_search(conn, query_vec, limit=limit)
+    else:
+        results = semantic_search(conn, query_vec, limit=limit)
     conn.close()
 
     if not results:
@@ -737,11 +749,12 @@ def semantic(ctx, query, limit, json_output):
 
 @cli.command()
 @filter_options
+@click.option("--chunk", "chunk_mode", is_flag=True, help="Generate chunk-level embeddings")
 @click.option("--batch-size", type=int, default=None, help="Batch size for encoding")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, batch_size, dry_run, json_output):
+def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, batch_size, dry_run, json_output):
     """Generate embeddings for documents with text."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -756,16 +769,20 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, batch_size, dr
         return
 
     conn = get_connection(cfg.db_path)
-    from .embeddings import embed_documents
+    from .embeddings import embed_documents, embed_chunks
     from .queue import build_filter_query
 
     if batch_size is None:
-        batch_size = cfg.embedding.batch_size
+        batch_size = cfg.embedding.batch_size if not chunk_mode else 64
 
-    # Default filter: needs embeddings, has text
+    # Default filter depends on mode
     if not needs and not has_prop and not is_prop and not stale_embeddings:
-        needs = ("embeddings",)
-        has_prop = ("text",)
+        if chunk_mode:
+            needs = ("chunk_embeddings",)
+            has_prop = ("text",)
+        else:
+            needs = ("embeddings",)
+            has_prop = ("text",)
 
     where, params = build_filter_query(
         needs=list(needs) if needs else None,
@@ -819,7 +836,8 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, batch_size, dr
             progress_bar.update(task, completed=current)
 
     try:
-        stats = embed_documents(
+        embed_fn = embed_chunks if chunk_mode else embed_documents
+        stats = embed_fn(
             conn, cfg.db_path,
             paper_ids=paper_ids,
             model_name=cfg.embedding.model,
@@ -1045,6 +1063,137 @@ def retry(ctx, max_attempts, json_output):
         click.echo(f"Retried {format_count(stats.total)} documents")
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         click.echo(f"  Still failing: {format_count(stats.failed)}")
+
+
+# --- read ---
+
+@cli.command()
+@click.argument("identifier")
+@click.option("--chunk", "chunk_id", type=int, default=None, help="Read a specific chunk by ID")
+@click.option("--chunks", "list_chunks", is_flag=True, help="List all chunks for a document")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def read(ctx, identifier, chunk_id, list_chunks, json_output):
+    """Read document text or chunks. IDENTIFIER is a paper ID or filename."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+
+    if chunk_id is not None:
+        # Read a specific chunk by ID
+        row = conn.execute(
+            """SELECT c.*, p.filename, p.title
+            FROM chunks c JOIN papers p ON p.id = c.doc_id
+            WHERE c.chunk_id = ?""",
+            (chunk_id,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            msg = f"Chunk {chunk_id} not found"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
+        if use_json:
+            click.echo(json.dumps({
+                "chunk_id": row["chunk_id"],
+                "doc_id": row["doc_id"],
+                "filename": row["filename"],
+                "title": row["title"],
+                "chunk_index": row["chunk_index"],
+                "section_header": row["section_header"],
+                "text": row["text"],
+            }, indent=2))
+        else:
+            click.echo(f"[{row['filename']}] chunk {row['chunk_index']}")
+            if row["section_header"]:
+                click.echo(f"Section: {row['section_header']}")
+            click.echo()
+            click.echo(row["text"])
+        return
+
+    # Resolve identifier to paper
+    try:
+        paper_id = int(identifier)
+        paper = conn.execute("SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    except ValueError:
+        paper = conn.execute("SELECT id, filename, title FROM papers WHERE filename = ?", (identifier,)).fetchone()
+
+    if not paper:
+        msg = f"Paper not found: {identifier}"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        conn.close()
+        ctx.exit(EXIT_ERROR)
+        return
+
+    if list_chunks:
+        chunks = conn.execute(
+            "SELECT chunk_id, chunk_index, section_header, LENGTH(text) as text_len FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
+            (paper["id"],),
+        ).fetchall()
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({
+                "paper_id": paper["id"],
+                "filename": paper["filename"],
+                "chunks": [
+                    {
+                        "chunk_id": c["chunk_id"],
+                        "chunk_index": c["chunk_index"],
+                        "section_header": c["section_header"],
+                        "text_length": c["text_len"],
+                    }
+                    for c in chunks
+                ],
+            }, indent=2))
+        else:
+            click.echo(f"{paper['filename']} — {len(chunks)} chunks")
+            for c in chunks:
+                header = f" [{c['section_header']}]" if c["section_header"] else ""
+                click.echo(f"  {c['chunk_index']:3d}. (id={c['chunk_id']}) {c['text_len']:,} chars{header}")
+        return
+
+    # Default: read full markdown
+    text = conn.execute(
+        "SELECT markdown, raw_text FROM paper_text WHERE paper_id = ?",
+        (paper["id"],),
+    ).fetchone()
+    conn.close()
+
+    if not text:
+        msg = f"No text extracted for {paper['filename']}. Run 'gantry process' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    content = text["markdown"] or text["raw_text"]
+    if use_json:
+        click.echo(json.dumps({
+            "paper_id": paper["id"],
+            "filename": paper["filename"],
+            "title": paper["title"],
+            "text": content,
+        }, indent=2))
+    else:
+        click.echo(content)
 
 
 # --- vault ---
