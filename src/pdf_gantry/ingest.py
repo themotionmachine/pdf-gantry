@@ -117,8 +117,16 @@ def ingest_directory(
                 progress_callback(i + 1, stats.total_pdfs)
             continue
 
-        # Compute hash
-        fhash = file_hash(pdf_path)
+        # Compute hash — catch iCloud dataless files (EDEADLK)
+        try:
+            fhash = file_hash(pdf_path)
+        except OSError as e:
+            if e.errno == 11:  # EDEADLK: Resource deadlock avoided
+                stats.evicted += 1
+                if progress_callback:
+                    progress_callback(i + 1, stats.total_pdfs)
+                continue
+            raise
 
         # Check if already in DB
         row = conn.execute(

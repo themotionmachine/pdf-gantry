@@ -50,6 +50,7 @@ class IngestStats:
     new: int = 0
     changed: int = 0
     missing: int = 0
+    evicted: int = 0
     elapsed_seconds: float = 0.0
 
 

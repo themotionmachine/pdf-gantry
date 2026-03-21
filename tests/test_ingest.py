@@ -116,3 +116,31 @@ def test_ingest_sets_scan_flag(populated_db):
     rows = populated_db.execute("SELECT is_scanned FROM papers").fetchall()
     for row in rows:
         assert row["is_scanned"] is not None  # Should be classified
+
+
+def test_ingest_skips_edeadlk(tmp_path, papers_dir, monkeypatch):
+    """iCloud dataless files (EDEADLK) are skipped, not fatal."""
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+
+    original_file_hash = __import__("pdf_gantry.utils", fromlist=["file_hash"]).file_hash
+    call_count = 0
+
+    def fake_hash(path, chunk_size=65536):
+        nonlocal call_count
+        call_count += 1
+        if "test_climate" in str(path):
+            err = OSError("Resource deadlock avoided")
+            err.errno = 11
+            raise err
+        return original_file_hash(path, chunk_size)
+
+    monkeypatch.setattr("pdf_gantry.ingest.file_hash", fake_hash)
+
+    stats = ingest_directory(conn, papers_dir)
+
+    assert stats.evicted == 1
+    assert stats.new == 1  # the other PDF still got indexed
+    row = conn.execute("SELECT COUNT(*) FROM papers").fetchone()
+    assert row[0] == 1
+    conn.close()
