@@ -22,18 +22,18 @@ uv pip install -e ".[embeddings]" --python .venv/bin/python
 
 ## Migration from earlier commits
 
-If you have an existing `~/.gantry/index.db` from before the chunk-level embedding work (schema v1), it will auto-migrate on first connection. The migration adds:
-- `has_chunk_embeddings` column to `papers` (defaults to 0)
-- `chunks` table
-- `chunk_vec` vec0 virtual table
+The database auto-migrates on first connection. Current schema is **v3**.
 
-**After migration, you must re-run `gantry process`** to populate the `chunks` table. Existing text/markdown in `paper_text` is untouched, but chunks are only generated during processing. You can target specific papers:
+**From v1 (pre-chunk):** Adds `has_chunk_embeddings` column, `chunks` table, `chunk_vec` table. You must re-run `gantry process --has text` to populate chunks, then `gantry embed --chunk`.
 
+**From v2 (pre-cosine fix):** Recreates `paper_embeddings` and `chunk_vec` tables with `distance_metric=cosine`. **Existing vectors are preserved** — they're read out, tables recreated, vectors re-inserted. No re-embedding needed. This fixes `score_vector` values: previously they were `1 - L2_distance` (compressed, often negative), now they're true cosine similarity (0–1 range, 0.7+ means strong match).
+
+**After any migration, verify:**
 ```bash
-gantry process --has text    # re-process everything that already has text
+gantry status               # check counts
+gantry process --has text    # re-process to generate chunks (if coming from v1)
+gantry embed --chunk         # embed chunks (if coming from v1 or v2)
 ```
-
-This will regenerate chunks and reset `has_chunk_embeddings = 0`, so follow with `gantry embed --chunk`.
 
 ## Non-obvious design choices
 

@@ -6,6 +6,8 @@ import pytest
 
 from pdf_gantry.db import get_connection, get_schema_version, SCHEMA_VERSION
 
+assert SCHEMA_VERSION == 3, "Update tests if schema version changes"
+
 
 def test_schema_creation(tmp_path):
     """Schema is created on fresh database."""
