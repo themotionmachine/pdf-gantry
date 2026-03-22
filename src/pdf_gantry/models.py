@@ -40,6 +40,11 @@ class SearchResult:
     title: str | None = None
     has_markdown: bool = False
     has_embeddings: bool = False
+    # Component scores for hybrid search (populated with --components)
+    score_fts: float | None = None
+    score_vector: float | None = None
+    rank_fts: int | None = None
+    rank_vector: int | None = None
 
 
 @dataclass

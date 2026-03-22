@@ -73,3 +73,22 @@ def test_fts_phrase_query(searchable_db):
     """Phrase queries work with FTS5."""
     results = fts_search(searchable_db, '"climate change"')
     assert len(results) >= 1
+
+
+def test_fts_hyphenated_query(searchable_db):
+    """Hyphenated terms don't crash FTS5."""
+    from pdf_gantry.search import _sanitize_fts_query
+    # Should not raise "no such column" error
+    results = fts_search(searchable_db, "cross-national")
+    # May or may not find results, but should not error
+    assert isinstance(results, list)
+
+
+def test_sanitize_fts_query():
+    """Hyphen sanitization works correctly."""
+    from pdf_gantry.search import _sanitize_fts_query
+    assert _sanitize_fts_query("cross-national") == "cross national"
+    assert _sanitize_fts_query('"self-regulation"') == '"self regulation"'
+    assert _sanitize_fts_query("climate AND cross-border") == "climate AND cross border"
+    # Preserve non-hyphen content
+    assert _sanitize_fts_query("climate change") == "climate change"
