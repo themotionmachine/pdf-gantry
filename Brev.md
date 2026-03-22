@@ -8,6 +8,11 @@ Notes for Brev — the agent testing gantry against Ryan's real research library
 cd ~/Desktop/code/pdf-gantry
 source .venv/bin/activate
 gantry config init          # set papers_dir and vault_dir
+gantry pipeline             # ingest + process + embed in one command
+```
+
+Or step by step:
+```bash
 gantry ingest               # scan the corpus
 gantry process              # extract text from digital PDFs
 gantry embed --chunk        # generate chunk-level embeddings
@@ -94,9 +99,22 @@ The key insight: `--fields` makes early passes cheap, `gantry info` makes follow
 
 **`--context` expands outward from a chunk.** `gantry read x --chunk 47 --context 4000` gives you the target chunk plus neighboring chunks, expanding alternately before and after, until the character budget is reached. The target chunk is always included even if it exceeds the budget. Use this after a semantic search surfaces a relevant chunk — you can see what comes before and after without reading the whole document.
 
+**`gantry pipeline` is the single command for ongoing ingestion.** It runs ingest → process → embed in sequence, idempotently. If nothing's new, it exits immediately. Use `--file "paper.pdf"` to process a single newly-arrived PDF end-to-end. Use `--limit 5` to cap throughput for cron budgeting. The embedding model loads once, not per-paper.
+
+**`gantry prune` removes ghost entries.** After deleting PDFs from the corpus, their DB entries persist and show up in search results. `gantry prune` checks every entry against disk and removes missing ones, cleaning up papers, text, FTS, chunks, and embeddings. Always safe to run — only removes entries for files that are genuinely gone. Use `--dry-run` to preview.
+
 ## Useful commands for testing
 
 ```bash
+# Bring index current (single command)
+gantry pipeline --json
+
+# Process one new file end-to-end
+gantry pipeline --file "NewPaper2025.pdf" --json
+
+# Remove ghost entries for deleted files
+gantry prune
+
 # How many papers need processing?
 gantry queue --needs text --count
 
