@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Development Process
+
+**Red/green TDD is mandatory.** Every change follows this cycle:
+
+1. **Red:** Write a failing test that specifies the behavior you're about to implement.
+2. **Green:** Write the minimum code to make the test pass.
+3. **Refactor:** Clean up if needed, keeping tests green.
+
+This applies to bug fixes (write a test that reproduces the bug first), new features (write tests for the expected interface before implementing), and refactors (ensure existing tests cover the behavior, then change the code). Never ship code without a test that would have caught the problem. Run `pytest` after every change — don't batch up.
+
 ## Project
 
 pdf-gantry is an agent-friendly CLI (`gantry`) for managing ~2000 academic PDFs in a flat iCloud folder. It indexes PDFs into a single SQLite database (with sqlite-vec for vectors), extracts text/markdown, generates embeddings, and provides FTS5 + semantic search. Read-only Obsidian vault integration cross-references source notes.
@@ -67,11 +77,11 @@ Chunk-level embeddings (#2) are the substrate for this. Once chunks are addressa
 
 ## Next Steps
 
-All three PRD phases are structurally complete but untested against real data. Anticipated work:
+Chunk-level embeddings, composable search (`--components`, `--fields`, `gantry info`), and the cosine distance fix are shipped. The tool is being tested against a real ~2000-PDF corpus. Anticipated work:
 
-1. **Real corpus testing.** Ingest the ~2000 PDFs and fix edge cases: encrypted PDFs, zero-byte files, exotic encodings, special-character filenames. The iCloud dataless file fix (#1) was the first of these.
-2. **Tune scanned/digital classifier.** Current thresholds (0.05/0.15) were calibrated on synthetic PDFs. Two-column layouts, figure-heavy papers, and sparse title pages will likely misclassify. Spot-check with `gantry queue --is scanned`.
-3. **Test optional dependencies end-to-end.** Embeddings (sentence-transformers + Nomic), Marker, and Surya are wired up but haven't run on real data with real models. Expect integration issues around model downloads, memory, and Metal acceleration.
-4. **Search quality iteration.** Whole-document embeddings lose nuance for long papers — may need text chunking. RRF k parameter may need tuning. Possible new commands: `gantry read <filename>` to dump markdown, `gantry find <fragment>` for fuzzy filename lookup.
-5. **Workflow integration.** Test usage from Claude Code sessions. May surface needs for richer `--json` output, a `gantry summary` command, or other agent-oriented features.
-6. **Vault integration polish.** Real vaults have aliases, nested folders, varied reference conventions. May need refined reference extraction and a `gantry vault suggest` command for papers without notes.
+1. **Tune scanned/digital classifier.** Current thresholds (0.05/0.15) were calibrated on synthetic PDFs. Two-column layouts, figure-heavy papers, and sparse title pages will likely misclassify. Spot-check with `gantry queue --is scanned`.
+2. **Marker integration end-to-end.** `--method marker` / `--quality` is wired but untested with the real Marker library. Expect integration issues with model downloads and memory on complex PDFs.
+3. **`gantry find <fragment>`** — fuzzy filename lookup for agents that have a partial filename. Currently requires exact match.
+4. **Scoped context windows.** `gantry read --chunk <id> --context 2000` to get K tokens of surrounding text, letting agents zoom into a chunk's neighborhood without retrieving the whole document.
+5. **Vault integration polish.** Real vaults have aliases, nested folders, varied reference conventions. May need refined reference extraction and a `gantry vault suggest` command for papers without notes.
+6. **Surya OCR end-to-end.** Wired but untested with real scanned PDFs and the actual Surya models.
