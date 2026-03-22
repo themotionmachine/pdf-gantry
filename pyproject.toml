@@ -26,6 +26,7 @@ ocr = [
 ]
 embeddings = [
     "sentence-transformers>=3.0",
+    "einops>=0.7",
 ]
 dev = [
     "pytest>=8.0",
