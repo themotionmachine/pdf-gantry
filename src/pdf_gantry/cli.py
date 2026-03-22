@@ -429,9 +429,12 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
 @click.argument("query")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
 @click.option("--hybrid", is_flag=True, help="Combine FTS5 and vector search")
+@click.option("--components", is_flag=True, help="Include FTS and vector component scores (hybrid only)")
+@click.option("--fields", "field_list", type=str, default=None,
+              help="Comma-separated fields to include in JSON output")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def search(ctx, query, limit, hybrid, json_output):
+def search(ctx, query, limit, hybrid, components, field_list, json_output):
     """Full-text search across indexed PDFs."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -485,27 +488,41 @@ def search(ctx, query, limit, hybrid, json_output):
         return
 
     if use_json:
+        result_dicts = []
+        for r in results:
+            d = {
+                "id": r.id,
+                "filename": r.filename,
+                "path": r.path,
+                "score": r.score,
+                "snippet": r.snippet,
+                "has_markdown": r.has_markdown,
+                "has_embeddings": r.has_embeddings,
+            }
+            if components and hybrid:
+                d["score_fts"] = r.score_fts
+                d["score_vector"] = r.score_vector
+                d["rank_fts"] = r.rank_fts
+                d["rank_vector"] = r.rank_vector
+            if field_list:
+                fields = {f.strip() for f in field_list.split(",")}
+                d = {k: v for k, v in d.items() if k in fields}
+            result_dicts.append(d)
+
         click.echo(json.dumps({
             "query": query,
             "total": total,
-            "results": [
-                {
-                    "id": r.id,
-                    "filename": r.filename,
-                    "path": r.path,
-                    "score": r.score,
-                    "snippet": r.snippet,
-                    "has_markdown": r.has_markdown,
-                    "has_embeddings": r.has_embeddings,
-                }
-                for r in results
-            ],
+            "results": result_dicts,
         }, indent=2))
     else:
         click.echo(f'Found {total} results for "{query}"')
         click.echo()
         for i, r in enumerate(results, 1):
             click.echo(f" {i:2d}. [{r.score:.2f}] {r.filename}")
+            if components and hybrid and (r.score_fts is not None or r.score_vector is not None):
+                fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
+                vec_str = f"vec={r.score_vector:.4f}" if r.score_vector is not None else "vec=--"
+                click.echo(f"     {fts_str}  {vec_str}")
             if r.snippet:
                 click.echo(f"     \"{r.snippet}\"")
             click.echo()
@@ -668,9 +685,11 @@ def errors(ctx, json_output):
 @click.argument("query")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
 @click.option("--doc-only", is_flag=True, help="Use doc-level embeddings only (skip chunk cascade)")
+@click.option("--fields", "field_list", type=str, default=None,
+              help="Comma-separated fields to include in JSON output")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def semantic(ctx, query, limit, doc_only, json_output):
+def semantic(ctx, query, limit, doc_only, field_list, json_output):
     """Semantic similarity search (requires embeddings)."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -719,21 +738,26 @@ def semantic(ctx, query, limit, doc_only, json_output):
         return
 
     if use_json:
+        result_dicts = []
+        for r in results:
+            d = {
+                "id": r.id,
+                "filename": r.filename,
+                "path": r.path,
+                "score": r.score,
+                "snippet": r.snippet,
+                "has_markdown": r.has_markdown,
+                "has_embeddings": r.has_embeddings,
+            }
+            if field_list:
+                fields = {f.strip() for f in field_list.split(",")}
+                d = {k: v for k, v in d.items() if k in fields}
+            result_dicts.append(d)
+
         click.echo(json.dumps({
             "query": query,
             "total": len(results),
-            "results": [
-                {
-                    "id": r.id,
-                    "filename": r.filename,
-                    "path": r.path,
-                    "score": r.score,
-                    "snippet": r.snippet,
-                    "has_markdown": r.has_markdown,
-                    "has_embeddings": r.has_embeddings,
-                }
-                for r in results
-            ],
+            "results": result_dicts,
         }, indent=2))
     else:
         click.echo(f'Found {len(results)} results for "{query}"')
@@ -1063,6 +1087,125 @@ def retry(ctx, max_attempts, json_output):
         click.echo(f"Retried {format_count(stats.total)} documents")
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         click.echo(f"  Still failing: {format_count(stats.failed)}")
+
+
+# --- info ---
+
+@cli.command()
+@click.option("--ids", type=str, required=True, help="Comma-separated paper IDs")
+@click.option("--fields", "field_list", type=str, default=None,
+              help="Comma-separated fields to include")
+@click.option("--chunks", "include_chunks", is_flag=True,
+              help="Include chunk texts for each paper")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def info(ctx, ids, field_list, include_chunks, json_output):
+    """Fetch metadata for specific papers by ID."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    try:
+        paper_ids = [int(x.strip()) for x in ids.split(",")]
+    except ValueError:
+        msg = "Invalid --ids: must be comma-separated integers"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+
+    placeholders = ",".join("?" * len(paper_ids))
+    rows = conn.execute(
+        f"""SELECT p.id, p.filename, p.path, p.title, p.authors, p.year, p.doi,
+                   p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
+                   p.has_chunk_embeddings, p.page_count, p.is_scanned,
+                   p.text_method, p.error_count, p.last_error,
+                   SUBSTR(pt.raw_text, 1, 300) as snippet
+            FROM papers p
+            LEFT JOIN paper_text pt ON pt.paper_id = p.id
+            WHERE p.id IN ({placeholders})""",
+        paper_ids,
+    ).fetchall()
+
+    if not rows:
+        if use_json:
+            click.echo(json.dumps({"count": 0, "papers": []}))
+        else:
+            click.echo("No papers found for given IDs")
+        conn.close()
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    results = []
+    for r in rows:
+        d = {
+            "id": r["id"],
+            "filename": r["filename"],
+            "path": r["path"],
+            "title": r["title"],
+            "authors": r["authors"],
+            "year": r["year"],
+            "doi": r["doi"],
+            "abstract": r["abstract"],
+            "snippet": r["snippet"],
+            "page_count": r["page_count"],
+            "has_text": bool(r["has_text"]),
+            "has_markdown": bool(r["has_markdown"]),
+            "has_embeddings": bool(r["has_embeddings"]),
+            "has_chunk_embeddings": bool(r["has_chunk_embeddings"]),
+            "is_scanned": bool(r["is_scanned"]) if r["is_scanned"] is not None else None,
+            "error_count": r["error_count"],
+        }
+
+        if include_chunks:
+            chunks = conn.execute(
+                "SELECT chunk_id, chunk_index, section_header, text FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
+                (r["id"],),
+            ).fetchall()
+            d["chunks"] = [
+                {
+                    "chunk_id": c["chunk_id"],
+                    "chunk_index": c["chunk_index"],
+                    "section_header": c["section_header"],
+                    "text": c["text"],
+                }
+                for c in chunks
+            ]
+
+        if field_list:
+            fields = {f.strip() for f in field_list.split(",")}
+            d = {k: v for k, v in d.items() if k in fields}
+
+        results.append(d)
+
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps({"count": len(results), "papers": results}, indent=2))
+    else:
+        for d in results:
+            click.echo(f"[{d.get('id')}] {d.get('filename', '?')}")
+            if d.get("title"):
+                click.echo(f"  Title: {d['title']}")
+            if d.get("authors"):
+                click.echo(f"  Authors: {d['authors']}")
+            if d.get("year"):
+                click.echo(f"  Year: {d['year']}")
+            if d.get("doi"):
+                click.echo(f"  DOI: {d['doi']}")
+            click.echo()
 
 
 # --- read ---
