@@ -1089,6 +1089,64 @@ def retry(ctx, max_attempts, json_output):
         click.echo(f"  Still failing: {format_count(stats.failed)}")
 
 
+# --- find ---
+
+@cli.command()
+@click.argument("fragment")
+@click.option("-n", "--limit", type=int, default=20, help="Max results")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def find(ctx, fragment, limit, json_output):
+    """Fuzzy filename lookup. FRAGMENT matches anywhere in the filename."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    from .search import find_papers
+
+    results = find_papers(conn, fragment, limit=limit)
+    conn.close()
+
+    if not results:
+        if use_json:
+            click.echo(json.dumps({"fragment": fragment, "count": 0, "results": []}))
+        else:
+            click.echo(f'No papers matching "{fragment}"')
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    if use_json:
+        click.echo(json.dumps({
+            "fragment": fragment,
+            "count": len(results),
+            "results": [
+                {
+                    "id": r["id"],
+                    "filename": r["filename"],
+                    "title": r["title"],
+                    "page_count": r["page_count"],
+                    "has_text": bool(r["has_text"]),
+                }
+                for r in results
+            ],
+        }, indent=2))
+    else:
+        click.echo(f'{len(results)} papers matching "{fragment}"')
+        click.echo()
+        for r in results:
+            extra = f" — {r['title']}" if r["title"] else ""
+            click.echo(f"  [{r['id']:4d}] {r['filename']}{extra}")
+
+
 # --- info ---
 
 @cli.command()
@@ -1214,9 +1272,11 @@ def info(ctx, ids, field_list, include_chunks, json_output):
 @click.argument("identifier")
 @click.option("--chunk", "chunk_id", type=int, default=None, help="Read a specific chunk by ID")
 @click.option("--chunks", "list_chunks", is_flag=True, help="List all chunks for a document")
+@click.option("--context", "context_chars", type=int, default=None,
+              help="Expand chunk with surrounding context (chars). Use with --chunk")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def read(ctx, identifier, chunk_id, list_chunks, json_output):
+def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
     """Read document text or chunks. IDENTIFIER is a paper ID or filename."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -1231,6 +1291,31 @@ def read(ctx, identifier, chunk_id, list_chunks, json_output):
         return
 
     conn = get_connection(cfg.db_path)
+
+    if chunk_id is not None and context_chars is not None:
+        # Scoped context window around a chunk
+        from .search import get_chunk_context
+        result = get_chunk_context(conn, chunk_id, max_chars=context_chars)
+        conn.close()
+        if not result:
+            msg = f"Chunk {chunk_id} not found"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
+        if use_json:
+            click.echo(json.dumps(result, indent=2))
+        else:
+            click.echo(f"[{result['filename']}] chunk {result['chunk_index']} "
+                        f"(±context, {len(result['context']):,} chars, "
+                        f"{result['total_chunks']} total chunks)")
+            if result["section_header"]:
+                click.echo(f"Section: {result['section_header']}")
+            click.echo()
+            click.echo(result["context"])
+        return
 
     if chunk_id is not None:
         # Read a specific chunk by ID

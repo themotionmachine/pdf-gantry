@@ -281,3 +281,107 @@ def cascade_search(
         ))
 
     return results
+
+
+def find_papers(
+    conn: sqlite3.Connection,
+    fragment: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Fuzzy filename lookup using LIKE matching (case-insensitive)."""
+    rows = conn.execute(
+        """SELECT id, filename, path, title, page_count, has_text, has_markdown,
+                  has_embeddings, has_chunk_embeddings, is_scanned
+        FROM papers
+        WHERE filename LIKE ?
+        ORDER BY filename
+        LIMIT ?""",
+        (f"%{fragment}%", limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_chunk_context(
+    conn: sqlite3.Connection,
+    chunk_id: int,
+    max_chars: int = 2000,
+) -> dict | None:
+    """
+    Get a chunk with surrounding context from neighboring chunks.
+
+    Returns a dict with the target chunk text, expanded context from
+    neighbors, and document metadata. Returns None if chunk_id not found.
+    """
+    # Get the target chunk with document info
+    row = conn.execute(
+        """SELECT c.chunk_id, c.doc_id, c.chunk_index, c.section_header,
+                  c.page_start, c.text,
+                  p.filename, p.path, p.title
+        FROM chunks c
+        JOIN papers p ON p.id = c.doc_id
+        WHERE c.chunk_id = ?""",
+        (chunk_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    doc_id = row["doc_id"]
+    target_index = row["chunk_index"]
+    target_text = row["text"]
+
+    # Count total chunks for this document
+    total_chunks = conn.execute(
+        "SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (doc_id,)
+    ).fetchone()[0]
+
+    # Get all chunks for this document, ordered
+    all_chunks = conn.execute(
+        "SELECT chunk_index, text FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
+        (doc_id,),
+    ).fetchall()
+
+    # Build context by expanding outward from the target chunk
+    context_parts = [target_text]
+    chars_used = len(target_text)
+
+    # Expand outward: alternate before and after
+    before_idx = target_index - 1
+    after_idx = target_index + 1
+    chunk_map = {c["chunk_index"]: c["text"] for c in all_chunks}
+
+    while chars_used < max_chars:
+        added = False
+
+        if before_idx >= 0 and before_idx in chunk_map:
+            text = chunk_map[before_idx]
+            if chars_used + len(text) <= max_chars + 200:  # Allow slight overshoot
+                context_parts.insert(0, text)
+                chars_used += len(text)
+                before_idx -= 1
+                added = True
+
+        if after_idx in chunk_map:
+            text = chunk_map[after_idx]
+            if chars_used + len(text) <= max_chars + 200:
+                context_parts.append(text)
+                chars_used += len(text)
+                after_idx += 1
+                added = True
+
+        if not added:
+            break
+
+    return {
+        "chunk_id": row["chunk_id"],
+        "doc_id": doc_id,
+        "chunk_index": target_index,
+        "section_header": row["section_header"],
+        "page_start": row["page_start"],
+        "chunk_text": target_text,
+        "context": "\n\n".join(context_parts),
+        "filename": row["filename"],
+        "path": row["path"],
+        "title": row["title"],
+        "total_chunks": total_chunks,
+    }
