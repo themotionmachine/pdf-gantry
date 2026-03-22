@@ -1089,6 +1089,104 @@ def retry(ctx, max_attempts, json_output):
         click.echo(f"  Still failing: {format_count(stats.failed)}")
 
 
+# --- pipeline ---
+
+@cli.command()
+@click.option("--file", "filename", type=str, default=None, help="Process a single file by name")
+@click.option("--limit", type=int, default=None, help="Max papers to process end-to-end")
+@click.option("--workers", type=int, default=None, help="Number of concurrent workers")
+@click.option("--dry-run", is_flag=True, help="Report what would happen")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def pipeline(ctx, filename, limit, workers, dry_run, json_output):
+    """Run full ingestion pipeline: ingest → process → embed."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.papers_dir.is_dir():
+        msg = f"Papers directory not found: {cfg.papers_dir}"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    if workers is None:
+        workers = cfg.processing.workers
+
+    cfg.index_dir.mkdir(parents=True, exist_ok=True)
+    conn = get_connection(cfg.db_path)
+
+    from .pipeline import run_pipeline
+
+    if not use_json and not dry_run:
+        if filename:
+            err_console.print(f"Pipeline: {filename}")
+        else:
+            err_console.print(f"Pipeline: scanning {cfg.papers_dir}")
+
+    stats = run_pipeline(
+        conn, cfg.papers_dir, cfg.db_path,
+        workers=workers, limit=limit, dry_run=dry_run,
+        filename=filename,
+        scan_threshold=cfg.processing.scan_threshold,
+    )
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(stats, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        click.echo(f"{prefix}Ingested: {stats['ingested']}, "
+                    f"Processed: {stats['processed']}, "
+                    f"Embedded: {stats['embedded']}, "
+                    f"Errors: {stats['errors']}")
+
+    if stats.get("errors", 0) > 0 and stats.get("processed", 0) > 0:
+        ctx.exit(EXIT_PARTIAL)
+    elif stats.get("errors", 0) > 0 and stats.get("processed", 0) == 0:
+        ctx.exit(EXIT_ERROR)
+
+
+# --- prune ---
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Report what would be removed")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def prune(ctx, dry_run, json_output):
+    """Remove database entries for files no longer on disk."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    from .prune import prune_missing
+
+    stats = prune_missing(conn, cfg.papers_dir, dry_run=dry_run)
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(stats, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        if stats["pruned"] == 0:
+            click.echo(f"{prefix}No ghost entries found ({stats['remaining']} papers in index)")
+        else:
+            click.echo(f"{prefix}Pruned {stats['pruned']} ghost entries ({stats['remaining']} remaining)")
+            for f in stats["pruned_files"]:
+                click.echo(f"  - {f}")
+
+
 # --- find ---
 
 @cli.command()
