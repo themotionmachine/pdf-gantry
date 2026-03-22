@@ -13,10 +13,12 @@ gantry process              # extract text from digital PDFs
 gantry embed --chunk        # generate chunk-level embeddings
 ```
 
-Chunk-level embedding requires `sentence-transformers`:
+Chunk-level embedding requires `sentence-transformers` and `einops`:
 ```bash
 uv pip install -e ".[embeddings]" --python .venv/bin/python
 ```
+
+(Both are included in the `[embeddings]` extra. If you hit an `einops` import error, you're on an older install — re-run the command above.)
 
 ## Migration from earlier commits
 
@@ -50,6 +52,37 @@ This will regenerate chunks and reset `has_chunk_embeddings = 0`, so follow with
 **The cascade boost (0.05)** is a mild score addition for chunks whose parent document appeared in doc-level top-50. It's not a hard filter — chunks from documents outside the top-50 still appear, they just don't get the boost. If you notice retrieval quality issues, this is the first parameter to tune.
 
 **`prepare_chunk_text` prepends metadata at embedding time, not storage time.** The `chunks.text` column stores raw chunk text. The title and section header are prepended when calling the embedding model: `"search_document: {title} | {section} | {text}"`. This means if you later enrich metadata (adding titles via `gantry enrich`), you'd want to re-embed chunks to benefit from the improved context.
+
+**Hyphenated search terms.** FTS5 misparses hyphens as column filters (`cross-national` → `no such column: national`). Gantry sanitizes these automatically — hyphens become spaces before hitting MATCH. This means `cross-national` and `cross national` produce the same results. If you need an exact hyphenated match, it won't find one (FTS5 doesn't support this natively). This is an acceptable tradeoff.
+
+**Hybrid search RRF scores are ordinal, not absolute.** The fused `score` from `--hybrid` lives in a narrow ~0.016–0.033 band and is meaningless for thresholding or cross-query comparison. If you need absolute relevance signals, use `--components` to get the raw `score_fts` (BM25) and `score_vector` (cosine similarity). Cosine similarity is on a fixed 0–1 scale and survives cross-query comparison. BM25 scores are corpus-relative but still more informative than RRF.
+
+**`--fields` filters the result objects, not the top-level response.** `gantry search "X" --json --fields id,score` still returns `{"query": ..., "total": ..., "results": [{id, score}, ...]}`. The `query` and `total` wrapper fields are always present. Only the per-result objects are filtered.
+
+**`gantry info` is for targeted follow-up, not discovery.** It takes paper IDs (from a prior search) and returns metadata without re-running search. The pattern: run a broad `--fields id,score` search first, filter IDs in your logic, then `gantry info --ids 1,2,3 --json` for the survivors. Add `--chunks` if you need the actual chunk texts for those papers.
+
+## Composable search patterns
+
+For multi-step workflows, here's how the pieces fit together:
+
+```bash
+# 1. Broad pass — IDs and scores only
+gantry search "bounded rationality" --hybrid --json --fields id,score,filename
+
+# 2. With component scores — identify semantic-only vs keyword-only hits
+gantry search "bounded rationality" --hybrid --json --components --fields id,score_fts,score_vector
+
+# 3. Targeted fetch for papers that survived your filtering
+gantry info --ids 142,587,923 --json --fields filename,title,snippet
+
+# 4. Deep dive with chunk texts
+gantry info --ids 142 --json --chunks
+
+# 5. Read a specific chunk directly
+gantry read x --chunk 47
+```
+
+The key insight: `--fields` makes early passes cheap, `gantry info` makes follow-up targeted, and `--components` makes cross-query reasoning possible. You don't need to pull full snippets until you know which papers you care about.
 
 ## Useful commands for testing
 
