@@ -5,7 +5,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 -- Core papers table
@@ -88,10 +88,10 @@ CREATE TABLE IF NOT EXISTS paper_text (
     markdown_length INTEGER
 );
 
--- Embeddings via sqlite-vec
+-- Embeddings via sqlite-vec (cosine distance)
 CREATE VIRTUAL TABLE IF NOT EXISTS paper_embeddings USING vec0(
     paper_id INTEGER PRIMARY KEY,
-    embedding FLOAT[768]
+    embedding FLOAT[768] distance_metric=cosine
 );
 
 -- Document chunks for chunk-level embeddings
@@ -108,10 +108,10 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
 
--- Chunk-level embeddings via sqlite-vec
+-- Chunk-level embeddings via sqlite-vec (cosine distance)
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
     chunk_id INTEGER PRIMARY KEY,
-    embedding FLOAT[768]
+    embedding FLOAT[768] distance_metric=cosine
 );
 
 -- Schema version tracking
@@ -173,8 +173,9 @@ def migrate(conn: sqlite3.Connection) -> None:
         init_schema(conn)
         return
 
+    from .utils import now_iso
+
     if version < 2:
-        from .utils import now_iso
         conn.execute(
             "ALTER TABLE papers ADD COLUMN has_chunk_embeddings INTEGER NOT NULL DEFAULT 0"
         )
@@ -189,12 +190,55 @@ def migrate(conn: sqlite3.Connection) -> None:
             UNIQUE(doc_id, chunk_index)
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
+        # v2 tables created with cosine metric (skipping L2 intermediate)
         conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
             chunk_id INTEGER PRIMARY KEY,
-            embedding FLOAT[768]
+            embedding FLOAT[768] distance_metric=cosine
         )""")
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (2, now_iso()),
+        )
+        conn.commit()
+        version = 2
+
+    if version < 3:
+        # Recreate vec0 tables with cosine distance metric.
+        # vec0 tables can't be ALTERed — must drop and recreate.
+        # Preserve existing vectors by reading them out first.
+
+        # Migrate paper_embeddings
+        existing_doc_vecs = conn.execute(
+            "SELECT paper_id, embedding FROM paper_embeddings"
+        ).fetchall()
+        conn.execute("DROP TABLE IF EXISTS paper_embeddings")
+        conn.execute("""CREATE VIRTUAL TABLE paper_embeddings USING vec0(
+            paper_id INTEGER PRIMARY KEY,
+            embedding FLOAT[768] distance_metric=cosine
+        )""")
+        for row in existing_doc_vecs:
+            conn.execute(
+                "INSERT INTO paper_embeddings (paper_id, embedding) VALUES (?, ?)",
+                (row[0], row[1]),
+            )
+
+        # Migrate chunk_vec
+        existing_chunk_vecs = conn.execute(
+            "SELECT chunk_id, embedding FROM chunk_vec"
+        ).fetchall()
+        conn.execute("DROP TABLE IF EXISTS chunk_vec")
+        conn.execute("""CREATE VIRTUAL TABLE chunk_vec USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[768] distance_metric=cosine
+        )""")
+        for row in existing_chunk_vecs:
+            conn.execute(
+                "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+                (row[0], row[1]),
+            )
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (3, now_iso()),
         )
         conn.commit()
