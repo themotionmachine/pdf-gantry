@@ -80,9 +80,19 @@ gantry info --ids 142 --json --chunks
 
 # 5. Read a specific chunk directly
 gantry read x --chunk 47
+
+# 6. Expand context around a chunk (scoped window)
+gantry read x --chunk 47 --context 4000
+
+# 7. Fuzzy filename lookup (don't need the exact name)
+gantry find "Friston" --json
 ```
 
-The key insight: `--fields` makes early passes cheap, `gantry info` makes follow-up targeted, and `--components` makes cross-query reasoning possible. You don't need to pull full snippets until you know which papers you care about.
+The key insight: `--fields` makes early passes cheap, `gantry info` makes follow-up targeted, `--components` makes cross-query reasoning possible, and `--context` lets you zoom in without pulling the whole document. You don't need to pull full snippets until you know which papers you care about.
+
+**`gantry find` resolves partial filenames.** If you have a fragment like "Friston" or "2019_climate", `gantry find` does a case-insensitive LIKE match against all indexed filenames. Use this when you know roughly what paper you want but don't have the exact filename. Returns IDs you can feed into `gantry info` or `gantry read`.
+
+**`--context` expands outward from a chunk.** `gantry read x --chunk 47 --context 4000` gives you the target chunk plus neighboring chunks, expanding alternately before and after, until the character budget is reached. The target chunk is always included even if it exceeds the budget. Use this after a semantic search surfaces a relevant chunk — you can see what comes before and after without reading the whole document.
 
 ## Useful commands for testing
 
@@ -98,6 +108,13 @@ gantry read "some_paper.pdf" --chunks
 
 # Read a specific chunk
 gantry read x --chunk 42
+
+# Expand context around a chunk
+gantry read x --chunk 42 --context 4000
+
+# Fuzzy filename lookup
+gantry find "Friston"
+gantry find "2019" --json
 
 # Full-text search
 gantry search "adaptation strategies"
