@@ -1,9 +1,30 @@
 """Full-text search (FTS5), semantic search, hybrid search, and chunk-level search."""
 
+import re
 import sqlite3
 from collections import defaultdict
 
 from .models import ChunkResult, SearchResult
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """
+    Sanitize a query string for FTS5.
+
+    Handles hyphenated terms (e.g. "cross-national") which FTS5 misparses
+    as column filters. Replaces hyphens with spaces except inside quoted phrases.
+    """
+    # Split on quoted sections to preserve them
+    parts = re.split(r'(".*?")', query)
+    sanitized = []
+    for part in parts:
+        if part.startswith('"') and part.endswith('"'):
+            # Inside quotes: replace hyphens with spaces but keep quotes
+            sanitized.append(part.replace('-', ' '))
+        else:
+            # Outside quotes: replace hyphens with spaces
+            sanitized.append(part.replace('-', ' '))
+    return "".join(sanitized)
 
 
 def fts_search(
@@ -12,6 +33,7 @@ def fts_search(
     limit: int = 20,
 ) -> list[SearchResult]:
     """Run FTS5 search and return ranked results with snippets."""
+    safe_query = _sanitize_fts_query(query)
     # Contentless FTS5 can't use snippet() — we get snippets from paper_text instead
     rows = conn.execute(
         """SELECT
@@ -25,7 +47,7 @@ def fts_search(
         WHERE papers_fts MATCH ?
         ORDER BY rank
         LIMIT ?""",
-        (query, limit),
+        (safe_query, limit),
     ).fetchall()
 
     results = []
@@ -53,9 +75,10 @@ def fts_search(
 
 def search_count(conn: sqlite3.Connection, query: str) -> int:
     """Return the number of FTS5 matches for a query."""
+    safe_query = _sanitize_fts_query(query)
     row = conn.execute(
         "SELECT COUNT(*) FROM papers_fts WHERE papers_fts MATCH ?",
-        (query,),
+        (safe_query,),
     ).fetchone()
     return row[0]
 
@@ -108,6 +131,8 @@ def hybrid_search(
 ) -> list[SearchResult]:
     """
     Combine FTS5 and vector search using Reciprocal Rank Fusion (RRF).
+    Component scores (FTS rank, vector cosine, ordinal positions) are
+    preserved on each result for downstream composition.
     """
     fetch_limit = limit * 2
 
@@ -117,18 +142,22 @@ def hybrid_search(
     # Get semantic results
     sem_results = semantic_search(conn, query_vector, limit=fetch_limit)
 
-    # Build RRF scores
+    # Build RRF scores and track component data
     rrf_scores: dict[int, float] = {}
     result_map: dict[int, SearchResult] = {}
+    fts_data: dict[int, tuple[float, int]] = {}   # doc_id -> (score, rank)
+    vec_data: dict[int, tuple[float, int]] = {}    # doc_id -> (score, rank)
 
     for rank, r in enumerate(fts_results):
         rrf_scores[r.id] = rrf_scores.get(r.id, 0) + 1.0 / (rrf_k + rank + 1)
         result_map[r.id] = r
+        fts_data[r.id] = (r.score, rank + 1)
 
     for rank, r in enumerate(sem_results):
         rrf_scores[r.id] = rrf_scores.get(r.id, 0) + 1.0 / (rrf_k + rank + 1)
         if r.id not in result_map:
             result_map[r.id] = r
+        vec_data[r.id] = (r.score, rank + 1)
 
     # Sort by combined RRF score
     sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:limit]
@@ -137,6 +166,11 @@ def hybrid_search(
     for doc_id in sorted_ids:
         r = result_map[doc_id]
         r.score = round(rrf_scores[doc_id], 4)
+        # Populate component scores
+        if doc_id in fts_data:
+            r.score_fts, r.rank_fts = fts_data[doc_id]
+        if doc_id in vec_data:
+            r.score_vector, r.rank_vector = vec_data[doc_id]
         results.append(r)
 
     return results
