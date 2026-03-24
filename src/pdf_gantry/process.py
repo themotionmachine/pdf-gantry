@@ -31,6 +31,49 @@ def extract_text_pymupdf(pdf_path: Path) -> tuple[str, str]:
     return raw_text, markdown
 
 
+# Module-level cache for Marker models (loaded once per worker process)
+_MARKER_MODELS: dict = {}
+
+
+def extract_text_marker(pdf_path: Path) -> tuple[str, str]:
+    """
+    Extract raw text and markdown from a PDF using Marker.
+    Returns (raw_text, markdown). Marker produces high-quality markdown
+    with LaTeX equations, proper tables, and layout-aware text.
+
+    Models are cached at module level — loaded once per worker process (~8s),
+    then reused for all subsequent calls.
+    """
+    global _MARKER_MODELS
+
+    try:
+        from marker.converters.pdf import PdfConverter
+        from marker.output import text_from_rendered
+    except ImportError:
+        raise ImportError("Marker not installed. Run: pip install pdf-gantry[quality]")
+
+    if not _MARKER_MODELS:
+        from marker.models import create_model_dict
+        from marker.config.parser import ConfigParser
+        config_parser = ConfigParser({"output_format": "markdown"})
+        _MARKER_MODELS["models"] = create_model_dict()
+        _MARKER_MODELS["config"] = config_parser.generate_config_dict()
+
+    converter = PdfConverter(
+        artifact_dict=_MARKER_MODELS["models"],
+        config=_MARKER_MODELS["config"],
+    )
+    rendered = converter(str(pdf_path))
+    markdown, ext, images = text_from_rendered(rendered)
+
+    # Raw text via fitz (same as pymupdf4llm path)
+    doc = fitz.open(str(pdf_path))
+    raw_text = "\n".join(page.get_text() for page in doc)
+    doc.close()
+
+    return raw_text, markdown
+
+
 def _process_single(
     paper_id: int,
     pdf_path: str,
@@ -49,6 +92,8 @@ def _process_single(
 
         if method == "pymupdf4llm":
             raw_text, markdown = extract_text_pymupdf(full_path)
+        elif method == "marker":
+            raw_text, markdown = extract_text_marker(full_path)
         else:
             return (paper_id, False, f"Unknown method: {method}")
 
@@ -154,6 +199,10 @@ def process_documents(
     Process documents matching the given IDs (or all needing text).
     Returns processing statistics.
     """
+    # Marker is internally parallelized — multiple workers would OOM
+    if method == "marker" and workers > 1:
+        workers = 1
+
     stats = ProcessStats()
     start = time.time()
 
