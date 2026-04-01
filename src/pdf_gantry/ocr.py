@@ -1,4 +1,4 @@
-"""OCR detection and processing for scanned PDFs."""
+"""OCR detection and processing for scanned PDFs using Surya."""
 
 import sqlite3
 import time
@@ -6,6 +6,11 @@ from pathlib import Path
 
 from .models import ProcessStats
 from .utils import now_iso
+
+# Lazy-loaded predictor singletons (expensive to initialize)
+_foundation_predictor = None
+_recognition_predictor = None
+_detection_predictor = None
 
 
 def _check_surya_available():
@@ -17,28 +22,38 @@ def _check_surya_available():
         return False
 
 
+def _load_predictors():
+    """Load Surya predictors once and cache at module level."""
+    global _foundation_predictor, _recognition_predictor, _detection_predictor
+    if _recognition_predictor is None:
+        from surya.foundation import FoundationPredictor
+        from surya.recognition import RecognitionPredictor
+        from surya.detection import DetectionPredictor
+
+        _foundation_predictor = FoundationPredictor()
+        _recognition_predictor = RecognitionPredictor(_foundation_predictor)
+        _detection_predictor = DetectionPredictor()
+    return _recognition_predictor, _detection_predictor
+
+
+
 def ocr_document(pdf_path: Path) -> tuple[str, str]:
     """
     Run OCR on a scanned PDF using Surya.
     Returns (raw_text, markdown).
     """
-    try:
-        from surya.ocr import run_ocr
-        from surya.model.detection.model import load_model as load_det_model
-        from surya.model.detection.processor import load_processor as load_det_processor
-        from surya.model.recognition.model import load_model as load_rec_model
-        from surya.model.recognition.processor import load_processor as load_rec_processor
-        import fitz
-    except ImportError:
+    if not _check_surya_available():
         raise ImportError("Surya OCR not installed. Run: pip install pdf-gantry[ocr]")
+
+    import fitz
+    from PIL import Image
+    import io
 
     # Open PDF and convert pages to images
     doc = fitz.open(str(pdf_path))
     images = []
     for page in doc:
         pix = page.get_pixmap(dpi=300)
-        from PIL import Image
-        import io
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         images.append(img)
     doc.close()
@@ -46,19 +61,15 @@ def ocr_document(pdf_path: Path) -> tuple[str, str]:
     if not images:
         return "", ""
 
-    # Load models
-    det_model = load_det_model()
-    det_processor = load_det_processor()
-    rec_model = load_rec_model()
-    rec_processor = load_rec_processor()
+    # Load predictors (cached at module level)
+    rec_predictor, det_predictor = _load_predictors()
 
     # Run OCR
-    langs = [["en"]] * len(images)
-    results = run_ocr(images, langs, det_model, det_processor, rec_model, rec_processor)
+    predictions = rec_predictor(images, det_predictor=det_predictor)
 
     # Extract text
     pages_text = []
-    for page_result in results:
+    for page_result in predictions:
         lines = [line.text for line in page_result.text_lines]
         pages_text.append("\n".join(lines))
 
@@ -78,10 +89,11 @@ def process_ocr_documents(
     db_path: Path,
     paper_ids: list[int] | None = None,
     limit: int | None = None,
+    dry_run: bool = False,
     progress_callback=None,
 ) -> ProcessStats:
     """Process scanned PDFs with OCR."""
-    if not _check_surya_available():
+    if not dry_run and not _check_surya_available():
         raise ImportError("Surya OCR not installed. Run: pip install pdf-gantry[ocr]")
 
     stats = ProcessStats()
@@ -102,6 +114,11 @@ def process_ocr_documents(
         rows = rows[:limit]
 
     stats.total = len(rows)
+
+    if dry_run:
+        stats.elapsed_seconds = round(time.time() - start, 1)
+        return stats
+
     completed = 0
 
     for row in rows:

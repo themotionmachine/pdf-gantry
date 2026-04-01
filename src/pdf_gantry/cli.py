@@ -423,6 +423,104 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
         ctx.exit(EXIT_ERROR)
 
 
+# --- ocr ---
+
+@cli.command()
+@filter_options
+@click.option("--dry-run", is_flag=True, help="Report what would happen without processing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_output):
+    """Run OCR on scanned PDFs using Surya."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    conn = get_connection(cfg.db_path)
+
+    from .queue import build_filter_query
+
+    # Default: papers that need OCR
+    if not needs and not has_prop and not is_prop:
+        needs = ("ocr",)
+
+    where, params = build_filter_query(
+        needs=list(needs) if needs else None,
+        has=list(has_prop) if has_prop else None,
+        is_prop=list(is_prop) if is_prop else None,
+    )
+
+    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+    paper_ids = [r["id"] for r in rows]
+
+    if dry_run:
+        count = len(paper_ids) if limit is None else min(len(paper_ids), limit)
+        if use_json:
+            click.echo(json.dumps({"would_process": count, "method": "surya"}))
+        else:
+            click.echo(f"Would OCR {format_count(count)} documents with Surya")
+        return
+
+    if not paper_ids:
+        if use_json:
+            click.echo(json.dumps({"total": 0, "message": "Nothing to OCR"}))
+        else:
+            click.echo("Nothing to OCR")
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    from .ocr import process_ocr_documents
+
+    actual = len(paper_ids) if limit is None else min(len(paper_ids), limit)
+
+    progress_bar = None
+    task = None
+    if not use_json:
+        err_console.print(f"Running OCR on {format_count(actual)} documents with Surya")
+        progress_bar = Progress(
+            BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=err_console,
+        )
+        task = progress_bar.add_task("OCR", total=actual)
+        progress_bar.start()
+
+    def on_progress(current, total):
+        if progress_bar and task is not None:
+            progress_bar.update(task, completed=current)
+
+    try:
+        stats = process_ocr_documents(
+            conn, cfg.papers_dir, cfg.db_path,
+            paper_ids=paper_ids, limit=limit,
+            progress_callback=on_progress,
+        )
+    finally:
+        if progress_bar:
+            progress_bar.stop()
+
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps({
+            "total": stats.total,
+            "succeeded": stats.succeeded,
+            "failed": stats.failed,
+            "elapsed_seconds": stats.elapsed_seconds,
+            "method": "surya",
+        }, indent=2))
+    else:
+        click.echo(f"OCR'd {format_count(stats.total)} documents in {format_duration(stats.elapsed_seconds)}")
+        click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
+        if stats.failed > 0:
+            click.echo(f"  Failed: {format_count(stats.failed)} (use 'gantry queue --has errors' to see failures)")
+
+    if stats.failed > 0 and stats.succeeded > 0:
+        ctx.exit(EXIT_PARTIAL)
+    elif stats.failed > 0 and stats.succeeded == 0:
+        ctx.exit(EXIT_ERROR)
+
+
 # --- search ---
 
 @cli.command()
