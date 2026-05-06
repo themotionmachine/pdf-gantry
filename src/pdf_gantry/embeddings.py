@@ -117,8 +117,13 @@ def embed_documents(
         for i, row in enumerate(batch):
             try:
                 vec_bytes = _serialize_vector(vectors[i])
+                # vec0 virtual tables don't honor INSERT OR REPLACE — DELETE first.
                 conn.execute(
-                    "INSERT OR REPLACE INTO paper_embeddings (paper_id, embedding) VALUES (?, ?)",
+                    "DELETE FROM paper_embeddings WHERE paper_id = ?",
+                    (row["id"],),
+                )
+                conn.execute(
+                    "INSERT INTO paper_embeddings (paper_id, embedding) VALUES (?, ?)",
                     (row["id"], vec_bytes),
                 )
                 conn.execute(
@@ -234,8 +239,13 @@ def embed_chunks(
         for i, chunk in enumerate(batch):
             try:
                 vec_bytes = _serialize_vector(vectors[i])
+                # vec0 virtual tables don't honor INSERT OR REPLACE — DELETE first.
                 conn.execute(
-                    "INSERT OR REPLACE INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+                    "DELETE FROM chunk_vec WHERE chunk_id = ?",
+                    (chunk["chunk_id"],),
+                )
+                conn.execute(
+                    "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
                     (chunk["chunk_id"], vec_bytes),
                 )
                 stats.succeeded += 1

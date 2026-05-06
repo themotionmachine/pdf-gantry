@@ -61,3 +61,76 @@ def test_embed_documents_requires_sentence_transformers(tmp_path, papers_dir):
         pass
     finally:
         conn.close()
+
+
+def test_embed_chunks_overwrites_existing_vectors(tmp_path, papers_dir):
+    """Re-embedding must replace existing chunk_vec rows.
+
+    Regression: vec0 virtual tables don't honor `INSERT OR REPLACE` and raise
+    `UNIQUE constraint failed` on PK collision. The embed path must DELETE
+    before INSERT so re-embeds succeed.
+    """
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+    ingest_directory(conn, papers_dir)
+    process_documents(conn, papers_dir, db_path, workers=1)
+
+    paper_ids = [r["id"] for r in conn.execute("SELECT id FROM papers").fetchall()]
+    assert paper_ids, "fixture should produce at least one paper"
+
+    try:
+        from pdf_gantry.embeddings import embed_chunks
+    except ImportError:
+        pytest.skip("sentence-transformers not installed")
+
+    try:
+        first = embed_chunks(conn, db_path, paper_ids=paper_ids)
+    except ImportError:
+        pytest.skip("sentence-transformers not installed")
+
+    assert first.total > 0, "fixture should produce chunks"
+    assert first.failed == 0, f"first embed unexpectedly failed: {first.failed}"
+
+    second = embed_chunks(conn, db_path, paper_ids=paper_ids)
+    assert second.failed == 0, (
+        f"re-embed produced {second.failed} failures — INSERT OR REPLACE on vec0 "
+        "doesn't work; embed_chunks must DELETE before INSERT"
+    )
+    assert second.succeeded == first.succeeded
+    conn.close()
+
+
+def test_embed_documents_overwrites_existing_vectors(tmp_path, papers_dir):
+    """Re-embedding papers must replace existing paper_embeddings rows.
+
+    Same vec0 `INSERT OR REPLACE` regression as the chunk path.
+    """
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+    ingest_directory(conn, papers_dir)
+    process_documents(conn, papers_dir, db_path, workers=1)
+
+    try:
+        from pdf_gantry.embeddings import embed_documents
+    except ImportError:
+        pytest.skip("sentence-transformers not installed")
+
+    try:
+        first = embed_documents(conn, db_path)
+    except ImportError:
+        pytest.skip("sentence-transformers not installed")
+
+    assert first.total > 0
+    assert first.failed == 0, f"first embed unexpectedly failed: {first.failed}"
+
+    # Force re-embed by clearing the flag (rows in paper_embeddings remain).
+    conn.execute("UPDATE papers SET has_embeddings = 0")
+    conn.commit()
+
+    second = embed_documents(conn, db_path)
+    assert second.failed == 0, (
+        f"re-embed produced {second.failed} failures — INSERT OR REPLACE on vec0 "
+        "doesn't work; embed_documents must DELETE before INSERT"
+    )
+    assert second.succeeded == first.succeeded
+    conn.close()
