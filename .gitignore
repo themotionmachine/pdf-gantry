@@ -35,3 +35,8 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Private project docs (kept local, scrubbed from history)
+CLAUDE.md
+Brev.md
+pdf-gantry-prd.md
