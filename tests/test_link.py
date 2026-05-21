@@ -12,6 +12,8 @@ from pdf_gantry.link import (
     LinkMatch,
     apply_matches,
     extract_bib_filename,
+    generate_bib_content,
+    generate_citekey,
     match_by_doi,
     match_by_filename,
     match_by_title,
@@ -466,43 +468,167 @@ def cli_db(tmp_path, bib_file):
     return tmp_path, bib_file, config_file
 
 
-def test_cli_link_report(cli_db, monkeypatch):
+def test_cli_link_check_report(cli_db, monkeypatch):
     tmp_path, bib_file, config_file = cli_db
     monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
     runner = CliRunner()
-    result = runner.invoke(cli, ["link", str(bib_file)])
+    result = runner.invoke(cli, ["link", "check", str(bib_file)])
     assert result.exit_code == 0
     assert "DOI matches" in result.output
 
 
-def test_cli_link_json(cli_db, monkeypatch):
+def test_cli_link_check_json(cli_db, monkeypatch):
     tmp_path, bib_file, config_file = cli_db
     monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
     runner = CliRunner()
-    result = runner.invoke(cli, ["link", str(bib_file), "--json"])
+    result = runner.invoke(cli, ["link", "check", str(bib_file), "--json"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert "matches" in data
     assert "total_papers" in data
 
 
-def test_cli_link_apply(cli_db, monkeypatch):
+def test_cli_link_check_apply(cli_db, monkeypatch):
     tmp_path, bib_file, config_file = cli_db
     monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
     runner = CliRunner()
-    result = runner.invoke(cli, ["link", str(bib_file), "--apply"])
+    result = runner.invoke(
+        cli, ["link", "check", str(bib_file), "--apply"]
+    )
     assert result.exit_code == 0
     assert "Applied" in result.output
 
     conn = get_connection(str(tmp_path / "index.db"))
-    row = conn.execute("SELECT COUNT(*) FROM papers WHERE citekey IS NOT NULL").fetchone()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE citekey IS NOT NULL"
+    ).fetchone()
     assert row[0] >= 1
     conn.close()
 
 
-def test_cli_link_no_bib_path(cli_db, monkeypatch):
+def test_cli_link_check_no_bib_path(cli_db, monkeypatch):
     tmp_path, _, config_file = cli_db
     monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
     runner = CliRunner()
-    result = runner.invoke(cli, ["link"])
+    result = runner.invoke(cli, ["link", "check"])
     assert result.exit_code != 0
+
+
+# --- generate_citekey ---
+
+
+def test_generate_citekey_basic():
+    key = generate_citekey("Smith, John", 2024, "Climate Policy")
+    assert key == "smith2024climate"
+
+
+def test_generate_citekey_multi_author():
+    key = generate_citekey(
+        "Smith, John and Doe, Jane and Lee, Kim", 2024, "Climate"
+    )
+    assert key == "smith2024climate"
+
+
+def test_generate_citekey_no_year():
+    key = generate_citekey("Smith, John", None, "Climate Policy")
+    assert "smith" in key
+    assert "climate" in key
+
+
+def test_generate_citekey_no_author():
+    key = generate_citekey(None, 2024, "Climate Policy")
+    assert "2024" in key
+    assert "climate" in key
+
+
+def test_generate_citekey_no_title():
+    key = generate_citekey("Smith, John", 2024, None)
+    assert key == "smith2024"
+
+
+def test_generate_citekey_nothing():
+    key = generate_citekey(None, None, None)
+    assert key == "unknown"
+
+
+def test_generate_citekey_strips_special_chars():
+    key = generate_citekey("O'Brien, Pat", 2024, "AI & ML: A Review")
+    assert "'" not in key
+    assert "&" not in key
+    assert ":" not in key
+
+
+# --- generate_bib_content ---
+
+
+def test_generate_bib_content_basic():
+    papers = [
+        {"title": "Climate Policy", "authors": "Smith, John",
+         "year": 2024, "doi": "10.1234/test", "filename": "smith.pdf"},
+    ]
+    content = generate_bib_content(papers)
+    assert "@article{smith2024climate" in content
+    assert "title = {Climate Policy}" in content
+    assert "doi = {10.1234/test}" in content
+
+
+def test_generate_bib_content_no_metadata():
+    papers = [
+        {"title": None, "authors": None, "year": None,
+         "doi": None, "filename": "mystery.pdf"},
+    ]
+    content = generate_bib_content(papers)
+    assert "@misc{unknown" in content
+    assert "mystery.pdf" in content
+
+
+def test_generate_bib_content_deduplicates_citekeys():
+    papers = [
+        {"title": "Climate Policy", "authors": "Smith, John",
+         "year": 2024, "doi": None, "filename": "a.pdf"},
+        {"title": "Climate Policy Revisited", "authors": "Smith, John",
+         "year": 2024, "doi": None, "filename": "b.pdf"},
+    ]
+    content = generate_bib_content(papers)
+    assert "smith2024climate," in content
+    assert "smith2024climateb," in content or "smith2024climatea," in content
+
+
+# --- CLI link init ---
+
+
+def test_cli_link_init(cli_db, monkeypatch, tmp_path):
+    _, _, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    out_bib = tmp_path / "output.bib"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "init", str(out_bib)])
+    assert result.exit_code == 0
+    assert out_bib.exists()
+    content = out_bib.read_text()
+    assert "@" in content
+
+
+def test_cli_link_init_json(cli_db, monkeypatch, tmp_path):
+    _, _, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    out_bib = tmp_path / "output.bib"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["link", "init", str(out_bib), "--json"]
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "entries" in data
+    assert "path" in data
+
+
+def test_cli_link_init_no_overwrite(cli_db, monkeypatch, tmp_path):
+    _, _, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    out_bib = tmp_path / "output.bib"
+    out_bib.write_text("existing content")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "init", str(out_bib)])
+    assert result.exit_code != 0
+    assert out_bib.read_text() == "existing content"

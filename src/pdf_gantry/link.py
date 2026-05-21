@@ -1,4 +1,4 @@
-"""BibTeX reconciliation — match PDFs to bibliography entries."""
+"""BibTeX reconciliation and bibliography generation."""
 
 import re
 import sqlite3
@@ -7,6 +7,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 import bibtexparser
+
+_CITEKEY_CLEAN_RE = re.compile(r"[^a-z0-9]")
 
 
 @dataclass
@@ -308,3 +310,80 @@ def apply_matches(
 
     conn.commit()
     return applied
+
+
+# --- Bibliography generation ---
+
+
+def generate_citekey(
+    authors: str | None,
+    year: int | None,
+    title: str | None,
+) -> str:
+    parts = []
+
+    if authors:
+        first_author = authors.split(" and ")[0].strip()
+        if "," in first_author:
+            last_name = first_author.split(",")[0].strip()
+        else:
+            last_name = first_author.split()[-1] if first_author.split() else ""
+        clean = _CITEKEY_CLEAN_RE.sub("", last_name.lower())
+        if clean:
+            parts.append(clean)
+
+    if year is not None:
+        parts.append(str(year))
+
+    if title:
+        stop_words = {"a", "an", "the", "of", "in", "on", "for", "and", "to"}
+        words = re.findall(r"[a-z]+", title.lower())
+        first_word = next(
+            (w for w in words if w not in stop_words), None
+        )
+        if first_word:
+            parts.append(first_word)
+
+    return "".join(parts) if parts else "unknown"
+
+
+def _format_bib_entry(
+    citekey: str,
+    paper: dict,
+) -> str:
+    entry_type = "article" if paper.get("doi") else "misc"
+    lines = [f"@{entry_type}{{{citekey},"]
+
+    if paper.get("title"):
+        lines.append(f"  title = {{{paper['title']}}},")
+    if paper.get("authors"):
+        lines.append(f"  author = {{{paper['authors']}}},")
+    if paper.get("year"):
+        lines.append(f"  year = {{{paper['year']}}},")
+    if paper.get("doi"):
+        lines.append(f"  doi = {{{paper['doi']}}},")
+    lines.append(f"  file = {{{paper['filename']}}},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def generate_bib_content(papers: list[dict]) -> str:
+    used_keys: dict[str, int] = {}
+    entries = []
+
+    for paper in papers:
+        base_key = generate_citekey(
+            paper.get("authors"), paper.get("year"), paper.get("title")
+        )
+
+        if base_key in used_keys:
+            used_keys[base_key] += 1
+            suffix = chr(ord("a") + used_keys[base_key] - 1)
+            key = f"{base_key}{suffix}"
+        else:
+            used_keys[base_key] = 1
+            key = base_key
+
+        entries.append(_format_bib_entry(key, paper))
+
+    return "\n\n".join(entries) + "\n"

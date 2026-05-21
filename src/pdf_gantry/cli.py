@@ -1786,12 +1786,22 @@ def vault_coverage(ctx, json_output):
 cli.add_command(vault)
 
 
-# --- link command ---
+# --- link command group ---
 
 
-@cli.command()
-@click.argument("bib_path", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--apply", "do_apply", is_flag=True, help="Write matches to the database")
+@cli.group()
+def link():
+    """Bibliography linking and generation."""
+    pass
+
+
+@link.command()
+@click.argument(
+    "bib_path", required=False,
+    type=click.Path(exists=True, path_type=Path),
+)
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Write matches to the database")
 @click.option("--include-uncertain", is_flag=True,
               help="Also apply uncertain title matches (requires --apply)")
 @click.option("--force", is_flag=True,
@@ -1800,7 +1810,7 @@ cli.add_command(vault)
               help="Title similarity threshold (0.5-1.0)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def link(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_output):
+def check(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_output):
     """Reconcile PDFs against a BibTeX bibliography."""
     import time
 
@@ -1810,7 +1820,10 @@ def link(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_outp
     if bib_path is None:
         bib_path = cfg.bib_path
     if bib_path is None:
-        msg = "No .bib file specified. Pass a path or set bib_path in config."
+        msg = (
+            "No .bib file specified. "
+            "Pass a path or set bib_path in config."
+        )
         if use_json:
             click.echo(json.dumps({"error": msg}))
         else:
@@ -1820,7 +1833,8 @@ def link(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_outp
 
     bib_path = Path(bib_path)
 
-    from .link import parse_bib_file, reconcile, apply_matches
+    from .link import apply_matches as do_apply_matches
+    from .link import parse_bib_file, reconcile as do_reconcile
 
     start = time.monotonic()
     entries = parse_bib_file(bib_path)
@@ -1834,20 +1848,25 @@ def link(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_outp
         return
 
     conn = get_connection(cfg.db_path)
-    matches, stats = reconcile(conn, entries, threshold=threshold)
+    matches, stats = do_reconcile(conn, entries, threshold=threshold)
     elapsed = time.monotonic() - start
 
     applied = 0
     if do_apply:
-        applied = apply_matches(conn, matches,
-                                include_uncertain=include_uncertain,
-                                force=force)
+        applied = do_apply_matches(
+            conn, matches,
+            include_uncertain=include_uncertain, force=force,
+        )
         stats.applied = applied
 
     conn.close()
 
-    certain_matches = [m for m in matches if m.confidence in ("certain", "likely")]
-    uncertain_matches = [m for m in matches if m.confidence == "uncertain"]
+    certain_matches = [
+        m for m in matches if m.confidence in ("certain", "likely")
+    ]
+    uncertain_matches = [
+        m for m in matches if m.confidence == "uncertain"
+    ]
 
     if use_json:
         click.echo(json.dumps({
@@ -1890,29 +1909,112 @@ def link(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_outp
         }, indent=2))
     else:
         click.echo(
-            f"Reconciliation: {bib_path.name} ({stats.total_bib_entries} entries) "
+            f"Reconciliation: {bib_path.name} "
+            f"({stats.total_bib_entries} entries) "
             f"vs {stats.total_papers} indexed papers\n"
         )
-        click.echo(f"  DOI matches:        {stats.matched_doi} certain")
-        click.echo(f"  Filename matches:   {stats.matched_filename} likely")
-        title_total = stats.matched_title_certain + stats.matched_title_uncertain
         click.echo(
-            f"  Title matches:      {title_total} "
-            f"({stats.matched_title_certain} certain, {stats.matched_title_uncertain} uncertain)"
+            f"  DOI matches:        {stats.matched_doi} certain"
+        )
+        click.echo(
+            f"  Filename matches:   {stats.matched_filename} likely"
+        )
+        tc = stats.matched_title_certain
+        tu = stats.matched_title_uncertain
+        click.echo(
+            f"  Title matches:      {tc + tu} "
+            f"({tc} certain, {tu} uncertain)"
         )
         click.echo()
-        click.echo(f"  Matched:           {len(matches)} / {stats.total_papers} papers")
+        click.echo(
+            f"  Matched:           "
+            f"{len(matches)} / {stats.total_papers} papers"
+        )
         click.echo(f"  Unmatched papers:  {stats.unmatched_papers}")
         click.echo(f"  Unmatched bib:     {stats.unmatched_bib}")
 
         if uncertain_matches:
-            click.echo(f"\n  Uncertain matches (review with --include-uncertain):")
+            click.echo(
+                "\n  Uncertain matches "
+                "(review with --include-uncertain):"
+            )
             for m in uncertain_matches[:10]:
-                click.echo(f"    [{m.paper_id:>4}] {m.filename}  →  @{m.citekey}  ({m.score:.2f})")
+                click.echo(
+                    f"    [{m.paper_id:>4}] {m.filename}"
+                    f"  →  @{m.citekey}  ({m.score:.2f})"
+                )
             if len(uncertain_matches) > 10:
-                click.echo(f"    ... and {len(uncertain_matches) - 10} more")
+                click.echo(
+                    f"    ... and {len(uncertain_matches) - 10} more"
+                )
 
         if do_apply:
-            click.echo(f"\n  Applied {applied} citekeys to database.")
+            click.echo(
+                f"\n  Applied {applied} citekeys to database."
+            )
         else:
-            click.echo(f"\n  To apply: gantry link {bib_path} --apply")
+            click.echo(
+                f"\n  To apply: gantry link check {bib_path} --apply"
+            )
+
+
+@link.command()
+@click.argument("output", type=click.Path(path_type=Path))
+@click.option("--force", is_flag=True,
+              help="Overwrite existing file")
+@click.option("--json", "json_output", is_flag=True,
+              help="Output as JSON")
+@click.pass_context
+def init(ctx, output, force, json_output):
+    """Generate a .bib file from enriched paper metadata."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if output.exists() and not force:
+        msg = (
+            f"{output} already exists. "
+            "Use --force to overwrite."
+        )
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    rows = conn.execute(
+        "SELECT title, authors, year, doi, filename FROM papers "
+        "ORDER BY filename"
+    ).fetchall()
+    conn.close()
+
+    papers = [dict(r) for r in rows]
+
+    from .link import generate_bib_content
+
+    content = generate_bib_content(papers)
+    output.write_text(content)
+
+    entry_count = content.count("@")
+
+    if use_json:
+        click.echo(json.dumps({
+            "path": str(output),
+            "entries": entry_count,
+            "total_papers": len(papers),
+        }, indent=2))
+    else:
+        click.echo(
+            f"Wrote {entry_count} entries to {output} "
+            f"({len(papers)} papers)"
+        )
