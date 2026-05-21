@@ -37,6 +37,7 @@ class Config:
     papers_dir: Path = field(default_factory=lambda: DEFAULT_PAPERS_DIR)
     index_dir: Path = field(default_factory=lambda: GANTRY_DIR)
     vault_dir: Path | None = None
+    bib_path: Path | None = None
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -65,6 +66,8 @@ def load_config() -> Config:
             cfg.index_dir = _expand(data["index_dir"])
         if "vault_dir" in data and data["vault_dir"]:
             cfg.vault_dir = _expand(data["vault_dir"])
+        if "bib_path" in data and data["bib_path"]:
+            cfg.bib_path = _expand(data["bib_path"])
 
         if "embedding" in data and isinstance(data["embedding"], dict):
             for k, v in data["embedding"].items():
@@ -88,6 +91,8 @@ def load_config() -> Config:
         cfg.index_dir = _expand(env_index)
     if env_vault := os.environ.get("GANTRY_VAULT_DIR"):
         cfg.vault_dir = _expand(env_vault)
+    if env_bib := os.environ.get("GANTRY_BIB_PATH"):
+        cfg.bib_path = _expand(env_bib)
 
     return cfg
 
@@ -102,6 +107,8 @@ def save_config(cfg: Config) -> None:
     }
     if cfg.vault_dir:
         data["vault_dir"] = str(cfg.vault_dir)
+    if cfg.bib_path:
+        data["bib_path"] = str(cfg.bib_path)
 
     data["embedding"] = {
         "model": cfg.embedding.model,
@@ -131,6 +138,8 @@ def set_config_value(key: str, value: str) -> Config:
         cfg.index_dir = _expand(value)
     elif key == "vault_dir":
         cfg.vault_dir = _expand(value) if value else None
+    elif key == "bib_path":
+        cfg.bib_path = _expand(value) if value else None
     else:
         raise ValueError(f"Unknown config key: {key}")
     save_config(cfg)

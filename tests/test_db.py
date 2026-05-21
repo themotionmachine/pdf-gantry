@@ -6,7 +6,7 @@ import pytest
 
 from pdf_gantry.db import get_connection, get_schema_version, SCHEMA_VERSION
 
-assert SCHEMA_VERSION == 3, "Update tests if schema version changes"
+assert SCHEMA_VERSION == 4, "Update tests if schema version changes"
 
 
 def test_schema_creation(tmp_path):
@@ -122,6 +122,26 @@ def test_chunks_foreign_key_cascade(tmp_db):
     tmp_db.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
     tmp_db.commit()
     assert tmp_db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+
+
+def test_citekey_column_exists(tmp_db):
+    """papers table has citekey and citekey_source columns (schema v4)."""
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    tmp_db.commit()
+    row = tmp_db.execute("SELECT citekey, citekey_source FROM papers WHERE path = 'test.pdf'").fetchone()
+    assert row["citekey"] is None
+    assert row["citekey_source"] is None
+
+
+def test_citekey_index_exists(tmp_db):
+    """Index on citekey column exists (schema v4)."""
+    row = tmp_db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_papers_citekey'"
+    ).fetchone()
+    assert row is not None
 
 
 def test_idempotent_connection(tmp_path):

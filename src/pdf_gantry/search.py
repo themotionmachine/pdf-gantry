@@ -291,7 +291,7 @@ def find_papers(
     """Fuzzy filename lookup using LIKE matching (case-insensitive)."""
     rows = conn.execute(
         """SELECT id, filename, path, title, page_count, has_text, has_markdown,
-                  has_embeddings, has_chunk_embeddings, is_scanned
+                  has_embeddings, has_chunk_embeddings, is_scanned, citekey
         FROM papers
         WHERE filename LIKE ?
         ORDER BY filename

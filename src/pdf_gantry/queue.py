@@ -2,8 +2,6 @@
 
 import sqlite3
 
-from .models import Paper
-
 
 def build_filter_query(
     needs: list[str] | None = None,
@@ -34,6 +32,8 @@ def build_filter_query(
                 conditions.append("has_chunk_embeddings = 0")
             elif n == "metadata":
                 conditions.append("(doi IS NULL OR metadata_enriched_at IS NULL)")
+            elif n == "citekey":
+                conditions.append("citekey IS NULL")
 
     if has:
         for h in has:
@@ -47,6 +47,8 @@ def build_filter_query(
                 conditions.append("has_chunk_embeddings = 1")
             elif h == "errors":
                 conditions.append("error_count > 0")
+            elif h == "citekey":
+                conditions.append("citekey IS NOT NULL")
 
     if is_prop:
         for p in is_prop:

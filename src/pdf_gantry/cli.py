@@ -28,10 +28,16 @@ err_console = Console(stderr=True)
 def filter_options(f):
     """Shared Click options for document filtering."""
     @click.option("--needs", multiple=True,
-                  type=click.Choice(["text", "markdown", "embeddings", "chunk_embeddings", "ocr", "metadata"]),
+                  type=click.Choice([
+                      "text", "markdown", "embeddings", "chunk_embeddings",
+                      "ocr", "metadata", "citekey",
+                  ]),
                   help="Filter to documents missing this property")
     @click.option("--has", "has_prop", multiple=True,
-                  type=click.Choice(["text", "markdown", "embeddings", "chunk_embeddings", "errors"]),
+                  type=click.Choice([
+                      "text", "markdown", "embeddings", "chunk_embeddings",
+                      "errors", "citekey",
+                  ]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice(["scanned", "digital"]),
@@ -585,6 +591,18 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
         ctx.exit(EXIT_NO_RESULTS)
         return
 
+    # Lookup citekeys for result papers
+    result_ids = [r.id for r in results]
+    citekey_map = {}
+    if result_ids:
+        placeholders = ",".join("?" * len(result_ids))
+        conn2 = get_connection(cfg.db_path)
+        rows = conn2.execute(
+            f"SELECT id, citekey FROM papers WHERE id IN ({placeholders})", result_ids
+        ).fetchall()
+        citekey_map = {row["id"]: row["citekey"] for row in rows}
+        conn2.close()
+
     if use_json:
         result_dicts = []
         for r in results:
@@ -596,6 +614,7 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
                 "snippet": r.snippet,
                 "has_markdown": r.has_markdown,
                 "has_embeddings": r.has_embeddings,
+                "citekey": citekey_map.get(r.id),
             }
             if components and hybrid:
                 d["score_fts"] = r.score_fts
@@ -616,7 +635,9 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
         click.echo(f'Found {total} results for "{query}"')
         click.echo()
         for i, r in enumerate(results, 1):
-            click.echo(f" {i:2d}. [{r.score:.2f}] {r.filename}")
+            ck = citekey_map.get(r.id)
+            ck_str = f" @{ck}" if ck else ""
+            click.echo(f" {i:2d}. [{r.score:.2f}] {r.filename}{ck_str}")
             if components and hybrid and (r.score_fts is not None or r.score_vector is not None):
                 fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
                 vec_str = f"vec={r.score_vector:.4f}" if r.score_vector is not None else "vec=--"
@@ -1331,6 +1352,7 @@ def find(ctx, fragment, limit, json_output):
                     "title": r["title"],
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
+                    "citekey": r.get("citekey"),
                 }
                 for r in results
             ],
@@ -1339,8 +1361,10 @@ def find(ctx, fragment, limit, json_output):
         click.echo(f'{len(results)} papers matching "{fragment}"')
         click.echo()
         for r in results:
+            ck = r.get("citekey")
+            ck_str = f" @{ck}" if ck else ""
             extra = f" — {r['title']}" if r["title"] else ""
-            click.echo(f"  [{r['id']:4d}] {r['filename']}{extra}")
+            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}")
 
 
 # --- info ---
@@ -1386,6 +1410,7 @@ def info(ctx, ids, field_list, include_chunks, json_output):
                    p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
                    p.has_chunk_embeddings, p.page_count, p.is_scanned,
                    p.text_method, p.error_count, p.last_error,
+                   p.citekey, p.citekey_source,
                    SUBSTR(pt.raw_text, 1, 300) as snippet
             FROM papers p
             LEFT JOIN paper_text pt ON pt.paper_id = p.id
@@ -1421,6 +1446,8 @@ def info(ctx, ids, field_list, include_chunks, json_output):
             "has_chunk_embeddings": bool(r["has_chunk_embeddings"]),
             "is_scanned": bool(r["is_scanned"]) if r["is_scanned"] is not None else None,
             "error_count": r["error_count"],
+            "citekey": r["citekey"],
+            "citekey_source": r["citekey_source"],
         }
 
         if include_chunks:
@@ -1459,6 +1486,8 @@ def info(ctx, ids, field_list, include_chunks, json_output):
                 click.echo(f"  Year: {d['year']}")
             if d.get("doi"):
                 click.echo(f"  DOI: {d['doi']}")
+            if d.get("citekey"):
+                click.echo(f"  Citekey: @{d['citekey']} ({d.get('citekey_source', '?')})")
             click.echo()
 
 
@@ -1755,3 +1784,237 @@ def vault_coverage(ctx, json_output):
 
 
 cli.add_command(vault)
+
+
+# --- link command group ---
+
+
+@cli.group()
+def link():
+    """Bibliography linking and generation."""
+    pass
+
+
+@link.command()
+@click.argument(
+    "bib_path", required=False,
+    type=click.Path(exists=True, path_type=Path),
+)
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Write matches to the database")
+@click.option("--include-uncertain", is_flag=True,
+              help="Also apply uncertain title matches (requires --apply)")
+@click.option("--force", is_flag=True,
+              help="Overwrite existing citekeys (requires --apply)")
+@click.option("--threshold", type=float, default=0.85,
+              help="Title similarity threshold (0.5-1.0)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def check(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_output):
+    """Reconcile PDFs against a BibTeX bibliography."""
+    import time
+
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if bib_path is None:
+        bib_path = cfg.bib_path
+    if bib_path is None:
+        msg = (
+            "No .bib file specified. "
+            "Pass a path or set bib_path in config."
+        )
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    bib_path = Path(bib_path)
+
+    from .link import apply_matches as do_apply_matches
+    from .link import parse_bib_file, reconcile as do_reconcile
+
+    start = time.monotonic()
+    entries = parse_bib_file(bib_path)
+    if not entries:
+        msg = f"No entries found in {bib_path}"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    conn = get_connection(cfg.db_path)
+    matches, stats = do_reconcile(conn, entries, threshold=threshold)
+    elapsed = time.monotonic() - start
+
+    applied = 0
+    if do_apply:
+        applied = do_apply_matches(
+            conn, matches,
+            include_uncertain=include_uncertain, force=force,
+        )
+        stats.applied = applied
+
+    conn.close()
+
+    certain_matches = [
+        m for m in matches if m.confidence in ("certain", "likely")
+    ]
+    uncertain_matches = [
+        m for m in matches if m.confidence == "uncertain"
+    ]
+
+    if use_json:
+        click.echo(json.dumps({
+            "bib_path": str(bib_path),
+            "total_papers": stats.total_papers,
+            "total_bib_entries": stats.total_bib_entries,
+            "matched": {
+                "doi": stats.matched_doi,
+                "filename": stats.matched_filename,
+                "title_certain": stats.matched_title_certain,
+                "title_uncertain": stats.matched_title_uncertain,
+                "total": len(matches),
+            },
+            "unmatched_papers": stats.unmatched_papers,
+            "unmatched_bib": stats.unmatched_bib,
+            "matches": [
+                {
+                    "paper_id": m.paper_id,
+                    "filename": m.filename,
+                    "citekey": m.citekey,
+                    "source": m.source,
+                    "confidence": m.confidence,
+                    "score": round(m.score, 3),
+                }
+                for m in certain_matches
+            ],
+            "uncertain": [
+                {
+                    "paper_id": m.paper_id,
+                    "filename": m.filename,
+                    "citekey": m.citekey,
+                    "source": m.source,
+                    "confidence": m.confidence,
+                    "score": round(m.score, 3),
+                }
+                for m in uncertain_matches
+            ],
+            "applied": applied,
+            "elapsed_seconds": round(elapsed, 2),
+        }, indent=2))
+    else:
+        click.echo(
+            f"Reconciliation: {bib_path.name} "
+            f"({stats.total_bib_entries} entries) "
+            f"vs {stats.total_papers} indexed papers\n"
+        )
+        click.echo(
+            f"  DOI matches:        {stats.matched_doi} certain"
+        )
+        click.echo(
+            f"  Filename matches:   {stats.matched_filename} likely"
+        )
+        tc = stats.matched_title_certain
+        tu = stats.matched_title_uncertain
+        click.echo(
+            f"  Title matches:      {tc + tu} "
+            f"({tc} certain, {tu} uncertain)"
+        )
+        click.echo()
+        click.echo(
+            f"  Matched:           "
+            f"{len(matches)} / {stats.total_papers} papers"
+        )
+        click.echo(f"  Unmatched papers:  {stats.unmatched_papers}")
+        click.echo(f"  Unmatched bib:     {stats.unmatched_bib}")
+
+        if uncertain_matches:
+            click.echo(
+                "\n  Uncertain matches "
+                "(review with --include-uncertain):"
+            )
+            for m in uncertain_matches[:10]:
+                click.echo(
+                    f"    [{m.paper_id:>4}] {m.filename}"
+                    f"  →  @{m.citekey}  ({m.score:.2f})"
+                )
+            if len(uncertain_matches) > 10:
+                click.echo(
+                    f"    ... and {len(uncertain_matches) - 10} more"
+                )
+
+        if do_apply:
+            click.echo(
+                f"\n  Applied {applied} citekeys to database."
+            )
+        else:
+            click.echo(
+                f"\n  To apply: gantry link check {bib_path} --apply"
+            )
+
+
+@link.command()
+@click.argument("output", type=click.Path(path_type=Path))
+@click.option("--force", is_flag=True,
+              help="Overwrite existing file")
+@click.option("--json", "json_output", is_flag=True,
+              help="Output as JSON")
+@click.pass_context
+def init(ctx, output, force, json_output):
+    """Generate a .bib file from enriched paper metadata."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if output.exists() and not force:
+        msg = (
+            f"{output} already exists. "
+            "Use --force to overwrite."
+        )
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    rows = conn.execute(
+        "SELECT title, authors, year, doi, filename FROM papers "
+        "ORDER BY filename"
+    ).fetchall()
+    conn.close()
+
+    papers = [dict(r) for r in rows]
+
+    from .link import generate_bib_content
+
+    content = generate_bib_content(papers)
+    output.write_text(content)
+
+    entry_count = content.count("@")
+
+    if use_json:
+        click.echo(json.dumps({
+            "path": str(output),
+            "entries": entry_count,
+            "total_papers": len(papers),
+        }, indent=2))
+    else:
+        click.echo(
+            f"Wrote {entry_count} entries to {output} "
+            f"({len(papers)} papers)"
+        )

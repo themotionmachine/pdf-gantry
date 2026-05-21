@@ -68,6 +68,13 @@ uv pip install -e ".[all]"        # Everything
 | `gantry retry` | Re-process previously failed documents |
 | `gantry prune` | Remove entries for files no longer on disk |
 
+### Bibliography linking
+
+| Command | Description |
+|---------|-------------|
+| `gantry link init <path>` | Generate a .bib file from enriched paper metadata |
+| `gantry link check <bib>` | Reconcile PDFs against a BibTeX file, assign citekeys |
+
 ### Configuration & integration
 
 | Command | Description |
