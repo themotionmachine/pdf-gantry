@@ -106,6 +106,62 @@ def test_config_set_unknown_key(tmp_path):
                 set_config_value("nonexistent_key", "value")
 
 
+def test_config_bib_path_default():
+    """bib_path defaults to None."""
+    with patch("pdf_gantry.config.CONFIG_PATH", Path("/nonexistent/config.yaml")):
+        cfg = load_config()
+    assert cfg.bib_path is None
+
+
+def test_config_bib_path_from_yaml(tmp_path):
+    """bib_path loads from YAML."""
+    config_file = tmp_path / "config.yaml"
+    bib = tmp_path / "library.bib"
+    config_file.write_text(yaml.dump({"bib_path": str(bib)}))
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        cfg = load_config()
+
+    assert cfg.bib_path == bib
+
+
+def test_config_bib_path_env_override(tmp_path):
+    """GANTRY_BIB_PATH env var overrides config file."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"bib_path": str(tmp_path / "from_file.bib")}))
+
+    env_bib = str(tmp_path / "from_env.bib")
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch.dict(os.environ, {"GANTRY_BIB_PATH": env_bib}):
+            cfg = load_config()
+
+    assert cfg.bib_path == Path(env_bib)
+
+
+def test_config_bib_path_save_roundtrip(tmp_path):
+    """bib_path round-trips through save/load."""
+    config_file = tmp_path / "config.yaml"
+    cfg = Config(bib_path=tmp_path / "library.bib")
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            save_config(cfg)
+            loaded = load_config()
+
+    assert loaded.bib_path == cfg.bib_path
+
+
+def test_config_set_bib_path(tmp_path):
+    """set_config_value works for bib_path."""
+    config_file = tmp_path / "config.yaml"
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            cfg = set_config_value("bib_path", str(tmp_path / "refs.bib"))
+
+    assert cfg.bib_path == tmp_path / "refs.bib"
+
+
 def test_db_path_property():
     """Config.db_path is derived from index_dir."""
     cfg = Config()

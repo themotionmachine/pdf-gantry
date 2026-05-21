@@ -5,7 +5,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 -- Core papers table
@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS papers (
     vault_note_path TEXT,
     vault_checked_at TEXT,
 
+    -- Bibliography linking
+    citekey TEXT,
+    citekey_source TEXT,
+
     -- Timestamps
     indexed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -67,6 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_papers_has_markdown ON papers(has_markdown);
 CREATE INDEX IF NOT EXISTS idx_papers_has_embeddings ON papers(has_embeddings);
 CREATE INDEX IF NOT EXISTS idx_papers_needs_ocr ON papers(needs_ocr);
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
+CREATE INDEX IF NOT EXISTS idx_papers_citekey ON papers(citekey);
 
 -- Full-text search virtual table
 CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
@@ -240,5 +245,18 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (3, now_iso()),
+        )
+        conn.commit()
+        version = 3
+
+    if version < 4:
+        conn.execute("ALTER TABLE papers ADD COLUMN citekey TEXT")
+        conn.execute("ALTER TABLE papers ADD COLUMN citekey_source TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_papers_citekey ON papers(citekey)"
+        )
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (4, now_iso()),
         )
         conn.commit()
