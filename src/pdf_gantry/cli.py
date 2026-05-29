@@ -532,14 +532,15 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_ou
 @cli.command()
 @click.argument("query")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
-@click.option("--hybrid", is_flag=True, help="Combine FTS5 and vector search")
+@click.option("--hybrid", is_flag=True, help="Combine FTS5 and vector search (default)")
+@click.option("--fts", "fts_only", is_flag=True, help="Use FTS5 only, skip vector search")
 @click.option("--components", is_flag=True, help="Include FTS and vector component scores (hybrid only)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include in JSON output")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def search(ctx, query, limit, hybrid, components, field_list, json_output):
-    """Full-text search across indexed PDFs."""
+def search(ctx, query, limit, hybrid, fts_only, components, field_list, json_output):
+    """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
@@ -555,10 +556,18 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
     conn = get_connection(cfg.db_path)
     from .search import fts_search, search_count, hybrid_search
 
+    # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
+    use_hybrid = not fts_only
+
     try:
-        if hybrid:
+        if use_hybrid:
             from .embeddings import embed_query
-            query_vec = embed_query(cfg.embedding.model, query)
+            try:
+                query_vec = embed_query(cfg.embedding.model, query)
+            except ImportError:
+                click.echo("Embeddings unavailable; falling back to FTS.", err=True)
+                use_hybrid = False
+        if use_hybrid:
             results = hybrid_search(conn, query, query_vec, limit=limit)
             total = len(results)
         else:
@@ -616,7 +625,7 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
                 "has_embeddings": r.has_embeddings,
                 "citekey": citekey_map.get(r.id),
             }
-            if components and hybrid:
+            if components and use_hybrid:
                 d["score_fts"] = r.score_fts
                 d["score_vector"] = r.score_vector
                 d["rank_fts"] = r.rank_fts
@@ -638,7 +647,8 @@ def search(ctx, query, limit, hybrid, components, field_list, json_output):
             ck = citekey_map.get(r.id)
             ck_str = f" @{ck}" if ck else ""
             click.echo(f" {i:2d}. [{r.score:.2f}] {r.filename}{ck_str}")
-            if components and hybrid and (r.score_fts is not None or r.score_vector is not None):
+            has_components = r.score_fts is not None or r.score_vector is not None
+            if components and use_hybrid and has_components:
                 fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
                 vec_str = f"vec={r.score_vector:.4f}" if r.score_vector is not None else "vec=--"
                 click.echo(f"     {fts_str}  {vec_str}")
@@ -1375,9 +1385,11 @@ def find(ctx, fragment, limit, json_output):
               help="Comma-separated fields to include")
 @click.option("--chunks", "include_chunks", is_flag=True,
               help="Include chunk texts for each paper")
+@click.option("-q", "--query", default=None,
+              help="Attach each paper's single best-matching chunk for this query")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def info(ctx, ids, field_list, include_chunks, json_output):
+def info(ctx, ids, field_list, include_chunks, query, json_output):
     """Fetch metadata for specific papers by ID."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -1427,6 +1439,23 @@ def info(ctx, ids, field_list, include_chunks, json_output):
         ctx.exit(EXIT_NO_RESULTS)
         return
 
+    top_chunks = {}
+    if query:
+        try:
+            from .embeddings import embed_query
+            from .search import best_chunk_per_doc
+            query_vec = embed_query(cfg.embedding.model, query)
+            top_chunks = best_chunk_per_doc(conn, query_vec, paper_ids)
+        except ImportError as e:
+            conn.close()
+            msg = str(e)
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
+
     results = []
     for r in rows:
         d = {
@@ -1465,6 +1494,17 @@ def info(ctx, ids, field_list, include_chunks, json_output):
                 for c in chunks
             ]
 
+        if query:
+            tc = top_chunks.get(r["id"])
+            d["top_chunk"] = None if tc is None else {
+                "chunk_id": tc.chunk_id,
+                "chunk_index": tc.chunk_index,
+                "section_header": tc.section_header,
+                "page_start": tc.page_start,
+                "score": tc.score,
+                "text": tc.chunk_text,
+            }
+
         if field_list:
             fields = {f.strip() for f in field_list.split(",")}
             d = {k: v for k, v in d.items() if k in fields}
@@ -1488,6 +1528,10 @@ def info(ctx, ids, field_list, include_chunks, json_output):
                 click.echo(f"  DOI: {d['doi']}")
             if d.get("citekey"):
                 click.echo(f"  Citekey: @{d['citekey']} ({d.get('citekey_source', '?')})")
+            if d.get("top_chunk"):
+                tc = d["top_chunk"]
+                click.echo(f"  Top chunk [{tc['score']:.2f}] {tc.get('section_header') or ''}")
+                click.echo(f"    \"{tc['text'][:300]}\"")
             click.echo()
 
 

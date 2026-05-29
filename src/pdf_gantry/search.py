@@ -215,6 +215,58 @@ def chunk_search(
     return results
 
 
+def best_chunk_per_doc(
+    conn: sqlite3.Connection,
+    query_vector: bytes,
+    doc_ids: list[int],
+) -> dict[int, ChunkResult]:
+    """
+    Return the single best-matching chunk for each document in doc_ids.
+
+    Scopes a cosine-distance comparison to only the requested documents'
+    chunks (via vec_distance_cosine, not global KNN), so an agent can fetch
+    the most relevant excerpt from each of N papers in one call rather than
+    looping per paper. Documents without chunk embeddings are omitted.
+    """
+    if not doc_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(doc_ids))
+    rows = conn.execute(
+        f"""SELECT
+            c.doc_id, c.chunk_id, c.chunk_index, c.section_header,
+            c.page_start, c.text,
+            p.filename, p.path, p.title,
+            vec_distance_cosine(cv.embedding, ?) AS distance
+        FROM chunks c
+        JOIN chunk_vec cv ON cv.chunk_id = c.chunk_id
+        JOIN papers p ON p.id = c.doc_id
+        WHERE c.doc_id IN ({placeholders})
+        ORDER BY c.doc_id, distance""",
+        [query_vector, *doc_ids],
+    ).fetchall()
+
+    best: dict[int, ChunkResult] = {}
+    for row in rows:
+        doc_id = row["doc_id"]
+        if doc_id in best:
+            continue  # rows ordered by distance within each doc; first is closest
+        score = round(1.0 - row["distance"], 4) if row["distance"] is not None else 0.0
+        best[doc_id] = ChunkResult(
+            chunk_id=row["chunk_id"],
+            doc_id=doc_id,
+            chunk_index=row["chunk_index"],
+            section_header=row["section_header"],
+            page_start=row["page_start"],
+            chunk_text=row["text"],
+            score=score,
+            filename=row["filename"],
+            path=row["path"],
+            title=row["title"],
+        )
+    return best
+
+
 def _top_k_pool(scores: list[float], k: int = 3) -> float:
     """Average of top-k scores for document aggregation."""
     top_k = sorted(scores, reverse=True)[:k]

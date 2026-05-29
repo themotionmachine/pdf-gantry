@@ -52,11 +52,11 @@ uv pip install -e ".[all]"        # Everything
 
 | Command | Description |
 |---------|-------------|
-| `gantry search <query>` | Full-text search (FTS5) |
+| `gantry search <query>` | Hybrid search (FTS5 + vector via RRF) by default; `--fts` for keyword-only |
 | `gantry semantic <query>` | Semantic similarity search |
 | `gantry find <query>` | Fuzzy filename lookup |
 | `gantry read <id>` | Read document text or chunks |
-| `gantry info <id>` | Fetch metadata for specific papers |
+| `gantry info --ids <ids>` | Fetch metadata for specific papers; add `--query "X"` for each paper's best-matching chunk |
 
 ### Index management
 
