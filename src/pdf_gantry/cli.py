@@ -25,6 +25,18 @@ EXIT_DB_ERROR = 4
 err_console = Console(stderr=True)
 
 
+def require_papers_dir(ctx, cfg, use_json):
+    """Exit with guidance if no papers directory is configured."""
+    if cfg.papers_dir is None:
+        msg = ("No papers directory configured. "
+               "Run 'gantry config init' or set GANTRY_PAPERS_DIR.")
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+
+
 def filter_options(f):
     """Shared Click options for document filtering."""
     @click.option("--needs", multiple=True,
@@ -80,7 +92,7 @@ def config_show(ctx, json_output):
     use_json = json_output or ctx.obj["json"]
 
     data = {
-        "papers_dir": str(cfg.papers_dir),
+        "papers_dir": str(cfg.papers_dir) if cfg.papers_dir else None,
         "index_dir": str(cfg.index_dir),
         "vault_dir": str(cfg.vault_dir) if cfg.vault_dir else None,
         "database": str(cfg.db_path),
@@ -89,7 +101,7 @@ def config_show(ctx, json_output):
     if use_json:
         click.echo(json.dumps(data, indent=2))
     else:
-        click.echo(f"papers_dir: {data['papers_dir']}")
+        click.echo(f"papers_dir: {data['papers_dir'] or '(not set)'}")
         click.echo(f"index_dir:  {data['index_dir']}")
         if data["vault_dir"]:
             click.echo(f"vault_dir:  {data['vault_dir']}")
@@ -117,9 +129,10 @@ def config_init(ctx):
     click.echo("pdf_gantry setup")
     click.echo()
 
+    existing = ctx.obj["config"]
     papers = click.prompt(
         "Papers directory",
-        default=str(Config().papers_dir),
+        default=str(existing.papers_dir) if existing.papers_dir else None,
     )
     papers_path = Path(papers).expanduser()
     if not papers_path.is_dir():
@@ -150,6 +163,7 @@ def ingest(ctx, dry_run, json_output):
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
+    require_papers_dir(ctx, cfg, use_json)
     if not cfg.papers_dir.is_dir():
         msg = f"Papers directory not found: {cfg.papers_dir}"
         if use_json:
@@ -311,6 +325,8 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
+    require_papers_dir(ctx, cfg, use_json)
+
     if quality:
         method = "marker"
 
@@ -440,6 +456,8 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_ou
     """Run OCR on scanned PDFs using Surya."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    require_papers_dir(ctx, cfg, use_json)
 
     conn = get_connection(cfg.db_path)
 
@@ -1156,6 +1174,8 @@ def retry(ctx, max_attempts, json_output):
         ctx.exit(EXIT_ERROR)
         return
 
+    require_papers_dir(ctx, cfg, use_json)
+
     conn = get_connection(cfg.db_path)
     from .process import process_documents
 
@@ -1232,6 +1252,7 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
+    require_papers_dir(ctx, cfg, use_json)
     if not cfg.papers_dir.is_dir():
         msg = f"Papers directory not found: {cfg.papers_dir}"
         if use_json:
@@ -1297,6 +1318,8 @@ def prune(ctx, dry_run, json_output):
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
         return
+
+    require_papers_dir(ctx, cfg, use_json)
 
     conn = get_connection(cfg.db_path)
     from .prune import prune_missing

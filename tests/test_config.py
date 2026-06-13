@@ -13,10 +13,10 @@ from pdf_gantry.config import (
 
 
 def test_config_defaults():
-    """Config with no file and no env vars returns defaults."""
+    """Config with no file and no env vars has no papers_dir."""
     with patch("pdf_gantry.config.CONFIG_PATH", Path("/nonexistent/config.yaml")):
         cfg = load_config()
-    assert cfg.papers_dir.name == "Papers"
+    assert cfg.papers_dir is None
     assert cfg.index_dir == GANTRY_DIR
     assert cfg.vault_dir is None
     assert cfg.embedding.dimensions == 768
@@ -166,3 +166,83 @@ def test_db_path_property():
     """Config.db_path is derived from index_dir."""
     cfg = Config()
     assert cfg.db_path == cfg.index_dir / "index.db"
+
+
+def test_save_config_omits_unset_papers_dir(tmp_path):
+    """save_config doesn't serialize a None papers_dir as the string 'None'."""
+    config_file = tmp_path / "config.yaml"
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            save_config(Config())
+            loaded = load_config()
+
+    data = yaml.safe_load(config_file.read_text())
+    assert "papers_dir" not in data
+    assert loaded.papers_dir is None
+
+
+# --- CLI behavior when papers_dir is unconfigured ---
+
+from click.testing import CliRunner  # noqa: E402
+
+from pdf_gantry.cli import cli  # noqa: E402
+
+
+@pytest.fixture
+def no_papers_config(tmp_path, monkeypatch):
+    """No config file, no GANTRY_PAPERS_DIR, index isolated to tmp_path."""
+    for var in ("GANTRY_PAPERS_DIR", "GANTRY_VAULT_DIR", "GANTRY_BIB_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    with patch("pdf_gantry.config.CONFIG_PATH", tmp_path / "missing.yaml"):
+        yield tmp_path
+
+
+def test_cli_ingest_without_papers_dir_errors(no_papers_config):
+    """ingest with no configured papers_dir exits 1 with setup guidance."""
+    result = CliRunner().invoke(cli, ["ingest"])
+    assert result.exit_code == 1
+    assert "config init" in result.stderr
+    assert "GANTRY_PAPERS_DIR" in result.stderr
+
+
+def test_cli_ingest_without_papers_dir_json(no_papers_config):
+    """JSON mode reports the missing papers_dir as a structured error."""
+    import json as json_mod
+
+    result = CliRunner().invoke(cli, ["ingest", "--json"])
+    assert result.exit_code == 1
+    data = json_mod.loads(result.output)
+    assert "config init" in data["error"]
+
+
+def test_cli_process_without_papers_dir_errors(no_papers_config):
+    """process guards papers_dir before touching the database."""
+    result = CliRunner().invoke(cli, ["process"])
+    assert result.exit_code == 1
+    assert "config init" in result.stderr
+
+
+def test_cli_config_show_without_papers_dir(no_papers_config):
+    """config show displays unset papers_dir as '(not set)', not 'None'."""
+    result = CliRunner().invoke(cli, ["config", "show"])
+    assert result.exit_code == 0
+    assert "(not set)" in result.output
+    assert "None" not in result.output
+
+
+def test_cli_config_init_writes_papers_dir(tmp_path, monkeypatch):
+    """config init prompts for papers_dir (no baked-in default) and saves it."""
+    for var in ("GANTRY_PAPERS_DIR", "GANTRY_VAULT_DIR", "GANTRY_BIB_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    config_file = tmp_path / "config.yaml"
+    papers = tmp_path / "papers"
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            result = CliRunner().invoke(cli, ["config", "init"], input=f"{papers}\n\n")
+
+    assert result.exit_code == 0
+    data = yaml.safe_load(config_file.read_text())
+    assert data["papers_dir"] == str(papers)

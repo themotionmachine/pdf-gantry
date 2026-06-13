@@ -9,7 +9,6 @@ import yaml
 
 GANTRY_DIR = Path("~/.gantry").expanduser()
 CONFIG_PATH = GANTRY_DIR / "config.yaml"
-DEFAULT_PAPERS_DIR = Path("~/Library/Mobile Documents/com~apple~CloudDocs/Papers").expanduser()
 
 
 @dataclass
@@ -34,7 +33,7 @@ class OutputConfig:
 
 @dataclass
 class Config:
-    papers_dir: Path = field(default_factory=lambda: DEFAULT_PAPERS_DIR)
+    papers_dir: Path | None = None
     index_dir: Path = field(default_factory=lambda: GANTRY_DIR)
     vault_dir: Path | None = None
     bib_path: Path | None = None
@@ -102,9 +101,10 @@ def save_config(cfg: Config) -> None:
     GANTRY_DIR.mkdir(parents=True, exist_ok=True)
 
     data: dict = {
-        "papers_dir": str(cfg.papers_dir),
         "index_dir": str(cfg.index_dir),
     }
+    if cfg.papers_dir:
+        data["papers_dir"] = str(cfg.papers_dir)
     if cfg.vault_dir:
         data["vault_dir"] = str(cfg.vault_dir)
     if cfg.bib_path:
