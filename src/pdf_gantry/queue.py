@@ -2,6 +2,23 @@
 
 import sqlite3
 
+# A digital PDF whose body is rendered as bitmap extracts to almost nothing
+# (PyMuPDF returns "picture intentionally omitted" placeholders), yet still
+# reports has_text=1 and usually needs_ocr=1. Flag papers whose extracted text
+# is implausibly thin for their page count so the silent failure becomes loud.
+# Threshold is a calibrated heuristic, not a hard rule (see issue #17).
+SUSPICIOUS_CHARS_PER_PAGE = 500
+
+
+def suspicious_extraction_condition() -> str:
+    """SQL predicate (against the papers table) for a likely-broken extraction."""
+    return (
+        "has_text = 1 AND needs_ocr = 1 AND page_count > 0 "
+        "AND COALESCE("
+        "(SELECT text_length FROM paper_text WHERE paper_text.paper_id = papers.id), 0"
+        f") < page_count * {SUSPICIOUS_CHARS_PER_PAGE}"
+    )
+
 
 def build_filter_query(
     needs: list[str] | None = None,
@@ -56,6 +73,8 @@ def build_filter_query(
                 conditions.append("is_scanned = 1")
             elif p == "digital":
                 conditions.append("is_scanned = 0")
+            elif p == "suspicious":
+                conditions.append(f"({suspicious_extraction_condition()})")
 
     if has_errors:
         conditions.append("error_count > 0")

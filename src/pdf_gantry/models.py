@@ -105,5 +105,6 @@ class StatusInfo:
     needs_ocr: int = 0
     has_errors: int = 0
     with_chunk_embeddings: int = 0
+    suspicious_extraction: int = 0
     db_size_bytes: int = 0
     db_path: str = ""

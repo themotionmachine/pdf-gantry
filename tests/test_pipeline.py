@@ -82,3 +82,66 @@ def test_pipeline_single_file(tmp_path, papers_dir):
     row = conn.execute("SELECT filename FROM papers WHERE has_text = 1").fetchone()
     assert row["filename"] == "test_climate.pdf"
     conn.close()
+
+
+# --- pipeline warns about suspicious extractions (issue #17) ---
+
+def _seed_suspicious(db_path):
+    conn = get_connection(str(db_path))
+    conn.execute(
+        """INSERT INTO papers
+            (id, path, filename, file_hash, file_size, file_modified,
+             page_count, has_text, needs_ocr, indexed_at, updated_at)
+           VALUES (1, 'p1.pdf', 'p1.pdf', 'h1', 1, '2026-01-01', 10, 1, 1, '2026-01-01', '2026-01-01')"""
+    )
+    conn.execute(
+        "INSERT INTO paper_text (paper_id, raw_text, markdown, text_length, markdown_length) "
+        "VALUES (1, ?, '', 1000, 0)",
+        ("x" * 1000,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_pipeline_json_includes_suspicious_count(tmp_path, monkeypatch):
+    """pipeline --json surfaces a suspicious-extraction count from the index."""
+    import json
+
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    empty_papers = tmp_path / "papers"
+    empty_papers.mkdir()
+    db_path = tmp_path / "index.db"
+    get_connection(str(db_path)).close()
+    _seed_suspicious(db_path)
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(empty_papers))
+
+    result = CliRunner().invoke(cli, ["pipeline", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["suspicious"] == 1
+
+
+def test_pipeline_text_warns_about_suspicious(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    empty_papers = tmp_path / "papers"
+    empty_papers.mkdir()
+    db_path = tmp_path / "index.db"
+    get_connection(str(db_path)).close()
+    _seed_suspicious(db_path)
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(empty_papers))
+
+    result = CliRunner().invoke(cli, ["pipeline"])
+
+    assert result.exit_code == 0
+    assert "suspicious" in result.output.lower()

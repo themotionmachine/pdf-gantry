@@ -52,7 +52,7 @@ def filter_options(f):
                   ]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
-                  type=click.Choice(["scanned", "digital"]),
+                  type=click.Choice(["scanned", "digital", "suspicious"]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
                   help="Documents with outdated embedding model version")
@@ -273,6 +273,10 @@ def status(ctx, json_output):
     info.needs_ocr = conn.execute("SELECT COUNT(*) FROM papers WHERE needs_ocr = 1").fetchone()[0]
     info.has_errors = conn.execute("SELECT COUNT(*) FROM papers WHERE error_count > 0").fetchone()[0]
     info.with_chunk_embeddings = conn.execute("SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1").fetchone()[0]
+    from .queue import suspicious_extraction_condition
+    info.suspicious_extraction = conn.execute(
+        f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
+    ).fetchone()[0]
     info.db_size_bytes = cfg.db_path.stat().st_size
 
     conn.close()
@@ -286,6 +290,7 @@ def status(ctx, json_output):
             "with_embeddings": info.with_embeddings,
             "needs_ocr": info.needs_ocr,
             "has_errors": info.has_errors,
+            "suspicious_extraction": info.suspicious_extraction,
             "db_size_bytes": info.db_size_bytes,
             "pct_text": round(info.with_text / info.total * 100, 1) if info.total else 0,
             "pct_markdown": round(info.with_markdown / info.total * 100, 1) if info.total else 0,
@@ -301,6 +306,10 @@ def status(ctx, json_output):
         click.echo(f"  With chunk embeddings: {format_count(info.with_chunk_embeddings)} ({format_pct(info.with_chunk_embeddings, info.total)})")
         click.echo(f"  Needs OCR:     {format_count(info.needs_ocr)} ({format_pct(info.needs_ocr, info.total)})")
         click.echo(f"  Has errors:    {format_count(info.has_errors)} ({format_pct(info.has_errors, info.total)})")
+        if info.suspicious_extraction:
+            click.echo(f"  Suspicious extraction: {format_count(info.suspicious_extraction)} "
+                       f"({format_pct(info.suspicious_extraction, info.total)}) "
+                       f"— run 'gantry queue --is suspicious'")
         click.echo()
         click.echo(f"Database size: {format_size(info.db_size_bytes)}")
 
@@ -1296,6 +1305,12 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
         filename=filename,
         scan_threshold=cfg.processing.scan_threshold,
     )
+
+    if not dry_run:
+        from .queue import suspicious_extraction_condition
+        stats["suspicious"] = conn.execute(
+            f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
+        ).fetchone()[0]
     conn.close()
 
     if use_json:
@@ -1306,6 +1321,10 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
                     f"Processed: {stats['processed']}, "
                     f"Embedded: {stats['embedded']}, "
                     f"Errors: {stats['errors']}")
+        if stats.get("suspicious", 0) > 0:
+            click.echo(f"  Warning: {stats['suspicious']} paper(s) have suspiciously thin "
+                       f"text for their page count — likely bitmap-rendered. "
+                       f"Run 'gantry queue --is suspicious' (then 'gantry ocr --ids ...').")
 
     if stats.get("errors", 0) > 0 and stats.get("processed", 0) > 0:
         ctx.exit(EXIT_PARTIAL)
