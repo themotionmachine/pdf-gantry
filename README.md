@@ -109,8 +109,25 @@ Zotero manages references; it does not give an agent chunk-level retrieval over 
 | `gantry process` | Extract text and markdown |
 | `gantry embed` | Generate chunk-level embeddings |
 | `gantry ocr` | OCR scanned PDFs with Surya |
-| `gantry enrich` | Fetch metadata from Semantic Scholar |
+| `gantry enrich` | Fetch metadata (title, authors, year, DOI, abstract) from OpenAlex or Semantic Scholar |
 | `gantry pipeline` | Run the full chain: ingest → process → embed |
+
+#### Enriching metadata
+
+Most flat PDF folders carry almost no metadata, so `gantry enrich` backfills it from a scholarly index and writes it onto each paper (`title`, `authors`, `year`, `doi`, `abstract`). With metadata in place, `gantry link init` can generate a real `.bib`.
+
+It defaults to **OpenAlex**: no API key, broad coverage, and a "polite pool" that runs faster when requests carry your email. Set it once and every run uses it:
+
+```bash
+gantry config set openalex_mailto you@example.com
+gantry enrich --dry-run        # how many papers would be touched
+gantry enrich --limit 20       # small batch to eyeball quality first
+gantry enrich                  # the whole library
+```
+
+For each paper it tries, in order: exact DOI lookup (from the `doi` column, else a DOI found in the first page of text), then an author+year search derived from the filename, then a title search. DOI matches are reliable; title-search fallbacks on opaque filenames are worth a skeptical pass.
+
+Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers missing metadata; pass `--has`/`--needs`/`--is` filters or `--limit` to scope it.
 
 ### Search and retrieval
 
@@ -147,7 +164,7 @@ gantry config show
 gantry config set papers_dir ~/Papers
 ```
 
-Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables override it (`GANTRY_PAPERS_DIR`, `GANTRY_INDEX_DIR`, `GANTRY_VAULT_DIR`). The two settings that matter: `papers_dir`, any flat folder of PDFs, and optionally `vault_dir` for Obsidian cross-referencing.
+Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables override it (`GANTRY_PAPERS_DIR`, `GANTRY_INDEX_DIR`, `GANTRY_VAULT_DIR`, `GANTRY_OPENALEX_MAILTO`). The two settings that matter: `papers_dir`, any flat folder of PDFs, and optionally `vault_dir` for Obsidian cross-referencing. Set `openalex_mailto` to use OpenAlex's faster polite pool during `gantry enrich`.
 
 ## How it works
 
