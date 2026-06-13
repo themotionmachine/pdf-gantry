@@ -95,6 +95,7 @@ def config_show(ctx, json_output):
         "papers_dir": str(cfg.papers_dir) if cfg.papers_dir else None,
         "index_dir": str(cfg.index_dir),
         "vault_dir": str(cfg.vault_dir) if cfg.vault_dir else None,
+        "openalex_mailto": cfg.openalex_mailto,
         "database": str(cfg.db_path),
     }
 
@@ -105,6 +106,8 @@ def config_show(ctx, json_output):
         click.echo(f"index_dir:  {data['index_dir']}")
         if data["vault_dir"]:
             click.echo(f"vault_dir:  {data['vault_dir']}")
+        if data["openalex_mailto"]:
+            click.echo(f"openalex_mailto: {data['openalex_mailto']}")
         click.echo(f"database:   {data['database']}")
 
 
@@ -1078,13 +1081,28 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
 
 @cli.command()
 @filter_options
+@click.option("--provider", type=click.Choice(["openalex", "semantic-scholar"]),
+              default="openalex", show_default=True,
+              help="Metadata provider")
+@click.option("--mailto", default=None,
+              help="OpenAlex polite-pool email (overrides config openalex_mailto)")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_output):
-    """Fetch metadata from Semantic Scholar."""
+def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
+           limit, dry_run, json_output):
+    """Fetch metadata from OpenAlex (default) or Semantic Scholar."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    if provider == "openalex" and mailto is None:
+        mailto = cfg.openalex_mailto
+    if provider == "openalex" and not mailto and not use_json:
+        err_console.print(
+            "[yellow]No OpenAlex mailto set; using the common pool "
+            "(slower). Set one with 'gantry config set openalex_mailto "
+            "you@example.com'.[/yellow]"
+        )
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -1152,6 +1170,7 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json
         stats = enrich_documents(
             conn, paper_ids=paper_ids, limit=limit,
             progress_callback=on_progress,
+            provider=provider, mailto=mailto,
         )
     finally:
         if progress_bar:

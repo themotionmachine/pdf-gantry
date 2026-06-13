@@ -162,6 +162,63 @@ def test_config_set_bib_path(tmp_path):
     assert cfg.bib_path == tmp_path / "refs.bib"
 
 
+# --- openalex_mailto (issue #20) ---
+
+
+def test_config_openalex_mailto_default():
+    """openalex_mailto defaults to None."""
+    with patch("pdf_gantry.config.CONFIG_PATH", Path("/nonexistent/config.yaml")):
+        cfg = load_config()
+    assert cfg.openalex_mailto is None
+
+
+def test_config_openalex_mailto_from_yaml(tmp_path):
+    """openalex_mailto loads from YAML."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"openalex_mailto": "ryan@example.com"}))
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        cfg = load_config()
+
+    assert cfg.openalex_mailto == "ryan@example.com"
+
+
+def test_config_openalex_mailto_env_override(tmp_path):
+    """GANTRY_OPENALEX_MAILTO env var overrides config file."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"openalex_mailto": "file@example.com"}))
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch.dict(os.environ, {"GANTRY_OPENALEX_MAILTO": "env@example.com"}):
+            cfg = load_config()
+
+    assert cfg.openalex_mailto == "env@example.com"
+
+
+def test_config_openalex_mailto_save_roundtrip(tmp_path):
+    """openalex_mailto round-trips through save/load."""
+    config_file = tmp_path / "config.yaml"
+    cfg = Config(openalex_mailto="ryan@example.com")
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            save_config(cfg)
+            loaded = load_config()
+
+    assert loaded.openalex_mailto == "ryan@example.com"
+
+
+def test_config_set_openalex_mailto(tmp_path):
+    """set_config_value works for openalex_mailto."""
+    config_file = tmp_path / "config.yaml"
+
+    with patch("pdf_gantry.config.CONFIG_PATH", config_file):
+        with patch("pdf_gantry.config.GANTRY_DIR", tmp_path):
+            cfg = set_config_value("openalex_mailto", "ryan@example.com")
+
+    assert cfg.openalex_mailto == "ryan@example.com"
+
+
 def test_db_path_property():
     """Config.db_path is derived from index_dir."""
     cfg = Config()

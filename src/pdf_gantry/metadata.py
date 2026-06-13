@@ -91,16 +91,75 @@ def _extract_title_from_text(raw_text: str) -> str | None:
     return None
 
 
+def _normalize_semantic_scholar(raw: dict | None) -> dict | None:
+    """Map a Semantic Scholar paper into the shared normalized metadata shape."""
+    if not raw:
+        return None
+    return {
+        "title": raw.get("title"),
+        "authors": [a.get("name", "") for a in raw.get("authors", [])],
+        "year": raw.get("year"),
+        "abstract": raw.get("abstract"),
+        "doi": (raw.get("externalIds") or {}).get("DOI"),
+        "source_id": raw.get("paperId"),
+    }
+
+
+def _semantic_scholar_provider(rate_limit: float) -> dict:
+    return {
+        "by_doi": lambda doi: _normalize_semantic_scholar(
+            _fetch_by_doi(doi, rate_limit)
+        ),
+        "by_filename": None,
+        "by_title": lambda title: _normalize_semantic_scholar(
+            _fetch_by_title(title, rate_limit)
+        ),
+        "doi_source": "semantic_scholar",
+        "filename_source": "semantic_scholar_filename",
+        "title_source": "semantic_scholar_title",
+        "is_semantic_scholar": True,
+    }
+
+
+def _openalex_provider(rate_limit: float, mailto: str | None) -> dict:
+    from . import openalex
+
+    return {
+        "by_doi": lambda doi: openalex.fetch_by_doi(
+            doi, mailto=mailto, rate_limit=rate_limit
+        ),
+        "by_filename": lambda filename: openalex.fetch_by_filename(
+            filename, mailto=mailto, rate_limit=rate_limit
+        ),
+        "by_title": lambda title: openalex.fetch_by_title(
+            title, mailto=mailto, rate_limit=rate_limit
+        ),
+        "doi_source": "openalex",
+        "filename_source": "openalex_filename",
+        "title_source": "openalex_title",
+        "is_semantic_scholar": False,
+    }
+
+
+def _get_provider(provider: str, rate_limit: float, mailto: str | None) -> dict:
+    if provider in ("semantic-scholar", "semantic_scholar", "s2"):
+        return _semantic_scholar_provider(rate_limit)
+    return _openalex_provider(rate_limit, mailto)
+
+
 def enrich_documents(
     conn: sqlite3.Connection,
     paper_ids: list[int] | None = None,
     rate_limit: float = 0.1,
     limit: int | None = None,
     progress_callback=None,
+    provider: str = "openalex",
+    mailto: str | None = None,
 ) -> EnrichStats:
-    """Fetch metadata from Semantic Scholar for documents."""
+    """Fetch metadata for documents from the chosen provider (OpenAlex default)."""
     stats = EnrichStats()
     start = time.time()
+    prov = _get_provider(provider, rate_limit, mailto)
 
     if paper_ids is not None:
         placeholders = ",".join("?" * len(paper_ids))
@@ -128,6 +187,7 @@ def enrich_documents(
     for row in rows:
         paper_id = row["id"]
         doi = row["doi"]
+        filename = row["filename"]
         raw_text = row["raw_text"] or ""
 
         metadata = None
@@ -142,9 +202,18 @@ def enrich_documents(
         if doi:
             stats.doi_found += 1
             try:
-                metadata = _fetch_by_doi(doi, rate_limit)
+                metadata = prov["by_doi"](doi)
                 if metadata:
-                    source = "semantic_scholar"
+                    source = prov["doi_source"]
+            except Exception:
+                stats.api_errors += 1
+
+        # Fallback: filename-derived author+year lookup (provider-dependent)
+        if not metadata and prov["by_filename"] and filename:
+            try:
+                metadata = prov["by_filename"](filename)
+                if metadata:
+                    source = prov["filename_source"]
             except Exception:
                 stats.api_errors += 1
 
@@ -153,23 +222,28 @@ def enrich_documents(
             title_guess = _extract_title_from_text(raw_text)
             if title_guess:
                 try:
-                    metadata = _fetch_by_title(title_guess, rate_limit)
+                    metadata = prov["by_title"](title_guess)
                     if metadata:
-                        source = "semantic_scholar_title"
+                        source = prov["title_source"]
                         stats.matched_by_title += 1
                 except Exception:
                     stats.api_errors += 1
 
         if metadata:
             now = now_iso()
-            authors = json.dumps([a.get("name", "") for a in metadata.get("authors", [])])
+            authors = json.dumps(metadata.get("authors") or [])
+            ss_id = (
+                metadata.get("source_id")
+                if prov["is_semantic_scholar"] else None
+            )
             conn.execute(
                 """UPDATE papers SET
                     title = COALESCE(?, title),
                     authors = ?,
                     year = ?,
                     abstract = ?,
-                    semantic_scholar_id = ?,
+                    semantic_scholar_id = COALESCE(?, semantic_scholar_id),
+                    doi = COALESCE(?, doi),
                     metadata_source = ?,
                     metadata_enriched_at = ?,
                     updated_at = ?
@@ -179,7 +253,8 @@ def enrich_documents(
                     authors,
                     metadata.get("year"),
                     metadata.get("abstract"),
-                    metadata.get("paperId"),
+                    ss_id,
+                    metadata.get("doi"),
                     source,
                     now, now, paper_id,
                 ),
