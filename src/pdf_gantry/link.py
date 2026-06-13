@@ -347,43 +347,78 @@ def generate_citekey(
     return "".join(parts) if parts else "unknown"
 
 
+_BIB_ESCAPES = {
+    "\\": r"\textbackslash ",
+    "{": r"\{",
+    "}": r"\}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+}
+
+
+def _bib_escape(text: str) -> str:
+    """Escape LaTeX-special characters in a BibTeX field value."""
+    return "".join(_BIB_ESCAPES.get(ch, ch) for ch in text)
+
+
+def assign_citekeys(
+    papers: list[dict],
+    reserved_keys: set[str] | None = None,
+) -> list[tuple[dict, str]]:
+    """Pair each paper with a unique citekey, avoiding reserved + in-batch keys."""
+    taken = {k.lower() for k in (reserved_keys or set())}
+    assigned: list[tuple[dict, str]] = []
+
+    for paper in papers:
+        base = generate_citekey(
+            paper.get("authors"), paper.get("year"), paper.get("title")
+        )
+        key = base
+        suffix = 0
+        while key.lower() in taken:
+            key = f"{base}{chr(ord('a') + suffix)}"
+            suffix += 1
+        taken.add(key.lower())
+        assigned.append((paper, key))
+
+    return assigned
+
+
 def _format_bib_entry(
     citekey: str,
     paper: dict,
+    file_prefix: str | None = None,
 ) -> str:
     entry_type = "article" if paper.get("doi") else "misc"
     lines = [f"@{entry_type}{{{citekey},"]
 
     if paper.get("title"):
-        lines.append(f"  title = {{{paper['title']}}},")
+        lines.append(f"  title = {{{_bib_escape(str(paper['title']))}}},")
     if paper.get("authors"):
-        lines.append(f"  author = {{{paper['authors']}}},")
+        lines.append(f"  author = {{{_bib_escape(str(paper['authors']))}}},")
     if paper.get("year"):
         lines.append(f"  year = {{{paper['year']}}},")
     if paper.get("doi"):
-        lines.append(f"  doi = {{{paper['doi']}}},")
-    lines.append(f"  file = {{{paper['filename']}}},")
+        lines.append(f"  doi = {{{_bib_escape(str(paper['doi']))}}},")
+
+    filename = paper["filename"]
+    file_value = (
+        f"{file_prefix.rstrip('/')}/{filename}" if file_prefix else filename
+    )
+    lines.append(f"  file = {{{file_value}}},")
     lines.append("}")
     return "\n".join(lines)
 
 
-def generate_bib_content(papers: list[dict]) -> str:
-    used_keys: dict[str, int] = {}
-    entries = []
-
-    for paper in papers:
-        base_key = generate_citekey(
-            paper.get("authors"), paper.get("year"), paper.get("title")
-        )
-
-        if base_key in used_keys:
-            used_keys[base_key] += 1
-            suffix = chr(ord("a") + used_keys[base_key] - 1)
-            key = f"{base_key}{suffix}"
-        else:
-            used_keys[base_key] = 1
-            key = base_key
-
-        entries.append(_format_bib_entry(key, paper))
-
+def generate_bib_content(
+    papers: list[dict],
+    file_prefix: str | None = None,
+) -> str:
+    entries = [
+        _format_bib_entry(key, paper, file_prefix=file_prefix)
+        for paper, key in assign_citekeys(papers)
+    ]
     return "\n\n".join(entries) + "\n"

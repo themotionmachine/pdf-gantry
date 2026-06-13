@@ -2118,3 +2118,112 @@ def init(ctx, output, force, json_output):
             f"Wrote {entry_count} entries to {output} "
             f"({len(papers)} papers)"
         )
+
+
+@link.command()
+@click.argument("bib_path", required=False, type=click.Path(path_type=Path))
+@click.option("--file-prefix", default=None,
+              help="Prefix for the file field (e.g. /Users/Shared/Papers)")
+@click.option("--dry-run", is_flag=True,
+              help="Preview entries without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def append(ctx, bib_path, file_prefix, dry_run, json_output):
+    """Append .bib entries for newly-ingested papers lacking citekeys."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if bib_path is None:
+        bib_path = cfg.bib_path
+    if bib_path is None:
+        msg = (
+            "No .bib file specified. "
+            "Pass a path or set bib_path in config."
+        )
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    bib_path = Path(bib_path)
+    if not bib_path.exists():
+        msg = (
+            f"{bib_path} does not exist. "
+            "Run 'gantry link init' to create it first."
+        )
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .link import _format_bib_entry, assign_citekeys, parse_bib_file
+
+    existing = parse_bib_file(bib_path)
+    reserved = {e.citekey for e in existing if e.citekey}
+
+    conn = get_connection(cfg.db_path)
+    rows = conn.execute(
+        "SELECT id, title, authors, year, doi, filename FROM papers "
+        "WHERE citekey IS NULL AND title IS NOT NULL AND title != '' "
+        "ORDER BY filename"
+    ).fetchall()
+    candidates = [dict(r) for r in rows]
+
+    if not candidates:
+        conn.close()
+        msg = "No keyless papers with titles to append."
+        if use_json:
+            click.echo(json.dumps({
+                "path": str(bib_path), "added": 0,
+            }, indent=2))
+        else:
+            click.echo(msg)
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    assigned = assign_citekeys(candidates, reserved_keys=reserved)
+    blocks = [
+        _format_bib_entry(key, paper, file_prefix=file_prefix)
+        for paper, key in assigned
+    ]
+
+    if dry_run:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({
+                "path": str(bib_path),
+                "added": len(assigned),
+                "dry_run": True,
+                "citekeys": [key for _, key in assigned],
+            }, indent=2))
+        else:
+            click.echo(
+                f"Would append {len(assigned)} entries to {bib_path}:"
+            )
+            for paper, key in assigned:
+                click.echo(f"  @{key}  ({paper['filename']})")
+        return
+
+    with open(bib_path, "a") as f:
+        f.write("\n" + "\n\n".join(blocks) + "\n")
+
+    for paper, key in assigned:
+        conn.execute(
+            "UPDATE papers SET citekey = ?, citekey_source = ? WHERE id = ?",
+            (key, "gantry-link-append", paper["id"]),
+        )
+    conn.commit()
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps({
+            "path": str(bib_path),
+            "added": len(assigned),
+            "citekeys": [key for _, key in assigned],
+        }, indent=2))
+    else:
+        click.echo(f"Appended {len(assigned)} entries to {bib_path}")

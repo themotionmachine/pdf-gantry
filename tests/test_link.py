@@ -11,6 +11,7 @@ from pdf_gantry.link import (
     BibEntry,
     LinkMatch,
     apply_matches,
+    assign_citekeys,
     extract_bib_filename,
     generate_bib_content,
     generate_citekey,
@@ -632,3 +633,145 @@ def test_cli_link_init_no_overwrite(cli_db, monkeypatch, tmp_path):
     result = runner.invoke(cli, ["link", "init", str(out_bib)])
     assert result.exit_code != 0
     assert out_bib.read_text() == "existing content"
+
+
+# --- assign_citekeys ---
+
+
+def test_assign_citekeys_dedupes_against_reserved():
+    papers = [{"authors": "Smith, John", "year": 2024, "title": "Climate Policy"}]
+    assigned = assign_citekeys(papers, reserved_keys={"smith2024climate"})
+    _, key = assigned[0]
+    assert key != "smith2024climate"
+    assert key.startswith("smith2024climate")
+
+
+def test_assign_citekeys_dedupes_within_batch():
+    papers = [
+        {"authors": "Smith, John", "year": 2024, "title": "Climate Policy"},
+        {"authors": "Smith, John", "year": 2024, "title": "Climate Change"},
+    ]
+    assigned = assign_citekeys(papers)
+    keys = [k for _, k in assigned]
+    assert len(set(keys)) == 2
+
+
+def test_assign_citekeys_reserved_case_insensitive():
+    papers = [{"authors": "Smith, John", "year": 2024, "title": "Climate Policy"}]
+    assigned = assign_citekeys(papers, reserved_keys={"SMITH2024CLIMATE"})
+    _, key = assigned[0]
+    assert key.lower() != "smith2024climate"
+
+
+# --- LaTeX escaping in generated entries ---
+
+
+def test_generate_bib_content_escapes_latex_specials():
+    papers = [
+        {"title": "AI & ML: 50% _gains_", "authors": "O'Brien, Pat",
+         "year": 2024, "doi": None, "filename": "x.pdf"},
+    ]
+    content = generate_bib_content(papers)
+    assert r"\&" in content
+    assert r"\%" in content
+    assert r"\_" in content
+
+
+def test_generate_bib_content_file_prefix():
+    papers = [
+        {"title": "Climate", "authors": "Smith, John",
+         "year": 2024, "doi": None, "filename": "smith.pdf"},
+    ]
+    content = generate_bib_content(papers, file_prefix="/Users/Shared/Papers")
+    assert "file = {/Users/Shared/Papers/smith.pdf}" in content
+
+
+# --- CLI link append ---
+
+
+def test_cli_link_append_adds_entries(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    before = bib_file.read_text()
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "append", str(bib_file)])
+    assert result.exit_code == 0
+    after = bib_file.read_text()
+    assert len(after) > len(before)
+    assert "2024climate" in after
+    assert "2017attention" in after
+    # original entries preserved
+    assert "smith2024climate" in after
+
+
+def test_cli_link_append_writes_citekeys_to_db(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "append", str(bib_file)])
+    assert result.exit_code == 0
+    conn = get_connection(str(tmp_path / "index.db"))
+    rows = conn.execute(
+        "SELECT citekey, citekey_source FROM papers WHERE citekey IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 2
+    assert all(r["citekey_source"] == "gantry-link-append" for r in rows)
+
+
+def test_cli_link_append_dry_run_no_write(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    before = bib_file.read_text()
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "append", str(bib_file), "--dry-run"])
+    assert result.exit_code == 0
+    assert bib_file.read_text() == before
+    conn = get_connection(str(tmp_path / "index.db"))
+    row = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE citekey IS NOT NULL"
+    ).fetchone()
+    conn.close()
+    assert row[0] == 0
+
+
+def test_cli_link_append_missing_bib(cli_db, monkeypatch, tmp_path):
+    _, _, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    missing = tmp_path / "does_not_exist.bib"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "append", str(missing)])
+    assert result.exit_code != 0
+    assert not missing.exists()
+
+
+def test_cli_link_append_file_prefix(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["link", "append", str(bib_file), "--file-prefix", "/Users/Shared/Papers"]
+    )
+    assert result.exit_code == 0
+    after = bib_file.read_text()
+    assert "/Users/Shared/Papers/paper_a.pdf" in after
+
+
+def test_cli_link_append_no_candidates(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    runner = CliRunner()
+    runner.invoke(cli, ["link", "append", str(bib_file)])
+    result = runner.invoke(cli, ["link", "append", str(bib_file)])
+    assert result.exit_code == 2
+
+
+def test_cli_link_append_json(cli_db, monkeypatch):
+    tmp_path, bib_file, config_file = cli_db
+    monkeypatch.setattr("pdf_gantry.config.CONFIG_PATH", config_file)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["link", "append", str(bib_file), "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["added"] == 2
+    assert "path" in data
