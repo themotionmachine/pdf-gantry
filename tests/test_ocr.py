@@ -333,3 +333,76 @@ def test_cli_ocr_nothing_to_process(tmp_path, papers_dir, monkeypatch):
     result = CliRunner().invoke(cli, ["ocr"])
 
     assert result.exit_code == 2
+
+
+# --- CLI tests: ocr --ids (issue #18) ---
+
+def _setup_cli_ocr_env(tmp_path, papers_dir, monkeypatch, mark_needs_ocr=True):
+    """Ingest papers, set CLI env, return (db_path, sorted paper ids)."""
+    db_path = tmp_path / "index.db"
+    conn = get_connection(str(db_path))
+    ingest_directory(conn, papers_dir)
+    if mark_needs_ocr:
+        conn.execute("UPDATE papers SET needs_ocr = 1, is_scanned = 1")
+    conn.commit()
+    ids = [r["id"] for r in conn.execute("SELECT id FROM papers ORDER BY id").fetchall()]
+    conn.close()
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(papers_dir))
+    return db_path, ids
+
+
+def test_cli_ocr_ids_targets_specific_paper(tmp_path, papers_dir, mock_surya, monkeypatch):
+    """gantry ocr --ids X processes only paper X, not the whole needs_ocr set."""
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    db_path, ids = _setup_cli_ocr_env(tmp_path, papers_dir, monkeypatch)
+    assert len(ids) > 1
+    target = ids[0]
+
+    result = CliRunner().invoke(cli, ["ocr", "--ids", str(target), "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["total"] == 1
+    assert data["succeeded"] == 1
+
+    conn = get_connection(str(db_path))
+    done = [r["id"] for r in conn.execute(
+        "SELECT id FROM papers WHERE ocr_completed_at IS NOT NULL"
+    ).fetchall()]
+    conn.close()
+    assert done == [target]
+
+
+def test_cli_ocr_ids_overrides_filter(tmp_path, papers_dir, mock_surya, monkeypatch):
+    """--ids re-OCRs a specific paper even when nothing is flagged needs_ocr."""
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    _db_path, ids = _setup_cli_ocr_env(tmp_path, papers_dir, monkeypatch, mark_needs_ocr=False)
+    target = ids[0]
+
+    result = CliRunner().invoke(cli, ["ocr", "--ids", str(target), "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["total"] == 1
+    assert data["succeeded"] == 1
+
+
+def test_cli_ocr_ids_invalid(tmp_path, papers_dir, mock_surya, monkeypatch):
+    """gantry ocr --ids with non-integers exits 1 with a clear error."""
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    _setup_cli_ocr_env(tmp_path, papers_dir, monkeypatch)
+
+    result = CliRunner().invoke(cli, ["ocr", "--ids", "abc", "--json"])
+
+    assert result.exit_code == 1
+    assert "Invalid --ids" in result.output

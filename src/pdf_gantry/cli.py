@@ -449,10 +449,11 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
 
 @cli.command()
 @filter_options
+@click.option("--ids", default=None, help="Comma-separated paper IDs to OCR (overrides filters)")
 @click.option("--dry-run", is_flag=True, help="Report what would happen without processing")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_output):
+def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, json_output):
     """Run OCR on scanned PDFs using Surya."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -461,20 +462,33 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, limit, dry_run, json_ou
 
     conn = get_connection(cfg.db_path)
 
-    from .queue import build_filter_query
+    if ids is not None:
+        # Surgical mode: OCR exactly these papers, regardless of needs_ocr state.
+        try:
+            paper_ids = [int(x.strip()) for x in ids.split(",")]
+        except ValueError:
+            msg = "Invalid --ids: must be comma-separated integers"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
+    else:
+        from .queue import build_filter_query
 
-    # Default: papers that need OCR
-    if not needs and not has_prop and not is_prop:
-        needs = ("ocr",)
+        # Default: papers that need OCR
+        if not needs and not has_prop and not is_prop:
+            needs = ("ocr",)
 
-    where, params = build_filter_query(
-        needs=list(needs) if needs else None,
-        has=list(has_prop) if has_prop else None,
-        is_prop=list(is_prop) if is_prop else None,
-    )
+        where, params = build_filter_query(
+            needs=list(needs) if needs else None,
+            has=list(has_prop) if has_prop else None,
+            is_prop=list(is_prop) if is_prop else None,
+        )
 
-    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
-    paper_ids = [r["id"] for r in rows]
+        rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+        paper_ids = [r["id"] for r in rows]
 
     if dry_run:
         count = len(paper_ids) if limit is None else min(len(paper_ids), limit)
