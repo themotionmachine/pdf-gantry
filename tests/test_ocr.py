@@ -1,5 +1,6 @@
 """Tests for OCR processing with Surya."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,19 +9,22 @@ from pdf_gantry.db import get_connection
 from pdf_gantry.ingest import ingest_directory
 from pdf_gantry.ocr import ocr_document, process_ocr_documents
 
-
 # --- Mock helpers ---
 
-def _make_mock_predictions(num_pages):
+_DEFAULT_OCR_LINES = ("Recognized OCR text line one.", "Another line of text.")
+
+
+def _make_mock_predictions(num_pages, lines=_DEFAULT_OCR_LINES):
     """Build a list of mock prediction objects mimicking Surya output."""
     predictions = []
     for _ in range(num_pages):
-        line1 = MagicMock()
-        line1.text = "Recognized OCR text line one."
-        line2 = MagicMock()
-        line2.text = "Another line of text."
+        text_lines = []
+        for text in lines:
+            line = MagicMock()
+            line.text = text
+            text_lines.append(line)
         page = MagicMock()
-        page.text_lines = [line1, line2]
+        page.text_lines = text_lines
         predictions.append(page)
     return predictions
 
@@ -160,6 +164,99 @@ def test_process_ocr_populates_fts(tmp_path, papers_dir, mock_surya):
     conn.close()
 
 
+# --- Regression tests: OCR must re-derive chunks and not duplicate FTS (issue #16) ---
+
+def _seed_stale_chunk(conn, paper_id):
+    """Give a paper a stale chunk + chunk_vec + has_chunk_embeddings=1,
+    as if it had been processed (badly) before OCR."""
+    cur = conn.execute(
+        """INSERT INTO chunks (doc_id, chunk_index, section_header, page_start, text, char_offset)
+           VALUES (?, 0, 'STALE', 1, ?, 0)""",
+        (paper_id, "STALE GARBAGE pre-ocr extraction noise"),
+    )
+    stale_chunk_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+        (stale_chunk_id, json.dumps([0.0] * 768)),
+    )
+    conn.execute("UPDATE papers SET has_chunk_embeddings = 1 WHERE id = ?", (paper_id,))
+    conn.commit()
+    return stale_chunk_id
+
+
+def test_process_ocr_rederives_chunks(tmp_path, papers_dir, mock_surya):
+    """After OCR, chunks reflect the OCR text — stale pre-OCR chunks are gone."""
+    db_path, conn = _setup_ocr_db(tmp_path, papers_dir)
+    paper_id = conn.execute("SELECT id FROM papers LIMIT 1").fetchone()["id"]
+    _seed_stale_chunk(conn, paper_id)
+
+    process_ocr_documents(conn, papers_dir, db_path, paper_ids=[paper_id])
+
+    texts = [r["text"] for r in conn.execute(
+        "SELECT text FROM chunks WHERE doc_id = ? ORDER BY chunk_index", (paper_id,)
+    ).fetchall()]
+    assert texts, "OCR should have produced chunks"
+    joined = "\n".join(texts)
+    assert "Recognized OCR text" in joined
+    assert "STALE GARBAGE" not in joined
+    conn.close()
+
+
+def test_process_ocr_clears_stale_chunk_vec(tmp_path, papers_dir, mock_surya):
+    """OCR removes embeddings tied to the old chunks (vec0 has no CASCADE)."""
+    db_path, conn = _setup_ocr_db(tmp_path, papers_dir)
+    paper_id = conn.execute("SELECT id FROM papers LIMIT 1").fetchone()["id"]
+    stale_chunk_id = _seed_stale_chunk(conn, paper_id)
+
+    process_ocr_documents(conn, papers_dir, db_path, paper_ids=[paper_id])
+
+    leftover = conn.execute(
+        "SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = ?", (stale_chunk_id,)
+    ).fetchone()[0]
+    assert leftover == 0, "stale chunk embedding should be deleted"
+    conn.close()
+
+
+def test_process_ocr_resets_chunk_embeddings_flag(tmp_path, papers_dir, mock_surya):
+    """New chunks have no embeddings yet, so the flag must be reset to 0."""
+    db_path, conn = _setup_ocr_db(tmp_path, papers_dir)
+    paper_id = conn.execute("SELECT id FROM papers LIMIT 1").fetchone()["id"]
+    _seed_stale_chunk(conn, paper_id)
+
+    process_ocr_documents(conn, papers_dir, db_path, paper_ids=[paper_id])
+
+    flag = conn.execute(
+        "SELECT has_chunk_embeddings FROM papers WHERE id = ?", (paper_id,)
+    ).fetchone()[0]
+    assert flag == 0
+    conn.close()
+
+
+def test_process_ocr_fts_replaces_stale_text(tmp_path, papers_dir, mock_surya):
+    """Re-OCR with new text must drop the old FTS postings (contentless delete)."""
+    db_path, conn = _setup_ocr_db(tmp_path, papers_dir)
+    paper_id = conn.execute("SELECT id FROM papers LIMIT 1").fetchone()["id"]
+
+    process_ocr_documents(conn, papers_dir, db_path, paper_ids=[paper_id])
+
+    # Second pass yields different OCR text, as if the page were re-OCR'd better.
+    mock_surya["rec"].return_value = _make_mock_predictions(
+        1, lines=("Totallynewword content here.",)
+    )
+    conn.execute("UPDATE papers SET ocr_completed_at = NULL WHERE id = ?", (paper_id,))
+    conn.commit()
+    process_ocr_documents(conn, papers_dir, db_path, paper_ids=[paper_id])
+
+    def hits(term):
+        return [r["rowid"] for r in conn.execute(
+            "SELECT rowid FROM papers_fts WHERE papers_fts MATCH ?", (term,)
+        ).fetchall()]
+
+    assert paper_id not in hits("Recognized"), "stale OCR text still in FTS"
+    assert paper_id in hits("Totallynewword"), "new OCR text missing from FTS"
+    conn.close()
+
+
 # --- CLI tests ---
 
 def _invoke_ocr(runner, tmp_path, papers_dir, extra_args, monkeypatch):
@@ -193,6 +290,7 @@ def test_cli_ocr_dry_run(tmp_path, papers_dir, mock_surya, monkeypatch):
 def test_cli_ocr_dry_run_json(tmp_path, papers_dir, mock_surya, monkeypatch):
     """gantry ocr --dry-run --json outputs structured JSON."""
     import json
+
     from click.testing import CliRunner
 
     result = _invoke_ocr(CliRunner(), tmp_path, papers_dir,
@@ -206,6 +304,7 @@ def test_cli_ocr_dry_run_json(tmp_path, papers_dir, mock_surya, monkeypatch):
 def test_cli_ocr_with_limit(tmp_path, papers_dir, mock_surya, monkeypatch):
     """gantry ocr --limit processes only N documents."""
     import json
+
     from click.testing import CliRunner
 
     result = _invoke_ocr(CliRunner(), tmp_path, papers_dir,
@@ -220,6 +319,7 @@ def test_cli_ocr_with_limit(tmp_path, papers_dir, mock_surya, monkeypatch):
 def test_cli_ocr_nothing_to_process(tmp_path, papers_dir, monkeypatch):
     """gantry ocr with no scanned docs exits with code 2."""
     from click.testing import CliRunner
+
     from pdf_gantry.cli import cli
 
     db_path = tmp_path / "index.db"

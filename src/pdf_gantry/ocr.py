@@ -129,6 +129,18 @@ def process_ocr_documents(
             raw_text, markdown = ocr_document(pdf_path)
             now = now_iso()
 
+            paper = conn.execute(
+                "SELECT filename, title, authors, abstract FROM papers WHERE id = ?",
+                (paper_id,),
+            ).fetchone()
+
+            # Read the prior text BEFORE overwriting — needed to delete stale
+            # postings from the contentless FTS5 index.
+            old_row = conn.execute(
+                "SELECT raw_text FROM paper_text WHERE paper_id = ?", (paper_id,)
+            ).fetchone()
+            old_text = old_row["raw_text"] if old_row else ""
+
             conn.execute(
                 """INSERT OR REPLACE INTO paper_text
                     (paper_id, raw_text, markdown, text_length, markdown_length)
@@ -136,21 +148,43 @@ def process_ocr_documents(
                 (paper_id, raw_text, markdown, len(raw_text), len(markdown)),
             )
 
-            # Update FTS
-            paper = conn.execute(
-                "SELECT filename, title, authors, abstract FROM papers WHERE id = ?",
-                (paper_id,),
+            # Update FTS (contentless: delete old postings before inserting new).
+            existing_fts = conn.execute(
+                "SELECT rowid FROM papers_fts WHERE rowid = ?", (paper_id,)
             ).fetchone()
-
+            if existing_fts:
+                conn.execute(
+                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, abstract, text_content) "
+                    "VALUES('delete', ?, ?, ?, ?, ?, ?)",
+                    (paper_id, paper["filename"] or "", paper["title"] or "",
+                     paper["authors"] or "", paper["abstract"] or "", old_text or ""),
+                )
             conn.execute(
                 "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) VALUES (?, ?, ?, ?, ?, ?)",
                 (paper_id, paper["filename"] or "", paper["title"] or "",
                  paper["authors"] or "", paper["abstract"] or "", raw_text),
             )
 
+            # Re-derive chunks from the OCR markdown — otherwise chunks (and their
+            # embeddings) keep answering with the pre-OCR garbage extraction.
+            from .chunking import chunk_markdown
+            raw_chunks = chunk_markdown(markdown, title=paper["title"])
+            conn.execute(
+                "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                (paper_id,),
+            )
+            conn.execute("DELETE FROM chunks WHERE doc_id = ?", (paper_id,))
+            for i, chunk in enumerate(raw_chunks):
+                conn.execute(
+                    """INSERT INTO chunks (doc_id, chunk_index, section_header, page_start, text, char_offset)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (paper_id, i, chunk.section_header, chunk.page_start, chunk.text, chunk.char_offset),
+                )
+
             conn.execute(
                 """UPDATE papers SET
                     has_text = 1, has_markdown = 1, needs_ocr = 0,
+                    has_chunk_embeddings = 0,
                     text_method = 'surya', ocr_method = 'surya',
                     text_extracted_at = ?, ocr_completed_at = ?,
                     markdown_method = 'surya', markdown_extracted_at = ?,
