@@ -40,3 +40,9 @@ htmlcov/
 CLAUDE.md
 Brev.md
 pdf-gantry-prd.md
+
+# Agent/steward local state: git worktrees, strand briefs, etc.
+.claude/
+
+# uv lockfile (not tracked in this repo)
+uv.lock
