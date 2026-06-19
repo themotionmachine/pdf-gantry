@@ -100,6 +100,21 @@ def _process_single(
         conn = get_connection(db_path)
         now = now_iso()
 
+        # Get paper metadata for FTS
+        row = conn.execute(
+            "SELECT filename, title, authors, abstract FROM papers WHERE id = ?",
+            (paper_id,),
+        ).fetchone()
+
+        # Read the prior text BEFORE overwriting paper_text — a contentless FTS5
+        # delete needs the OLD content to drop stale postings. Reading after the
+        # INSERT OR REPLACE below would hand the new text to 'delete', leaving the
+        # old terms to keep matching on re-extraction.
+        old_row = conn.execute(
+            "SELECT raw_text FROM paper_text WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        old_content = old_row["raw_text"] if old_row else ""
+
         # Store text
         conn.execute(
             """INSERT OR REPLACE INTO paper_text
@@ -108,23 +123,12 @@ def _process_single(
             (paper_id, raw_text, markdown, len(raw_text), len(markdown)),
         )
 
-        # Get paper metadata for FTS
-        row = conn.execute(
-            "SELECT filename, title, authors, abstract FROM papers WHERE id = ?",
-            (paper_id,),
-        ).fetchone()
-
         # Update FTS index
         # For contentless FTS5, check if row exists before trying to delete
         existing_fts = conn.execute(
             "SELECT rowid FROM papers_fts WHERE rowid = ?", (paper_id,)
         ).fetchone()
         if existing_fts:
-            # Must provide old content for contentless delete
-            old_text = conn.execute(
-                "SELECT raw_text FROM paper_text WHERE paper_id = ?", (paper_id,)
-            ).fetchone()
-            old_content = old_text["raw_text"] if old_text else ""
             conn.execute(
                 "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, abstract, text_content) "
                 "VALUES('delete', ?, ?, ?, ?, ?, ?)",
