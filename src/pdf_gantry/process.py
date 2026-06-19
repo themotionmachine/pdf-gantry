@@ -9,6 +9,7 @@ import fitz  # PyMuPDF
 import pymupdf4llm
 
 from .models import ProcessStats
+from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 from .utils import now_iso
 
 
@@ -194,9 +195,14 @@ def process_documents(
     workers: int = 4,
     limit: int | None = None,
     progress_callback=None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> ProcessStats:
     """
     Process documents matching the given IDs (or all needing text).
+
+    When paper_ids is None, papers that have failed at least `max_retries` times
+    are quarantined — skipped so a permanently-broken PDF isn't re-attempted on
+    every run. Explicit paper_ids bypass the cap (an operator asked for them).
     Returns processing statistics.
     """
     # Marker is internally parallelized — multiple workers would OOM
@@ -208,7 +214,9 @@ def process_documents(
 
     if paper_ids is None:
         rows = conn.execute(
-            "SELECT id, path FROM papers WHERE has_text = 0 AND (is_scanned = 0 OR is_scanned IS NULL)"
+            "SELECT id, path FROM papers WHERE has_text = 0 "
+            "AND (is_scanned = 0 OR is_scanned IS NULL) "
+            f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
     else:
         placeholders = ",".join("?" * len(paper_ids))
@@ -260,3 +268,23 @@ def process_documents(
 
     stats.elapsed_seconds = round(time.time() - start, 1)
     return stats
+
+
+def reset_errors(conn: sqlite3.Connection, paper_ids: list[int]) -> int:
+    """
+    Clear the error state of the given papers, re-admitting any that were
+    quarantined (error_count >= cap) to default process/embed selection.
+
+    Returns the number of rows updated.
+    """
+    if not paper_ids:
+        return 0
+    placeholders = ",".join("?" * len(paper_ids))
+    cur = conn.execute(
+        f"""UPDATE papers SET
+            error_count = 0, last_error = NULL, updated_at = ?
+        WHERE id IN ({placeholders})""",
+        [now_iso(), *paper_ids],
+    )
+    conn.commit()
+    return cur.rowcount

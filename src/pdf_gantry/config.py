@@ -23,6 +23,9 @@ class ProcessingConfig:
     workers: int = 4
     scan_threshold: float = 0.8
     default_method: str = "pymupdf4llm"
+    # A paper that fails this many times is quarantined: skipped by default
+    # process/embed selection so a permanently-broken PDF isn't retried forever.
+    max_retries: int = 3
 
 
 @dataclass
@@ -126,6 +129,7 @@ def save_config(cfg: Config) -> None:
         "workers": cfg.processing.workers,
         "scan_threshold": cfg.processing.scan_threshold,
         "default_method": cfg.processing.default_method,
+        "max_retries": cfg.processing.max_retries,
     }
     data["output"] = {
         "format": cfg.output.format,

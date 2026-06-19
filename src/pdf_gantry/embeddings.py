@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .models import ProcessStats
+from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 from .utils import now_iso
 
 
@@ -48,8 +49,13 @@ def embed_documents(
     batch_size: int = 32,
     limit: int | None = None,
     progress_callback=None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> ProcessStats:
-    """Generate embeddings for documents."""
+    """Generate embeddings for documents.
+
+    When paper_ids is None, quarantined papers (error_count >= max_retries) are
+    excluded from default selection so a broken paper isn't re-attempted forever.
+    """
     stats = ProcessStats()
     start = time.time()
 
@@ -65,10 +71,11 @@ def embed_documents(
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT p.id, p.title, p.abstract, pt.raw_text
+            f"""SELECT p.id, p.title, p.abstract, pt.raw_text
             FROM papers p
             JOIN paper_text pt ON pt.paper_id = p.id
-            WHERE p.has_text = 1 AND p.has_embeddings = 0"""
+            WHERE p.has_text = 1 AND p.has_embeddings = 0
+            AND p.{not_quarantined_condition(max_retries)}"""
         ).fetchall()
 
     if limit:
@@ -165,8 +172,13 @@ def embed_chunks(
     batch_size: int = 64,
     limit: int | None = None,
     progress_callback=None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> ProcessStats:
-    """Generate chunk-level embeddings with contextual metadata prepended."""
+    """Generate chunk-level embeddings with contextual metadata prepended.
+
+    When paper_ids is None, quarantined papers (error_count >= max_retries) are
+    excluded from default selection.
+    """
     from .chunking import prepare_chunk_text
 
     stats = ProcessStats()
@@ -181,7 +193,8 @@ def embed_chunks(
         ).fetchall()
     else:
         paper_rows = conn.execute(
-            "SELECT id, title FROM papers WHERE has_text = 1 AND has_chunk_embeddings = 0"
+            "SELECT id, title FROM papers WHERE has_text = 1 AND has_chunk_embeddings = 0 "
+            f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
 
     if limit:

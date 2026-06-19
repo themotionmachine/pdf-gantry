@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .ingest import ingest_directory
 from .process import process_documents
+from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 
 
 def run_pipeline(
@@ -17,6 +18,7 @@ def run_pipeline(
     filename: str | None = None,
     scan_threshold: float = 0.05,
     progress_callback=None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict:
     """
     Run the full ingestion pipeline: ingest → process → embed (chunks).
@@ -105,9 +107,11 @@ def run_pipeline(
             stats["processed"] = proc_stats.succeeded
             stats["errors"] += proc_stats.failed
     else:
-        # Get unprocessed papers
+        # Get unprocessed papers (skip quarantined — see queue.quarantine_condition)
         rows = conn.execute(
-            "SELECT id FROM papers WHERE has_text = 0 AND (is_scanned = 0 OR is_scanned IS NULL)"
+            "SELECT id FROM papers WHERE has_text = 0 "
+            "AND (is_scanned = 0 OR is_scanned IS NULL) "
+            f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
         ids_to_process = [r["id"] for r in rows]
 
@@ -135,7 +139,8 @@ def run_pipeline(
         ids_to_embed = target_ids
     else:
         rows = conn.execute(
-            "SELECT id FROM papers WHERE has_text = 1 AND has_chunk_embeddings = 0"
+            "SELECT id FROM papers WHERE has_text = 1 AND has_chunk_embeddings = 0 "
+            f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
         ids_to_embed = [r["id"] for r in rows]
         if limit:
