@@ -31,12 +31,29 @@ def fts_search(
     conn: sqlite3.Connection,
     query: str,
     limit: int = 20,
+    restrict_ids: list[int] | None = None,
 ) -> list[SearchResult]:
-    """Run FTS5 search and return ranked results with snippets."""
+    """
+    Run FTS5 search and return ranked results with snippets.
+
+    When ``restrict_ids`` is given, the search is scoped to only those paper
+    IDs (a cross-paper "which of THESE discuss X?" query). An empty list yields
+    no results without touching the DB.
+    """
+    if restrict_ids is not None and not restrict_ids:
+        return []
+
     safe_query = _sanitize_fts_query(query)
+    scope_sql = ""
+    params: list = [safe_query]
+    if restrict_ids is not None:
+        placeholders = ",".join("?" * len(restrict_ids))
+        scope_sql = f" AND p.id IN ({placeholders})"
+        params.extend(restrict_ids)
+    params.append(limit)
     # Contentless FTS5 can't use snippet() — we get snippets from paper_text instead
     rows = conn.execute(
-        """SELECT
+        f"""SELECT
             p.id, p.filename, p.path, p.title,
             p.has_markdown, p.has_embeddings,
             rank,
@@ -44,10 +61,10 @@ def fts_search(
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
         LEFT JOIN paper_text pt ON pt.paper_id = p.id
-        WHERE papers_fts MATCH ?
+        WHERE papers_fts MATCH ?{scope_sql}
         ORDER BY rank
         LIMIT ?""",
-        (safe_query, limit),
+        params,
     ).fetchall()
 
     results = []
@@ -87,22 +104,49 @@ def semantic_search(
     conn: sqlite3.Connection,
     query_vector: bytes,
     limit: int = 20,
+    restrict_ids: list[int] | None = None,
 ) -> list[SearchResult]:
-    """Run vector similarity search using sqlite-vec."""
-    rows = conn.execute(
-        """SELECT
-            p.id, p.filename, p.path, p.title,
-            p.has_markdown, p.has_embeddings,
-            e.distance,
-            SUBSTR(pt.raw_text, 1, 200) as text_preview
-        FROM paper_embeddings e
-        INNER JOIN papers p ON p.id = e.paper_id
-        LEFT JOIN paper_text pt ON pt.paper_id = p.id
-        WHERE e.embedding MATCH ?
-            AND k = ?
-        ORDER BY e.distance""",
-        (query_vector, limit),
-    ).fetchall()
+    """
+    Run vector similarity search using sqlite-vec.
+
+    When ``restrict_ids`` is given, the comparison is scoped to those papers'
+    embeddings via ``vec_distance_cosine`` (not global KNN), mirroring
+    ``best_chunk_per_doc``. An empty list yields no results.
+    """
+    if restrict_ids is not None and not restrict_ids:
+        return []
+
+    if restrict_ids is not None:
+        placeholders = ",".join("?" * len(restrict_ids))
+        rows = conn.execute(
+            f"""SELECT
+                p.id, p.filename, p.path, p.title,
+                p.has_markdown, p.has_embeddings,
+                vec_distance_cosine(e.embedding, ?) AS distance,
+                SUBSTR(pt.raw_text, 1, 200) as text_preview
+            FROM paper_embeddings e
+            INNER JOIN papers p ON p.id = e.paper_id
+            LEFT JOIN paper_text pt ON pt.paper_id = p.id
+            WHERE p.id IN ({placeholders})
+            ORDER BY distance
+            LIMIT ?""",
+            [query_vector, *restrict_ids, limit],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT
+                p.id, p.filename, p.path, p.title,
+                p.has_markdown, p.has_embeddings,
+                e.distance,
+                SUBSTR(pt.raw_text, 1, 200) as text_preview
+            FROM paper_embeddings e
+            INNER JOIN papers p ON p.id = e.paper_id
+            LEFT JOIN paper_text pt ON pt.paper_id = p.id
+            WHERE e.embedding MATCH ?
+                AND k = ?
+            ORDER BY e.distance""",
+            (query_vector, limit),
+        ).fetchall()
 
     results = []
     for row in rows:
@@ -128,19 +172,26 @@ def hybrid_search(
     query_vector: bytes,
     limit: int = 20,
     rrf_k: int = 60,
+    restrict_ids: list[int] | None = None,
 ) -> list[SearchResult]:
     """
     Combine FTS5 and vector search using Reciprocal Rank Fusion (RRF).
     Component scores (FTS rank, vector cosine, ordinal positions) are
     preserved on each result for downstream composition.
+
+    ``restrict_ids`` scopes both components to the given paper set; an empty
+    list yields no results.
     """
+    if restrict_ids is not None and not restrict_ids:
+        return []
+
     fetch_limit = limit * 2
 
     # Get FTS5 results
-    fts_results = fts_search(conn, query, limit=fetch_limit)
+    fts_results = fts_search(conn, query, limit=fetch_limit, restrict_ids=restrict_ids)
 
     # Get semantic results
-    sem_results = semantic_search(conn, query_vector, limit=fetch_limit)
+    sem_results = semantic_search(conn, query_vector, limit=fetch_limit, restrict_ids=restrict_ids)
 
     # Build RRF scores and track component data
     rrf_scores: dict[int, float] = {}
