@@ -5,9 +5,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pdf_gantry.db import get_connection
-from pdf_gantry.ingest import ingest_directory
-from pdf_gantry.ocr import ocr_document, process_ocr_documents
+# These tests exercise the OCR path, which needs the [ocr] extra
+# (surya-ocr + Pillow). Skip the whole module when those deps are absent
+# instead of erroring at collection / runtime.
+pytest.importorskip("PIL")
+pytest.importorskip("surya")
+
+from pdf_gantry.db import get_connection  # noqa: E402
+from pdf_gantry.ingest import ingest_directory  # noqa: E402
+from pdf_gantry.ocr import ocr_document, process_ocr_documents  # noqa: E402
 
 # --- Mock helpers ---
 
