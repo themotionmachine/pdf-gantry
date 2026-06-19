@@ -581,12 +581,31 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
 @click.option("--components", is_flag=True, help="Include FTS and vector component scores (hybrid only)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include in JSON output")
+@click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
+              help="Comma-separated paper IDs; scope the search to only these papers")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare ranked paper IDs, one per line (for piping)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def search(ctx, query, limit, hybrid, fts_only, components, field_list, json_output):
+def search(ctx, query, limit, hybrid, fts_only, components, field_list,
+           restrict_to_ids, ids_only, json_output):
     """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only."""
     cfg = ctx.obj["config"]
-    use_json = json_output or ctx.obj["json"]
+    # --ids-only is a pure pipe format: it wins over --json.
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    restrict_ids = None
+    if restrict_to_ids is not None:
+        try:
+            restrict_ids = [int(x.strip()) for x in restrict_to_ids.split(",") if x.strip()]
+        except ValueError:
+            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -612,11 +631,11 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list, json_out
                 click.echo("Embeddings unavailable; falling back to FTS.", err=True)
                 use_hybrid = False
         if use_hybrid:
-            results = hybrid_search(conn, query, query_vec, limit=limit)
+            results = hybrid_search(conn, query, query_vec, limit=limit, restrict_ids=restrict_ids)
             total = len(results)
         else:
-            total = search_count(conn, query)
-            results = fts_search(conn, query, limit=limit)
+            results = fts_search(conn, query, limit=limit, restrict_ids=restrict_ids)
+            total = len(results) if restrict_ids is not None else search_count(conn, query)
     except ImportError as e:
         msg = str(e)
         if use_json:
@@ -642,6 +661,12 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list, json_out
         else:
             click.echo(f'No results for "{query}"')
         ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    # --ids-only: bare ranked IDs, one per line, nothing else (pipe-friendly).
+    if ids_only:
+        for r in results:
+            click.echo(r.id)
         return
 
     # Lookup citekeys for result papers
@@ -860,12 +885,29 @@ def errors(ctx, json_output):
 @click.option("--doc-only", is_flag=True, help="Use doc-level embeddings only (skip chunk cascade)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include in JSON output")
+@click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
+              help="Comma-separated paper IDs; scope the search to only these papers")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare ranked paper IDs, one per line (for piping)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def semantic(ctx, query, limit, doc_only, field_list, json_output):
+def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only, json_output):
     """Semantic similarity search (requires embeddings)."""
     cfg = ctx.obj["config"]
-    use_json = json_output or ctx.obj["json"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    restrict_ids = None
+    if restrict_to_ids is not None:
+        try:
+            restrict_ids = [int(x.strip()) for x in restrict_to_ids.split(",") if x.strip()]
+        except ValueError:
+            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            ctx.exit(EXIT_ERROR)
+            return
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -896,7 +938,11 @@ def semantic(ctx, query, limit, doc_only, field_list, json_output):
         "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
     ).fetchone()[0] > 0
 
-    if has_chunks and not doc_only:
+    # Restriction scopes to a doc set, so use scoped doc-level cosine (not the
+    # global two-stage cascade).
+    if restrict_ids is not None:
+        results = semantic_search(conn, query_vec, limit=limit, restrict_ids=restrict_ids)
+    elif has_chunks and not doc_only:
         results = cascade_search(conn, query_vec, limit=limit)
     else:
         results = semantic_search(conn, query_vec, limit=limit)
@@ -908,6 +954,12 @@ def semantic(ctx, query, limit, doc_only, field_list, json_output):
         else:
             click.echo(f'No results for "{query}"')
         ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    # --ids-only: bare ranked IDs, one per line, nothing else (pipe-friendly).
+    if ids_only:
+        for r in results:
+            click.echo(r.id)
         return
 
     if use_json:

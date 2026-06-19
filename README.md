@@ -19,6 +19,25 @@ $ gantry search "predictive processing" --fields id --json -n 5
 }
 ```
 
+Or skip JSON entirely and emit bare ranked IDs, one per line, to pipe straight into the next step:
+
+```bash
+$ gantry search "predictive processing" --ids-only -n 5
+942
+1112
+999
+1616
+182
+```
+
+To ask "which of *these* papers discuss X?", scope a search to a candidate set instead of searching globally and filtering client-side:
+
+```bash
+$ gantry search "free energy" --restrict-to-ids 942,1112,999 --ids-only
+942
+999
+```
+
 Then pull the single best-matching chunk from each of those papers in one call. Not N searches, and no full documents:
 
 ```bash
@@ -93,7 +112,7 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   An agent can branch on "no results" without parsing anything.
 - **State is queryable.** Processing status lives in boolean columns (`has_text`, `has_embeddings`, `needs_ocr`), so `gantry queue --needs embeddings` answers "what work is left?" in one call.
 
-If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --fields id --json` to find papers, `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, and `gantry read <id> --chunk <chunk_id> --context 2000` to expand. Exit code 2 means no results."*
+If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, and `gantry read <id> --chunk <chunk_id> --context 2000` to expand. Exit code 2 means no results."*
 
 ## Why not Zotero, or a RAG framework?
 
@@ -133,8 +152,8 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 
 | Command | Description |
 |---------|-------------|
-| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only |
-| `gantry semantic <query>` | Pure vector similarity search |
+| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only. `--ids-only` emits bare ranked IDs for piping; `--restrict-to-ids` scopes the search to a candidate set |
+| `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only` and `--restrict-to-ids` |
 | `gantry find <fragment>` | Fuzzy filename lookup |
 | `gantry read <id>` | Read a document's text, list its chunks, or expand one chunk with `--context` |
 | `gantry info --ids <ids>` | Metadata for specific papers; `--query` attaches each paper's best-matching chunk |
