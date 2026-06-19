@@ -52,7 +52,7 @@ def filter_options(f):
                   ]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
-                  type=click.Choice(["scanned", "digital", "suspicious"]),
+                  type=click.Choice(["scanned", "digital", "suspicious", "broken"]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
                   help="Documents with outdated embedding model version")
@@ -377,7 +377,8 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
         paper_ids = [row["id"]]
     else:
         # Batch mode - apply filters
-        if not needs and not has_prop and not is_prop and not force:
+        default_select = not needs and not has_prop and not is_prop and not force
+        if default_select:
             needs = ("text",)
             is_prop = ("digital",)
 
@@ -385,6 +386,10 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
             needs=list(needs) if needs else None,
             has=list(has_prop) if has_prop else None,
             is_prop=list(is_prop) if is_prop else None,
+            # Skip permanently-broken papers on the default sweep; an explicit
+            # filter or --force opts back in (so they remain re-tryable).
+            exclude_quarantined=default_select,
+            max_retries=cfg.processing.max_retries,
         )
 
         rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
@@ -760,7 +765,8 @@ def queue(ctx, needs, has_prop, is_prop, stale_embeddings, limit, count, json_ou
 
     if count:
         c = queue_count(conn, needs=n_list, has=h_list, is_prop=i_list,
-                        stale_embeddings=stale_embeddings)
+                        stale_embeddings=stale_embeddings,
+                        max_retries=cfg.processing.max_retries)
         conn.close()
         if use_json:
             click.echo(json.dumps({"count": c}))
@@ -769,7 +775,8 @@ def queue(ctx, needs, has_prop, is_prop, stale_embeddings, limit, count, json_ou
         return
 
     rows = query_queue(conn, needs=n_list, has=h_list, is_prop=i_list,
-                       stale_embeddings=stale_embeddings, limit=limit)
+                       stale_embeddings=stale_embeddings, limit=limit,
+                       max_retries=cfg.processing.max_retries)
     conn.close()
 
     if not rows:
@@ -1025,7 +1032,8 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
         batch_size = cfg.embedding.batch_size if not chunk_mode else 64
 
     # Default filter depends on mode
-    if not needs and not has_prop and not is_prop and not stale_embeddings:
+    default_select = not needs and not has_prop and not is_prop and not stale_embeddings
+    if default_select:
         if chunk_mode:
             needs = ("chunk_embeddings",)
             has_prop = ("text",)
@@ -1039,6 +1047,9 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
         is_prop=list(is_prop) if is_prop else None,
         stale_embeddings=stale_embeddings,
         current_model_version=cfg.embedding.model.split("/")[-1] if stale_embeddings else None,
+        # Skip quarantined papers on the default sweep (re-tryable via reset).
+        exclude_quarantined=default_select,
+        max_retries=cfg.processing.max_retries,
     )
 
     rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
@@ -1251,13 +1262,25 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
 # --- retry ---
 
 @cli.command()
-@click.option("--max-attempts", type=int, default=3, help="Max retry attempts")
+@click.option("--max-attempts", type=int, default=None,
+              help="Max retry attempts (defaults to processing.max_retries)")
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to reset and re-process, "
+                   "even if quarantined (clears their error count)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def retry(ctx, max_attempts, json_output):
-    """Re-process documents that previously failed."""
+def retry(ctx, max_attempts, ids, json_output):
+    """Re-process documents that previously failed.
+
+    Without --ids, re-tries papers that have failed but not yet hit the cap.
+    With --ids, resets the given papers' error count and re-processes them
+    regardless of the cap — the way to un-quarantine a paper you've fixed.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    if max_attempts is None:
+        max_attempts = cfg.processing.max_retries
 
     if not cfg.db_path.exists():
         msg = "No database found."
@@ -1271,13 +1294,28 @@ def retry(ctx, max_attempts, json_output):
     require_papers_dir(ctx, cfg, use_json)
 
     conn = get_connection(cfg.db_path)
-    from .process import process_documents
+    from .process import process_documents, reset_errors
 
-    rows = conn.execute(
-        "SELECT id FROM papers WHERE error_count > 0 AND error_count < ?",
-        (max_attempts,),
-    ).fetchall()
-    paper_ids = [r["id"] for r in rows]
+    if ids is not None:
+        # Surgical un-quarantine: reset exactly these papers, ignore the cap.
+        try:
+            paper_ids = [int(x.strip()) for x in ids.split(",")]
+        except ValueError:
+            msg = "Invalid --ids: must be comma-separated integers"
+            if use_json:
+                click.echo(json.dumps({"error": msg}))
+            else:
+                click.echo(msg, err=True)
+            conn.close()
+            ctx.exit(EXIT_ERROR)
+            return
+        reset_errors(conn, paper_ids)
+    else:
+        rows = conn.execute(
+            "SELECT id FROM papers WHERE error_count > 0 AND error_count < ?",
+            (max_attempts,),
+        ).fetchall()
+        paper_ids = [r["id"] for r in rows]
 
     if not paper_ids:
         if use_json:
@@ -1375,6 +1413,7 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
         workers=workers, limit=limit, dry_run=dry_run,
         filename=filename,
         scan_threshold=cfg.processing.scan_threshold,
+        max_retries=cfg.processing.max_retries,
     )
 
     if not dry_run:

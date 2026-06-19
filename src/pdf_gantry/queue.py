@@ -2,6 +2,24 @@
 
 import sqlite3
 
+# A permanently-broken PDF (e.g. one PyMuPDF can't open) fails on every pipeline
+# run, incrementing error_count without end and wasting work. Once a paper has
+# failed this many times it is "quarantined": excluded from default process/embed
+# selection and surfaced via `queue --is broken`. Resettable via `gantry retry
+# --ids`. Configurable as processing.max_retries in config.yaml.
+DEFAULT_MAX_RETRIES = 3
+
+
+def quarantine_condition(max_retries: int = DEFAULT_MAX_RETRIES) -> str:
+    """SQL predicate (against papers) for a quarantined, retry-exhausted paper."""
+    return f"error_count >= {int(max_retries)}"
+
+
+def not_quarantined_condition(max_retries: int = DEFAULT_MAX_RETRIES) -> str:
+    """SQL predicate for a paper still eligible for (re)processing."""
+    return f"error_count < {int(max_retries)}"
+
+
 # A digital PDF whose body is rendered as bitmap extracts to almost nothing
 # (PyMuPDF returns "picture intentionally omitted" placeholders), yet still
 # reports has_text=1 and usually needs_ocr=1. Flag papers whose extracted text
@@ -27,6 +45,8 @@ def build_filter_query(
     has_errors: bool = False,
     stale_embeddings: bool = False,
     current_model_version: str | None = None,
+    exclude_quarantined: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[str, list]:
     """
     Build a WHERE clause for filtering the papers table.
@@ -75,9 +95,14 @@ def build_filter_query(
                 conditions.append("is_scanned = 0")
             elif p == "suspicious":
                 conditions.append(f"({suspicious_extraction_condition()})")
+            elif p == "broken":
+                conditions.append(quarantine_condition(max_retries))
 
     if has_errors:
         conditions.append("error_count > 0")
+
+    if exclude_quarantined:
+        conditions.append(not_quarantined_condition(max_retries))
 
     if stale_embeddings and current_model_version:
         conditions.append("has_embeddings = 1 AND embedding_model_version != ?")
@@ -98,12 +123,14 @@ def query_queue(
     stale_embeddings: bool = False,
     current_model_version: str | None = None,
     limit: int | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> list[dict]:
     """Query papers matching the given filters."""
     where, params = build_filter_query(
         needs=needs, has=has, is_prop=is_prop,
         has_errors=has_errors, stale_embeddings=stale_embeddings,
         current_model_version=current_model_version,
+        max_retries=max_retries,
     )
 
     sql = f"SELECT * FROM papers {where} ORDER BY filename"
@@ -122,12 +149,14 @@ def queue_count(
     has_errors: bool = False,
     stale_embeddings: bool = False,
     current_model_version: str | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> int:
     """Count papers matching the given filters."""
     where, params = build_filter_query(
         needs=needs, has=has, is_prop=is_prop,
         has_errors=has_errors, stale_embeddings=stale_embeddings,
         current_model_version=current_model_version,
+        max_retries=max_retries,
     )
     row = conn.execute(f"SELECT COUNT(*) FROM papers {where}", params).fetchone()
     return row[0]

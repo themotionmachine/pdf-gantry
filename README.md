@@ -165,6 +165,8 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 | `gantry status` | Coverage and database stats |
 | `gantry queue` | Documents matching a filter (`--needs`, `--has`, `--is`) |
 | `gantry errors` / `gantry retry` | Inspect and re-run failures |
+| `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |
+| `gantry retry --ids <ids>` | Clear a quarantined paper's error count and re-process it |
 | `gantry prune` | Drop entries for files no longer on disk |
 
 ### Bibliography and vault
@@ -192,6 +194,7 @@ Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables overri
 - **Search:** contentless FTS5 for keywords, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable.
 - **Chunks:** documents are split into addressable chunks with per-chunk embeddings, so retrieval can land on a passage instead of a paper.
 - **Scanned PDFs:** classified at ingest and routed to the OCR queue.
+- **Quarantine:** a paper that fails processing/embedding `processing.max_retries` times (default 3) is skipped by default selection so a permanently-broken PDF isn't re-attempted on every run. Find them with `gantry queue --is broken`; un-quarantine a fixed file with `gantry retry --ids <ids>`.
 
 ## Status
 
