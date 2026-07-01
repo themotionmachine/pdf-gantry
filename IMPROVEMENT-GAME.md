@@ -17,9 +17,9 @@
 ## Scoreboard  (rewritten in place each round)
 | Attractor | Cumulative | Last Δ |
 | --- | --- | --- |
-| 1 Composable retrieval | +2 | +2 |
-| 2 Corpus fidelity | +1 | +1 |
-- **Coverage:** 1/48 elite-map cells · **Tone:** 0 L / 1 D (debt −2) · **Ops:** 1 Sp / 0 Gr / 0 Pr · **Fouls:** 0
+| 1 Composable retrieval | +2 | +0 |
+| 2 Corpus fidelity | +4 | +3 |
+- **Coverage:** 2/48 elite-map cells · **Tone:** 0 L / 2 D (debt −3) · **Ops:** 1 Sp / 1 Gr / 0 Pr · **Fouls:** 0
 
 ## Elite map — best move per (perspective × operator)  (rewritten in place each round)
 | Perspective | Graft | Prune | Splice |
@@ -27,7 +27,7 @@
 | 1 Cartographer | – | – | – |
 | 2 Gardener | – | – | – |
 | 3 Provocateur | – | – | – |
-| 4 Adversary | – | – | – |
+| 4 Adversary | **r2b · Δ+3 · encrypted PDF no longer aborts batch ingest · r2b-adversary** | – | – |
 | 5 Minimalist | – | – | – |
 | 6 Naturalist | – | – | – |
 | 7 Diplomat | – | – | – |
@@ -49,5 +49,17 @@
 - **Score:** Composable retrieval **+2** (a real reliability gap in the ID-piping composition path is closed — an agent chaining commands can now detect a silent drop via body or exit code) · Corpus fidelity **+1** (motivated by real pruning/staleness on the actual ~2000-PDF corpus, not a hypothetical) → **trunk: ADVANCED** (merged `--ff-only`) · **elite-map:** new champion of (User-Advocate × Splice)
 - **Legacy hooks:** (1) same silent-drop pattern likely in `search --restrict-to-ids` / `semantic --restrict-to-ids`; (2) `ocr --ids` / `retry --ids` don't report unresolved target IDs either; (3) `missing_ids()` generalizes if a future `queue --ids-only`-style surface ships.
 
+## Round 2 — Adversary (lead) × Sentinel (Multiclass modifier) · Graft · Dark
+- **Roll:** R=2 P=4 OP=Graft TONE=Dark MEM=Amnesiac spine=2 ("What's the input the author never pictured — empty, enormous, malformed, hostile, concurrent?") band=Standard anchor=`IMPROVEMENT-GAME.md` · complication: Multiclass — Adversary lead, in the manner of card #16 Sentinel as modifier · reroll: none
+- **Anchor note:** the drawn anchor was the game's own Chronicle file (0 code references, born minutes earlier) — not a legitimate Adversary/Sentinel target. Both players correctly reached past it into `src/pdf_gantry/` per the "entry point, not a cage" rule and recorded why in their Focus statements.
+- **Provocation (GM, scaffolding only):** Adversary supplies the method (Graft — write the hostile-input test that locks behavior), Sentinel supplies the lens (aim at a trust boundary where *external/foreign data* crosses in — an API response, a file this system didn't produce). Dark register. Spine question above. Both attractors eligible.
+- **Best-of-2 played** (feature-forward profile: best-of-2 fires on Graft rounds) — two independent players, same frame, sub-draws tagged `:a`/`:b`:
+  - **Player A** (`r2-adversary`) — **Focus:** "...`metadata.py`/`openalex.py` pull real JSON off the wire and hand it to `parse_openalex_work`, which trusts `a.get('author', {}).get('display_name', '')`... OpenAlex legitimately returns `'author': null` for group/consortium authorships... one bad entry and the parser throws `AttributeError`, swallowed silently by the caller's bare `except Exception: return None` — a title, DOI, year, abstract we already paid a network round-trip for, gone, no error surfaced." Null-coalesced `a.get("author") or {}` in `openalex.py::parse_openalex_work`, 2 new tests (null-author entry, missing-author-key entry).
+  - **Player B** (`r2b-adversary`) — **Focus:** "`ingest_directory()` is the front door — every one of Ryan's ~2000 PDFs... passes through `classify_document()`... PyMuPDF happily *opens* a password-protected PDF without raising, and only throws `ValueError` later when the per-page loop touches `page.get_text()` — a call the author never wrapped... One password-protected PDF anywhere in a 2000-file iCloud folder... takes down the entire batch ingest, not just that file." Added `doc.needs_pass` guard + per-page try/except + try/finally close in `ingest.py::classify_document`, new `encrypted_pdf` fixture, 2 new tests (classify doesn't raise; ingest survives a locked file mixed into the batch).
+- **GM verification:** read `ingest_directory`/`_get_pdf_metadata` on the trunk before scoring — confirmed `classify_document()` was called with **no surrounding try/except** in the per-file loop, so Player B's claimed blast radius (one encrypted PDF aborts the *entire* directory scan) was real, not embellished.
+- **Score comparison:** A — Composable retrieval +0, Corpus fidelity **+2** (real bug, but already contained: a bare `except Exception` upstream meant the failure mode was "one paper's enrichment silently drops," not a crash). B — Composable retrieval +0, Corpus fidelity **+3** (unguarded: one bad file crashes the whole batch scan across the real ~2000-PDF corpus — bigger blast radius, genuine stride).
+- **Winner: Player B** (`r2b-adversary`, Δ+3 > Δ+2) → **trunk: ADVANCED** (merged `--ff-only`) · **elite-map:** new champion of (Adversary × Graft). Player A (`r2-adversary`) is **kept, not merged** — archived below as a real, gate-green, non-elite stepping stone.
+- **Legacy hooks:** (from B) `process.py`'s PyMuPDF4LLM extraction likely hits the same `needs_pass` wall on a file ingest now lets through as "digital"; encrypted PDFs are silently classified `digital` with zero signal they're actually unreadable — worth a `queue`-visible "blocked/encrypted" status; other bare `fitz.open()` call sites may share the shape. (from A, still open) `metadata.py::_normalize_semantic_scholar` has the identical bug shape one file over; `openalex.py`'s three `fetch_by_*` functions swallow *any* parse failure into silent "no match" — worth splitting `stats.no_match` from `stats.parse_errors`.
+
 ## Archive (fouls + non-elite stepping stones)
-(none yet)
+- **r2-adversary** (Player A, round 2) — held, not merged (best-of-2 runner-up, Δ+2 vs winner's Δ+3). Real fix (OpenAlex null-author crash, gate green, TDD'd), same (Adversary × Graft) cell as the winner so it doesn't get its own elite slot. Branch kept on disk for reference; not on the trunk.
