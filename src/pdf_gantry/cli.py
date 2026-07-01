@@ -952,6 +952,95 @@ def errors(ctx, json_output):
             click.echo(f"  {r['filename']}: {r['last_error']} (x{r['error_count']})")
 
 
+# --- gaps ---
+
+@cli.command()
+@click.option("--field", "field_name",
+              type=click.Choice(["title", "authors", "year", "abstract", "doi"]),
+              default=None,
+              help="Scope to one metadata field; without this, show the per-field summary")
+@click.option("--attempted-only", is_flag=True,
+              help="With --field, only papers where enrichment already ran and still left it "
+                   "empty (re-running the same provider won't fix these)")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="With --field, emit bare paper IDs, one per line "
+                   "(pipe into enrich --ids / info --ids)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def gaps(ctx, field_name, attempted_only, ids_only, json_output):
+    """Show metadata completeness gaps (title/authors/year/abstract/doi).
+
+    `metadata_enriched_at` being set doesn't mean a paper's metadata is
+    complete -- a provider miss on one field looks identical to full success
+    everywhere else in gantry. This reports per-field gaps and, scoped to
+    --field, splits "never enriched" from "enriched and still empty" so you
+    can tell a genuine provider gap from unfinished work.
+    """
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    from .metadata import GAP_FIELDS, field_completeness, gap_ids
+
+    if field_name is None:
+        result = field_completeness(conn)
+        conn.close()
+
+        if use_json:
+            click.echo(json.dumps(result, indent=2))
+        else:
+            click.echo(f"Metadata completeness across {format_count(result['total'])} papers")
+            click.echo()
+            for field in GAP_FIELDS:
+                stats = result["fields"][field]
+                click.echo(
+                    f"  {field:10s} complete={stats['complete']:5d}  "
+                    f"missing={stats['missing']:5d}  "
+                    f"(never_attempted={stats['never_attempted']}, "
+                    f"attempted_incomplete={stats['attempted_incomplete']})"
+                )
+        return
+
+    ids = gap_ids(conn, field_name, attempted_only=attempted_only)
+    conn.close()
+
+    if not ids:
+        if use_json:
+            click.echo(json.dumps({"field": field_name, "attempted_only": attempted_only,
+                                    "count": 0, "ids": []}))
+        elif not ids_only:
+            click.echo(f"No gaps for field '{field_name}'")
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    if ids_only:
+        for i in ids:
+            click.echo(i)
+        return
+
+    if use_json:
+        click.echo(json.dumps({
+            "field": field_name,
+            "attempted_only": attempted_only,
+            "count": len(ids),
+            "ids": ids,
+        }, indent=2))
+    else:
+        scope = " (attempted-but-still-empty only)" if attempted_only else ""
+        click.echo(f"{len(ids)} papers missing '{field_name}'{scope}")
+        click.echo()
+        click.echo(", ".join(str(i) for i in ids))
+
+
 # --- semantic ---
 
 @cli.command()
