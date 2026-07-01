@@ -17,9 +17,9 @@
 ## Scoreboard  (rewritten in place each round)
 | Attractor | Cumulative | Last Δ |
 | --- | --- | --- |
-| 1 Composable retrieval | +0 | – |
-| 2 Corpus fidelity | +0 | – |
-- **Coverage:** 0/48 elite-map cells · **Tone:** 0 L / 0 D (debt −1) · **Ops:** 0 Sp / 0 Gr / 0 Pr · **Fouls:** 0
+| 1 Composable retrieval | +2 | +2 |
+| 2 Corpus fidelity | +1 | +1 |
+- **Coverage:** 1/48 elite-map cells · **Tone:** 0 L / 1 D (debt −2) · **Ops:** 1 Sp / 0 Gr / 0 Pr · **Fouls:** 0
 
 ## Elite map — best move per (perspective × operator)  (rewritten in place each round)
 | Perspective | Graft | Prune | Splice |
@@ -37,9 +37,17 @@
 | 11 Engineer | – | – | – |
 | 12 Harness Engineer | – | – | – |
 | 13 Oracle | – | – | – |
-| 14 User-Advocate | – | – | – |
+| 14 User-Advocate | – | – | **r1 · Δ+2 · surfaced dropped IDs in `info --ids` (not_found + partial exit) · r1-user-advocate** |
 | 15 Migrator | – | – | – |
 | 16 Sentinel | – | – | – |
+
+## Round 1 — User-Advocate · Splice · Dark
+- **Roll:** R=1 P=14 OP=Splice TONE=Dark MEM=Amnesiac spine=3 ("What does this make the user understand that they shouldn't have to?") band=Tame anchor=src/pdf_gantry/utils.py · complication: none · reroll: none
+- **Provocation (GM, scaffolding only):** User-Advocate, Splice ("reroute the path — recombine existing capabilities into the flow the user's task actually wants"), Dark register (confront, don't delight), spine question above, anchor `src/pdf_gantry/utils.py` as entry point only, both attractors eligible.
+- **Focus (player's own words):** "`gantry info --ids` is the primitive CLAUDE.md brags about shipping... walking the path an agent actually walks — `search "X" --ids-only` piped into `info --ids ... --query Y` — exposes the seam: if any IDs no longer resolve, `info` silently returns fewer papers than requested and says nothing... I'm closing that loop: `info` now reports exactly which requested IDs it couldn't resolve (`not_found`) and downgrades its exit code to partial-failure (3) when some-but-not-all IDs resolve."
+- **Played:** Added `missing_ids()` to `utils.py` (order-preserving, dedupe-safe set-diff, TDD'd in `tests/test_utils.py`). Wired into `gantry info --ids`: JSON and plain output now carry `not_found`; partial resolution now exits `EXIT_PARTIAL` (3) instead of silent success. New `tests/test_info_not_found.py` covers all-found / partial / all-missing / duplicate-ID cases. · **PR:** local branch `r1-user-advocate` (not pushed — game trunk only, per Palette)
+- **Score:** Composable retrieval **+2** (a real reliability gap in the ID-piping composition path is closed — an agent chaining commands can now detect a silent drop via body or exit code) · Corpus fidelity **+1** (motivated by real pruning/staleness on the actual ~2000-PDF corpus, not a hypothetical) → **trunk: ADVANCED** (merged `--ff-only`) · **elite-map:** new champion of (User-Advocate × Splice)
+- **Legacy hooks:** (1) same silent-drop pattern likely in `search --restrict-to-ids` / `semantic --restrict-to-ids`; (2) `ocr --ids` / `retry --ids` don't report unresolved target IDs either; (3) `missing_ids()` generalizes if a future `queue --ids-only`-style surface ships.
 
 ## Archive (fouls + non-elite stepping stones)
 (none yet)
