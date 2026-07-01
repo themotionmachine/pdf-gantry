@@ -71,17 +71,25 @@ def classify_document(pdf_path: Path, scan_threshold: float = 0.05) -> str:
         return "mixed"
 
 
-def _get_pdf_metadata(pdf_path: Path) -> tuple[int | None, str]:
-    """Get page count and classification for a PDF."""
+def _get_pdf_metadata(pdf_path: Path) -> tuple[int | None, str, bool]:
+    """Get page count, classification, and encrypted flag for a PDF.
+
+    needs_pass is read off the same fitz.open() used for page_count — it's
+    reliable to check before any page content is touched (unlike
+    classify_document's own open, which is a separate handle), so this is a
+    free byproduct rather than an extra file open.
+    """
     try:
         doc = fitz.open(str(pdf_path))
         page_count = doc.page_count
+        is_encrypted = bool(doc.needs_pass)
         doc.close()
     except Exception:
         page_count = None
+        is_encrypted = False
 
     classification = classify_document(pdf_path)
-    return page_count, classification
+    return page_count, classification, is_encrypted
 
 
 def _fast_path_match(conn: sqlite3.Connection, rel_path: str, size: int, mtime: str) -> bool:
@@ -163,7 +171,7 @@ def ingest_directory(
                 # Content changed - reset processing flags
                 stats.changed += 1
                 if not dry_run:
-                    page_count, classification = _get_pdf_metadata(pdf_path)
+                    page_count, classification, is_encrypted = _get_pdf_metadata(pdf_path)
                     is_scanned = (
                         1 if classification == "scanned"
                         else (0 if classification == "digital" else None)
@@ -173,17 +181,18 @@ def ingest_directory(
                         """UPDATE papers SET
                             file_hash = ?, file_size = ?, file_modified = ?,
                             page_count = ?, is_scanned = ?, needs_ocr = ?,
+                            is_encrypted = ?,
                             has_text = 0, has_markdown = 0, has_embeddings = 0,
                             updated_at = ?
                         WHERE id = ?""",
                         (fhash, size, mtime, page_count, is_scanned, needs_ocr,
-                         now_iso(), row["id"]),
+                         int(is_encrypted), now_iso(), row["id"]),
                     )
         else:
             # New file
             stats.new += 1
             if not dry_run:
-                page_count, classification = _get_pdf_metadata(pdf_path)
+                page_count, classification, is_encrypted = _get_pdf_metadata(pdf_path)
                 is_scanned = (
                     1 if classification == "scanned"
                     else (0 if classification == "digital" else None)
@@ -193,10 +202,11 @@ def ingest_directory(
                 conn.execute(
                     """INSERT INTO papers (
                         path, filename, file_hash, file_size, file_modified,
-                        page_count, is_scanned, needs_ocr, indexed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        page_count, is_scanned, needs_ocr, is_encrypted,
+                        indexed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (rel_path, pdf_path.name, fhash, size, mtime,
-                     page_count, is_scanned, needs_ocr, now, now),
+                     page_count, is_scanned, needs_ocr, int(is_encrypted), now, now),
                 )
 
         if progress_callback:

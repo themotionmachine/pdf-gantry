@@ -53,6 +53,7 @@ def filter_options(f):
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice([
                       "scanned", "digital", "suspicious", "broken", "metadata-suspect",
+                      "encrypted",
                   ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
@@ -424,6 +425,12 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
             # Skip permanently-broken papers on the default sweep; an explicit
             # filter or --force opts back in (so they remain re-tryable).
             exclude_quarantined=default_select,
+            # Same reasoning for encrypted PDFs: classify_document() reports
+            # them as "digital" (Round 2), so is_prop=["digital"] alone would
+            # still select them — they'd just fail every extraction attempt
+            # and burn through the quarantine cap instead of never being
+            # tried at all.
+            exclude_encrypted=default_select,
             max_retries=cfg.processing.max_retries,
         )
 

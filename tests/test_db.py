@@ -7,7 +7,7 @@ import sqlite_vec
 
 from pdf_gantry.db import SCHEMA_VERSION, get_connection, get_schema_version
 
-assert SCHEMA_VERSION == 5, "Update tests if schema version changes"
+assert SCHEMA_VERSION == 6, "Update tests if schema version changes"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +266,55 @@ def test_metadata_suspect_index_exists(tmp_db):
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_papers_metadata_suspect'"
     ).fetchone()
     assert row is not None
+
+
+def test_is_encrypted_column_exists(tmp_db):
+    """papers table has an is_encrypted column (schema v6).
+
+    classify_document() already detects a password-protected PDF (needs_pass)
+    at ingest time, but Round 2's fix folded that fact into the ordinary
+    'digital' classification with no separate signal — a locked PDF and a
+    normal one look identical everywhere downstream. is_encrypted makes the
+    fact queryable (`queue --is encrypted`) instead of silently absorbed.
+    """
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    tmp_db.commit()
+    row = tmp_db.execute(
+        "SELECT is_encrypted FROM papers WHERE path = 'test.pdf'"
+    ).fetchone()
+    assert row["is_encrypted"] == 0
+
+
+def test_schema_convergence_is_encrypted(tmp_path):
+    """Init path and migration path from v1 agree on the is_encrypted column."""
+    fresh_db = tmp_path / "fresh.db"
+    conn_fresh = get_connection(str(fresh_db))
+    fresh_col = next(
+        (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_fresh.execute("PRAGMA table_info(papers)")
+        if row["name"] == "is_encrypted"
+    )
+    conn_fresh.close()
+
+    v1_db = tmp_path / "v1.db"
+    _make_v1_db(v1_db)
+    conn_migrated = get_connection(str(v1_db))
+    migrated_col = next(
+        (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_migrated.execute("PRAGMA table_info(papers)")
+        if row["name"] == "is_encrypted"
+    )
+    conn_migrated.close()
+
+    assert fresh_col == migrated_col, (
+        "Init path and migration path produced different is_encrypted columns.\n"
+        f"Fresh:    {fresh_col}\n"
+        f"Migrated: {migrated_col}"
+    )
 
 
 def test_schema_convergence_metadata_suspect(tmp_path):

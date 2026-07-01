@@ -107,10 +107,13 @@ def run_pipeline(
             stats["processed"] = proc_stats.succeeded
             stats["errors"] += proc_stats.failed
     else:
-        # Get unprocessed papers (skip quarantined — see queue.quarantine_condition)
+        # Get unprocessed papers (skip quarantined — see queue.quarantine_condition
+        # — and encrypted papers, which classify_document() reports as "digital"
+        # but can never actually be extracted; see process.py's identical filter)
         rows = conn.execute(
             "SELECT id FROM papers WHERE has_text = 0 "
             "AND (is_scanned = 0 OR is_scanned IS NULL) "
+            "AND is_encrypted = 0 "
             f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
         ids_to_process = [r["id"] for r in rows]

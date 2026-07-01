@@ -188,6 +188,73 @@ def test_filter_is_metadata_suspect_count(verify_flagged_db):
     assert queue_count(verify_flagged_db, is_prop=["metadata-suspect"]) == 1
 
 
+@pytest.fixture
+def encrypted_flagged_db(tmp_path):
+    """DB with one paper flagged is_encrypted by a prior ingest run."""
+    conn = get_connection(str(tmp_path / "encrypted.db"))
+    conn.execute(
+        "INSERT INTO papers (id, path, filename, file_hash, file_size, file_modified, "
+        "indexed_at, updated_at, is_encrypted, has_text) "
+        "VALUES (1, 'locked.pdf', 'locked.pdf', 'h1', 1, '2026-01-01', "
+        "'2026-01-01', '2026-01-01', 1, 0)"
+    )
+    conn.execute(
+        "INSERT INTO papers (id, path, filename, file_hash, file_size, file_modified, "
+        "indexed_at, updated_at, is_encrypted, has_text) "
+        "VALUES (2, 'p2.pdf', 'p2.pdf', 'h2', 1, '2026-01-01', "
+        "'2026-01-01', '2026-01-01', 0, 0)"
+    )
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+def test_filter_is_encrypted(encrypted_flagged_db):
+    """--is encrypted isolates papers ingest flagged is_encrypted."""
+    rows = query_queue(encrypted_flagged_db, is_prop=["encrypted"])
+    assert [r["id"] for r in rows] == [1]
+
+
+def test_filter_is_encrypted_count(encrypted_flagged_db):
+    assert queue_count(encrypted_flagged_db, is_prop=["encrypted"]) == 1
+
+
+def test_queue_is_encrypted_cli(tmp_path, monkeypatch):
+    """`gantry queue --is encrypted` is an accepted --is choice at the CLI layer
+    (the Click Choice() list is a separate seam from build_filter_query itself).
+    """
+    conn = get_connection(str(tmp_path / "index.db"))
+    conn.execute(
+        "INSERT INTO papers (id, path, filename, file_hash, file_size, file_modified, "
+        "indexed_at, updated_at, is_encrypted) "
+        "VALUES (1, 'locked.pdf', 'locked.pdf', 'h1', 1, '2026-01-01', "
+        "'2026-01-01', '2026-01-01', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["queue", "--is", "encrypted", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["count"] == 1
+
+
+def test_default_process_selection_excludes_encrypted():
+    """The default (no explicit filters) batch-selection WHERE clause skips
+    encrypted papers, not just non-digital ones — otherwise a locked PDF sits
+    in the same 'digital' bucket as anything readable and gets retried on
+    every default `gantry process` sweep until it quarantines by attrition.
+    """
+    where, _ = build_filter_query(
+        needs=["text"], is_prop=["digital"], exclude_encrypted=True,
+    )
+    assert "is_encrypted = 0" in where
+
+
 def test_queue_is_metadata_suspect_cli(tmp_path, monkeypatch):
     """`gantry queue --is metadata-suspect` is an accepted --is choice at the CLI layer.
 

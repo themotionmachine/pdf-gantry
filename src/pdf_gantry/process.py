@@ -226,6 +226,7 @@ def process_documents(
         rows = conn.execute(
             "SELECT id, path FROM papers WHERE has_text = 0 "
             "AND (is_scanned = 0 OR is_scanned IS NULL) "
+            "AND is_encrypted = 0 "
             f"AND {not_quarantined_condition(max_retries)}"
         ).fetchall()
     else:

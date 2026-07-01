@@ -126,6 +126,34 @@ def test_classify_encrypted_pdf_does_not_raise(encrypted_pdf):
     assert result in ("digital", "scanned", "mixed")
 
 
+def test_ingest_sets_is_encrypted_flag(tmp_path, papers_dir, encrypted_pdf):
+    """ingest_directory records is_encrypted=1 for a password-protected PDF,
+    and leaves it 0 for ordinary papers — the fact classify_document()
+    detects (needs_pass) but folds into "digital" must still surface
+    somewhere queryable.
+    """
+    import shutil
+
+    shutil.copy(encrypted_pdf, papers_dir / "locked.pdf")
+
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+    ingest_directory(conn, papers_dir)
+
+    locked_row = conn.execute(
+        "SELECT is_encrypted FROM papers WHERE filename = 'locked.pdf'"
+    ).fetchone()
+    assert locked_row["is_encrypted"] == 1
+
+    normal_rows = conn.execute(
+        "SELECT is_encrypted FROM papers WHERE filename != 'locked.pdf'"
+    ).fetchall()
+    assert len(normal_rows) == 2
+    for row in normal_rows:
+        assert row["is_encrypted"] == 0
+    conn.close()
+
+
 def test_ingest_survives_encrypted_pdf(tmp_path, papers_dir, encrypted_pdf):
     """One password-protected PDF anywhere in the papers dir must not abort
     ingestion of the rest of the corpus.

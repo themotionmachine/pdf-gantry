@@ -6,7 +6,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # ---------------------------------------------------------------------------
 # Canonical DDL for tables that are created both by init_schema (fresh DB) and
@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS papers (
     has_chunk_embeddings INTEGER NOT NULL DEFAULT 0,
     needs_ocr INTEGER NOT NULL DEFAULT 0,
     is_scanned INTEGER,
+
+    -- Set at ingest time when fitz reports needs_pass on the file (a locked
+    -- DRM'd export or accidentally-encrypted download). classify_document()
+    -- still reports these as "digital" (Round 2) so is_scanned/needs_ocr
+    -- selection is unaffected, but is_encrypted makes the "will never
+    -- extract" fact queryable (`queue --is encrypted`) and lets the default
+    -- process/pipeline sweeps skip them instead of burning quarantine
+    -- retries rediscovering it.
+    is_encrypted INTEGER NOT NULL DEFAULT 0,
 
     -- Processing metadata
     text_method TEXT,
@@ -281,5 +290,16 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (5, now_iso()),
+        )
+        conn.commit()
+        version = 5
+
+    if version < 6:
+        conn.execute(
+            "ALTER TABLE papers ADD COLUMN is_encrypted INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (6, now_iso()),
         )
         conn.commit()
