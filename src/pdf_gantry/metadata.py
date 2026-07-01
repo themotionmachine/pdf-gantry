@@ -1,5 +1,6 @@
 """Semantic Scholar API integration for metadata enrichment."""
 
+import difflib
 import json
 import re
 import sqlite3
@@ -9,6 +10,17 @@ from dataclasses import dataclass
 from .utils import now_iso
 
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
+
+_TITLE_NORMALIZE_RE = re.compile(r'[^a-z0-9\s]')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+# Below this similarity, a title-search-sourced metadata match is flagged
+# `metadata_suspect` — the stored title doesn't resemble what's actually on
+# the PDF's first page closely enough to trust the DOI/authors/year that
+# rode in with it. Calibrated loosely (SequenceMatcher ratio, not a strict
+# edit distance): distinguishing titles score well above this; an unrelated
+# title lands well below it.
+SUSPECT_THRESHOLD = 0.55
 
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper"
 FIELDS = "title,authors,year,abstract,citationCount,influentialCitationCount,externalIds"
@@ -277,3 +289,114 @@ def enrich_documents(
     conn.commit()
     stats.elapsed_seconds = round(time.time() - start, 1)
     return stats
+
+
+# ---------------------------------------------------------------------------
+# gantry verify — auditing title-search-sourced metadata matches
+#
+# enrich_documents() above has three fallback tiers: DOI (exact), filename
+# (author-surname + year heuristic), and title search (fuzzy text query,
+# top-result-wins). The first two are effectively unambiguous. Title search
+# is not: querying OpenAlex or Semantic Scholar with a generic or truncated
+# title guess (see _extract_title_from_text) can return a plausible-looking
+# but *wrong* paper, and nothing before this module ever checked. The wrong
+# title/authors/year/DOI then gets written back with full confidence and
+# `metadata_enriched_at` set, so the paper never gets re-attempted either.
+#
+# verify_documents() re-derives the title actually printed on the PDF and
+# compares it against what got stored, for every paper whose metadata came
+# from a title search. Low-similarity matches are flagged `metadata_suspect`
+# in the papers table (queryable via `queue --is metadata-suspect`) so the
+# mismatch becomes a fact an agent can find and act on, not a silent one.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VerifyResult:
+    """The verdict for one title-search-sourced metadata match."""
+    paper_id: int
+    filename: str
+    stored_title: str | None
+    extracted_title_guess: str | None
+    similarity: float
+    suspect: bool
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for comparison."""
+    t = title.lower()
+    t = _TITLE_NORMALIZE_RE.sub(" ", t)
+    t = _WHITESPACE_RE.sub(" ", t).strip()
+    return t
+
+
+def title_similarity(a: str | None, b: str | None) -> float:
+    """Similarity ratio in [0.0, 1.0] between two titles, format-insensitive.
+
+    Returns 0.0 if either title is missing or empty — there's nothing to
+    compare, and an absent title should never read as a confident match.
+    """
+    if not a or not b:
+        return 0.0
+    na, nb = _normalize_title(a), _normalize_title(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def verify_documents(
+    conn: sqlite3.Connection,
+    paper_ids: list[int] | None = None,
+    threshold: float = SUSPECT_THRESHOLD,
+    limit: int | None = None,
+) -> list[VerifyResult]:
+    """Audit title-search-sourced metadata against each PDF's own extracted title.
+
+    Scoped to papers whose ``metadata_source`` ends in ``_title`` (the only
+    fallback tier that involved an unverified fuzzy match) — DOI and
+    filename-sourced matches are exact by construction and are skipped.
+
+    Persists the verdict to ``metadata_suspect`` / ``metadata_verify_score`` /
+    ``metadata_verified_at`` on each checked paper, and returns results
+    ordered by ascending similarity so the worst mismatches surface first.
+    """
+    query = """SELECT p.id, p.filename, p.title, pt.raw_text
+        FROM papers p
+        LEFT JOIN paper_text pt ON pt.paper_id = p.id
+        WHERE p.metadata_source LIKE '%\\_title' ESCAPE '\\'"""
+    params: list = []
+
+    if paper_ids is not None:
+        placeholders = ",".join("?" * len(paper_ids))
+        query += f" AND p.id IN ({placeholders})"
+        params.extend(paper_ids)
+
+    rows = conn.execute(query, params).fetchall()
+    if limit:
+        rows = rows[:limit]
+
+    results = []
+    now = now_iso()
+    for row in rows:
+        raw_text = row["raw_text"] or ""
+        extracted_guess = _extract_title_from_text(raw_text) if raw_text else None
+        similarity = title_similarity(row["title"], extracted_guess)
+        suspect = similarity < threshold
+
+        results.append(VerifyResult(
+            paper_id=row["id"],
+            filename=row["filename"],
+            stored_title=row["title"],
+            extracted_title_guess=extracted_guess,
+            similarity=round(similarity, 4),
+            suspect=suspect,
+        ))
+
+        conn.execute(
+            "UPDATE papers SET metadata_suspect = ?, metadata_verify_score = ?, "
+            "metadata_verified_at = ? WHERE id = ?",
+            (int(suspect), similarity, now, row["id"]),
+        )
+
+    conn.commit()
+    results.sort(key=lambda r: r.similarity)
+    return results

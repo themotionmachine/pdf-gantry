@@ -6,7 +6,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # ---------------------------------------------------------------------------
 # Canonical DDL for tables that are created both by init_schema (fresh DB) and
@@ -74,6 +74,16 @@ CREATE TABLE IF NOT EXISTS papers (
     metadata_source TEXT,
     metadata_enriched_at TEXT,
 
+    -- Metadata verification: title-search-sourced metadata is accepted from
+    -- the provider with no confidence check at enrich time (top result wins
+    -- unconditionally). metadata_suspect flags matches whose stored title
+    -- doesn't resemble the title actually printed on the PDF, so a silently
+    -- wrong match becomes a loud, queryable, pipeable fact instead of an
+    -- invisible one. Set by verify_documents() in metadata.py.
+    metadata_suspect INTEGER NOT NULL DEFAULT 0,
+    metadata_verify_score REAL,
+    metadata_verified_at TEXT,
+
     -- Vault integration
     vault_note_path TEXT,
     vault_checked_at TEXT,
@@ -99,6 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_papers_has_embeddings ON papers(has_embeddings);
 CREATE INDEX IF NOT EXISTS idx_papers_needs_ocr ON papers(needs_ocr);
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_citekey ON papers(citekey);
+CREATE INDEX IF NOT EXISTS idx_papers_metadata_suspect ON papers(metadata_suspect);
 
 -- Full-text search virtual table
 CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
@@ -253,5 +264,22 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (4, now_iso()),
+        )
+        conn.commit()
+        version = 4
+
+    if version < 5:
+        conn.execute(
+            "ALTER TABLE papers ADD COLUMN metadata_suspect INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE papers ADD COLUMN metadata_verify_score REAL")
+        conn.execute("ALTER TABLE papers ADD COLUMN metadata_verified_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_papers_metadata_suspect "
+            "ON papers(metadata_suspect)"
+        )
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (5, now_iso()),
         )
         conn.commit()

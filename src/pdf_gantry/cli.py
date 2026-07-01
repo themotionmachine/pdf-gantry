@@ -51,7 +51,9 @@ def filter_options(f):
                   ]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
-                  type=click.Choice(["scanned", "digital", "suspicious", "broken"]),
+                  type=click.Choice([
+                      "scanned", "digital", "suspicious", "broken", "metadata-suspect",
+                  ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
                   help="Documents with outdated embedding model version")
@@ -1336,6 +1338,112 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         click.echo(f"  No match found: {format_count(stats.no_match)}")
         if stats.api_errors:
             click.echo(f"  API errors: {format_count(stats.api_errors)}")
+
+
+# --- verify ---
+
+@cli.command()
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to verify (default: all "
+                   "unverified title-sourced matches)")
+@click.option("--threshold", type=float, default=None,
+              help="Similarity below which a match is flagged suspect "
+                   "(default: metadata.SUSPECT_THRESHOLD)")
+@click.option("--limit", type=int, default=None, help="Max papers to check")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare suspect paper IDs, one per line (for piping)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def verify(ctx, ids, threshold, limit, ids_only, json_output):
+    """Audit title-search-sourced metadata against each PDF's own title.
+
+    enrich's title-search fallback accepts the top API result with no
+    confidence check. This re-derives the title actually printed on each
+    PDF and flags matches (metadata_suspect) whose stored title doesn't
+    resemble it — findable afterward via `queue --is metadata-suspect`.
+    """
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    try:
+        paper_ids = parse_ids(ids) if ids is not None else None
+    except ValueError:
+        msg = "Invalid --ids: must be comma-separated integers"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .metadata import SUSPECT_THRESHOLD, verify_documents
+
+    conn = get_connection(cfg.db_path)
+    kwargs = {"paper_ids": paper_ids, "limit": limit}
+    if threshold is not None:
+        kwargs["threshold"] = threshold
+    results = verify_documents(conn, **kwargs)
+    conn.close()
+
+    if not results:
+        if use_json:
+            click.echo(json.dumps({
+                "total": 0, "suspect_count": 0, "results": [],
+            }))
+        elif ids_only:
+            pass
+        else:
+            click.echo("Nothing to verify (no title-sourced metadata matches found)")
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    suspects = [r for r in results if r.suspect]
+
+    if ids_only:
+        for r in suspects:
+            click.echo(r.paper_id)
+        if suspects:
+            ctx.exit(EXIT_PARTIAL)
+        return
+
+    if use_json:
+        click.echo(json.dumps({
+            "total": len(results),
+            "suspect_count": len(suspects),
+            "threshold": threshold if threshold is not None else SUSPECT_THRESHOLD,
+            "results": [
+                {
+                    "paper_id": r.paper_id,
+                    "filename": r.filename,
+                    "stored_title": r.stored_title,
+                    "extracted_title_guess": r.extracted_title_guess,
+                    "similarity": r.similarity,
+                    "suspect": r.suspect,
+                }
+                for r in results
+            ],
+        }, indent=2))
+    else:
+        click.echo(
+            f"Checked {format_count(len(results))} title-sourced matches: "
+            f"{format_count(len(suspects))} suspect"
+        )
+        for r in suspects:
+            click.echo(f"  [{r.paper_id}] {r.filename} (similarity={r.similarity:.2f})")
+            click.echo(f"    stored:    {r.stored_title!r}")
+            click.echo(f"    extracted: {r.extracted_title_guess!r}")
+
+    if suspects:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- retry ---

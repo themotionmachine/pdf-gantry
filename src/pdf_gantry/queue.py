@@ -97,6 +97,8 @@ def build_filter_query(
                 conditions.append(f"({suspicious_extraction_condition()})")
             elif p == "broken":
                 conditions.append(quarantine_condition(max_retries))
+            elif p == "metadata-suspect":
+                conditions.append("metadata_suspect = 1")
 
     if has_errors:
         conditions.append("error_count > 0")
