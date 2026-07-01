@@ -36,6 +36,32 @@ def require_papers_dir(ctx, cfg, use_json):
         ctx.exit(EXIT_ERROR)
 
 
+def parse_ids_option(ctx, value, use_json, flag_name="--ids"):
+    """Parse a comma-separated --ids/--restrict-to-ids value, or exit uniformly.
+
+    Every command that accepts an --ids-style option needs identical handling
+    when the value fails to parse: same error message shape, same JSON/text
+    branching, same exit code. Before this helper, six call sites (ocr,
+    search, semantic, verify, retry, info) each hand-rolled an independent
+    copy of this try/except block -- one more place for the message or exit
+    code to silently drift the next time someone touches it.
+
+    Returns ``None`` if ``value`` is ``None`` (the option was omitted).
+    """
+    if value is None:
+        return None
+    try:
+        return parse_ids(value)
+    except ValueError:
+        msg = f"Invalid {flag_name}: must be comma-separated integers"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return None  # pragma: no cover - ctx.exit() raises SystemExit
+
+
 def filter_options(f):
     """Shared Click options for document filtering."""
     @click.option("--needs", multiple=True,
@@ -529,18 +555,22 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
 
     conn = get_connection(cfg.db_path)
 
+    not_found: list[int] = []
     if ids is not None:
         # Surgical mode: OCR exactly these papers, regardless of needs_ocr state.
-        try:
-            paper_ids = parse_ids(ids)
-        except ValueError:
-            msg = "Invalid --ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+        paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+        # Requested IDs that don't resolve to a row were previously dropped
+        # silently -- process_ocr_documents just selected fewer rows than
+        # asked for. Surfaced explicitly, same convention as `info --ids`.
+        if paper_ids:
+            placeholders = ",".join("?" * len(paper_ids))
+            found_ids = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM papers WHERE id IN ({placeholders})", paper_ids
+                ).fetchall()
+            }
+            not_found = missing_ids(paper_ids, found_ids)
     else:
         from .queue import build_filter_query
 
@@ -560,9 +590,19 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
     if dry_run:
         count = len(paper_ids) if limit is None else min(len(paper_ids), limit)
         if use_json:
-            click.echo(json.dumps({"would_process": count, "method": "surya"}))
+            payload = {"would_process": count, "method": "surya"}
+            if ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(f"Would OCR {format_count(count)} documents with Surya")
+            if not_found:
+                ids_str = ", ".join(str(i) for i in not_found)
+                click.echo(f"  Not in index: {ids_str}")
+        if not_found and len(not_found) == len(set(paper_ids)):
+            ctx.exit(EXIT_NO_RESULTS)
+        elif not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if not paper_ids:
@@ -607,13 +647,16 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({
+        payload = {
             "total": stats.total,
             "succeeded": stats.succeeded,
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
             "method": "surya",
-        }, indent=2))
+        }
+        if ids is not None:
+            payload["not_found"] = not_found
+        click.echo(json.dumps(payload, indent=2))
     else:
         click.echo(
             f"OCR'd {format_count(stats.total)} documents "
@@ -625,11 +668,18 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
                 f"  Failed: {format_count(stats.failed)} "
                 f"(use 'gantry queue --has errors' to see failures)"
             )
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"  Not in index: {ids_str}")
 
     if stats.failed > 0 and stats.succeeded > 0:
         ctx.exit(EXIT_PARTIAL)
     elif stats.failed > 0 and stats.succeeded == 0:
         ctx.exit(EXIT_ERROR)
+    elif not_found and len(not_found) == len(set(paper_ids)):
+        ctx.exit(EXIT_NO_RESULTS)
+    elif not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- search ---
@@ -656,18 +706,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     # --ids-only is a pure pipe format: it wins over --json.
     use_json = (json_output or ctx.obj["json"]) and not ids_only
 
-    restrict_ids = None
-    if restrict_to_ids is not None:
-        try:
-            restrict_ids = parse_ids(restrict_to_ids)
-        except ValueError:
-            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+    restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -980,18 +1019,7 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
     cfg = ctx.obj["config"]
     use_json = (json_output or ctx.obj["json"]) and not ids_only
 
-    restrict_ids = None
-    if restrict_to_ids is not None:
-        try:
-            restrict_ids = parse_ids(restrict_to_ids)
-        except ValueError:
-            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+    restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -1381,16 +1409,7 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
         ctx.exit(EXIT_ERROR)
         return
 
-    try:
-        paper_ids = parse_ids(ids) if ids is not None else None
-    except ValueError:
-        msg = "Invalid --ids: must be comma-separated integers"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
-        return
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
 
     from .metadata import SUSPECT_THRESHOLD, verify_documents
 
@@ -1490,19 +1509,24 @@ def retry(ctx, max_attempts, ids, json_output):
     conn = get_connection(cfg.db_path)
     from .process import process_documents, reset_errors
 
+    not_found: list[int] = []
     if ids is not None:
         # Surgical un-quarantine: reset exactly these papers, ignore the cap.
-        try:
-            paper_ids = parse_ids(ids)
-        except ValueError:
-            msg = "Invalid --ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            conn.close()
-            ctx.exit(EXIT_ERROR)
-            return
+        paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+        # Requested IDs that don't resolve to a row were previously dropped
+        # silently -- reset_errors/process_documents just acted on fewer
+        # papers than asked for. Surfaced explicitly, same convention as
+        # `info --ids` and `ocr --ids`.
+        if paper_ids:
+            placeholders = ",".join("?" * len(paper_ids))
+            found_ids = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM papers WHERE id IN ({placeholders})", paper_ids
+                ).fetchall()
+            }
+            not_found = missing_ids(paper_ids, found_ids)
+
         reset_errors(conn, paper_ids)
     else:
         rows = conn.execute(
@@ -1552,16 +1576,27 @@ def retry(ctx, max_attempts, ids, json_output):
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({
+        payload = {
             "total": stats.total,
             "succeeded": stats.succeeded,
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
-        }, indent=2))
+        }
+        if ids is not None:
+            payload["not_found"] = not_found
+        click.echo(json.dumps(payload, indent=2))
     else:
         click.echo(f"Retried {format_count(stats.total)} documents")
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         click.echo(f"  Still failing: {format_count(stats.failed)}")
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"  Not in index: {ids_str}")
+
+    if not_found and len(not_found) == len(set(paper_ids)):
+        ctx.exit(EXIT_NO_RESULTS)
+    elif not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- pipeline ---
@@ -1768,16 +1803,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         ctx.exit(EXIT_ERROR)
         return
 
-    try:
-        paper_ids = parse_ids(ids)
-    except ValueError:
-        msg = "Invalid --ids: must be comma-separated integers"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
-        return
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
 
     conn = get_connection(cfg.db_path)
 
