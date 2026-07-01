@@ -63,6 +63,40 @@ def test_parse_openalex_work_falls_back_to_display_name():
     assert meta["authors"] == []
 
 
+def test_parse_openalex_work_handles_null_author_entry():
+    """OpenAlex sometimes returns `authorships` entries with `"author": null`
+    (group/consortium authorships, deleted/merged author records). The API
+    contract doesn't forbid this, so a real response can carry it. One bad
+    entry should not nuke a title/DOI/abstract we already paid a network
+    round-trip for — it should just be dropped from the author list."""
+    work = {
+        "id": "https://openalex.org/W999",
+        "title": "Group Authorship Study",
+        "display_name": "Group Authorship Study",
+        "publication_year": 2023,
+        "doi": "https://doi.org/10.1234/group.2023",
+        "authorships": [
+            {"author": {"display_name": "Real Person"}},
+            {"author": None},
+        ],
+        "abstract_inverted_index": {"A": [0], "study": [1]},
+    }
+    meta = openalex.parse_openalex_work(work)
+    assert meta is not None
+    assert meta["title"] == "Group Authorship Study"
+    assert meta["authors"] == ["Real Person"]
+    assert meta["doi"] == "10.1234/group.2023"
+    assert meta["abstract"] == "A study"
+
+
+def test_parse_openalex_work_missing_author_key_entirely():
+    """Same trust boundary, adjacent shape: an authorship dict that omits the
+    "author" key altogether rather than nulling it. Must not crash either."""
+    work = {"display_name": "No Author Key", "authorships": [{}]}
+    meta = openalex.parse_openalex_work(work)
+    assert meta["authors"] == []
+
+
 # --- parse_filename ---
 
 
