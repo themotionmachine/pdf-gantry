@@ -70,3 +70,49 @@ def test_queue_is_suspicious_cli(tmp_path, monkeypatch):
     data = json.loads(result.output)
     assert data["count"] == 1
     assert data["documents"][0]["id"] == 1
+
+
+def test_status_json_includes_chunk_embeddings(tmp_path, monkeypatch):
+    """status --json must expose with_chunk_embeddings and pct_chunk_embeddings.
+
+    The text output has always shown 'With chunk embeddings: N (X%)', but the
+    JSON output silently omitted it.  An agent reading status --json to plan its
+    next operation cannot tell whether the cascade chunk search path is available
+    without this field — it must make a second query or guess.  That is joyless
+    friction.  This test pins the contract: the machine-facing API must be as
+    complete as the human-facing view.
+    """
+    db_path = tmp_path / "index.db"
+    conn = get_connection(str(db_path))
+    conn.execute(
+        """INSERT INTO papers
+            (id, path, filename, file_hash, file_size, file_modified,
+             page_count, has_text, has_chunk_embeddings, needs_ocr, indexed_at, updated_at)
+           VALUES (1, 'p1.pdf', 'p1.pdf', 'h1', 1, '2026-01-01',
+                   5, 1, 1, 0, '2026-01-01', '2026-01-01')"""
+    )
+    conn.execute(
+        "INSERT INTO paper_text (paper_id, raw_text, markdown, text_length, markdown_length) "
+        "VALUES (1, 'some text', '', 9, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["status", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+
+    assert "with_chunk_embeddings" in data, (
+        "status --json omits 'with_chunk_embeddings' — agents cannot determine "
+        "whether cascade search is available without a second query"
+    )
+    assert data["with_chunk_embeddings"] == 1
+
+    assert "pct_chunk_embeddings" in data, (
+        "status --json omits 'pct_chunk_embeddings' — breaks parity with "
+        "pct_text / pct_markdown / pct_embeddings already present in the output"
+    )
+    assert data["pct_chunk_embeddings"] == 100.0
