@@ -1,3 +1,4 @@
 src/pdf_gantry/utils.py
 IMPROVEMENT-GAME.md
 src/pdf_gantry/metadata.py
+src/pdf_gantry/cli.py
