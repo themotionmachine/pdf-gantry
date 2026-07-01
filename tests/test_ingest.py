@@ -116,6 +116,38 @@ def test_ingest_sets_scan_flag(populated_db):
         assert row["is_scanned"] is not None  # Should be classified
 
 
+def test_classify_encrypted_pdf_does_not_raise(encrypted_pdf):
+    """A password-protected PDF opens fine in fitz but can't be paged through
+    without authenticating. classify_document must not let that ValueError
+    escape — it should fall back the same way it does for any other PDF it
+    can't classify, not crash the caller.
+    """
+    result = classify_document(encrypted_pdf)
+    assert result in ("digital", "scanned", "mixed")
+
+
+def test_ingest_survives_encrypted_pdf(tmp_path, papers_dir, encrypted_pdf):
+    """One password-protected PDF anywhere in the papers dir must not abort
+    ingestion of the rest of the corpus.
+    """
+    import shutil
+
+    shutil.copy(encrypted_pdf, papers_dir / "locked.pdf")
+
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+
+    stats = ingest_directory(conn, papers_dir)
+
+    # The two normal PDFs from papers_dir plus the locked one all get
+    # registered — ingestion doesn't stop partway through the directory.
+    assert stats.total_pdfs == 3
+    assert stats.new == 3
+    row = conn.execute("SELECT COUNT(*) FROM papers").fetchone()
+    assert row[0] == 3
+    conn.close()
+
+
 def test_ingest_skips_edeadlk(tmp_path, papers_dir, monkeypatch):
     """iCloud dataless files (EDEADLK) are skipped, not fatal."""
     db_path = tmp_path / "test.db"

@@ -24,24 +24,40 @@ def classify_document(pdf_path: Path, scan_threshold: float = 0.05) -> str:
     except Exception:
         return "digital"  # default if we can't open
 
-    if doc.page_count == 0:
-        doc.close()
-        return "digital"
+    try:
+        if doc.page_count == 0:
+            return "digital"
 
-    ratios = []
-    for page in doc:
-        page_area = page.rect.width * page.rect.height
-        if page_area == 0:
-            ratios.append(0.0)
-            continue
-        blocks = page.get_text("blocks")
-        text_area = sum(
-            (b[2] - b[0]) * (b[3] - b[1])
-            for b in blocks
-            if b[6] == 0  # type 0 = text block
-        )
-        ratios.append(text_area / page_area)
-    doc.close()
+        # fitz.open() succeeds on a password-protected PDF without raising —
+        # it only throws once page content is touched without authenticating.
+        # A locked PDF (DRM'd publisher export, accidentally-encrypted
+        # download) is unreadable to us either way, so treat it the same as
+        # any other file we can't classify rather than letting it escape and
+        # abort the whole ingest run.
+        if doc.needs_pass:
+            return "digital"
+
+        ratios = []
+        try:
+            for page in doc:
+                page_area = page.rect.width * page.rect.height
+                if page_area == 0:
+                    ratios.append(0.0)
+                    continue
+                blocks = page.get_text("blocks")
+                text_area = sum(
+                    (b[2] - b[0]) * (b[3] - b[1])
+                    for b in blocks
+                    if b[6] == 0  # type 0 = text block
+                )
+                ratios.append(text_area / page_area)
+        except Exception:
+            # Some other decode failure surfaced mid-document (corrupt page,
+            # unsupported filter). Same fallback as "can't open" — don't let
+            # one bad page take down the batch.
+            return "digital"
+    finally:
+        doc.close()
 
     if not ratios:
         return "digital"
