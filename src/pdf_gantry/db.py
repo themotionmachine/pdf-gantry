@@ -1,5 +1,6 @@
 """Database connection, schema creation, and migrations."""
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -7,7 +8,33 @@ import sqlite_vec
 
 SCHEMA_VERSION = 4
 
-SCHEMA_SQL = """
+# ---------------------------------------------------------------------------
+# Canonical DDL for tables that are created both by init_schema (fresh DB) and
+# by migrate() (upgrading DB).  A single constant means the two paths can't
+# silently drift apart — changing the DDL here changes both call sites at once.
+# ---------------------------------------------------------------------------
+
+_CHUNKS_TABLE_DDL = """\
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    section_header TEXT,
+    page_start INTEGER,
+    text TEXT NOT NULL,
+    char_offset INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(doc_id, chunk_index)
+)\
+"""
+
+_CHUNK_VEC_DDL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
+    chunk_id INTEGER PRIMARY KEY,
+    embedding FLOAT[768] distance_metric=cosine
+)\
+"""
+
+SCHEMA_SQL = f"""
 -- Core papers table
 CREATE TABLE IF NOT EXISTS papers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,24 +127,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS paper_embeddings USING vec0(
 );
 
 -- Document chunks for chunk-level embeddings
-CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-    chunk_index INTEGER NOT NULL,
-    section_header TEXT,
-    page_start INTEGER,
-    text TEXT NOT NULL,
-    char_offset INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(doc_id, chunk_index)
-);
+{_CHUNKS_TABLE_DDL};
 
 CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
 
 -- Chunk-level embeddings via sqlite-vec (cosine distance)
-CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
-    chunk_id INTEGER PRIMARY KEY,
-    embedding FLOAT[768] distance_metric=cosine
-);
+{_CHUNK_VEC_DDL};
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -130,7 +145,14 @@ CREATE TABLE IF NOT EXISTS schema_version (
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open a connection with sqlite-vec, WAL mode, and schema initialized."""
     db_path = str(db_path)
+    _is_new = not Path(db_path).exists()
     conn = sqlite3.connect(db_path)
+    # sqlite3.connect() respects the process umask; on macOS the default umask
+    # (022) yields mode 0644 — world-readable.  The DB holds the user's entire
+    # research corpus (full text, abstracts, vault note paths).  Restrict it to
+    # owner-only (0600) immediately after creation, before any data is written.
+    if _is_new:
+        os.chmod(db_path, 0o600)
     conn.row_factory = sqlite3.Row
 
     # Load sqlite-vec extension
@@ -184,22 +206,9 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE papers ADD COLUMN has_chunk_embeddings INTEGER NOT NULL DEFAULT 0"
         )
-        conn.execute("""CREATE TABLE IF NOT EXISTS chunks (
-            chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            doc_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-            chunk_index INTEGER NOT NULL,
-            section_header TEXT,
-            page_start INTEGER,
-            text TEXT NOT NULL,
-            char_offset INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(doc_id, chunk_index)
-        )""")
+        conn.execute(_CHUNKS_TABLE_DDL)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
-        # v2 tables created with cosine metric (skipping L2 intermediate)
-        conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
-            chunk_id INTEGER PRIMARY KEY,
-            embedding FLOAT[768] distance_metric=cosine
-        )""")
+        conn.execute(_CHUNK_VEC_DDL)
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (2, now_iso()),
@@ -208,11 +217,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         version = 2
 
     if version < 3:
-        # Recreate vec0 tables with cosine distance metric.
+        # Recreate paper_embeddings with cosine distance metric.
         # vec0 tables can't be ALTERed — must drop and recreate.
         # Preserve existing vectors by reading them out first.
-
-        # Migrate paper_embeddings
+        #
+        # Note: chunk_vec was introduced in v2 already with distance_metric=cosine
+        # (_CHUNK_VEC_DDL), so it does NOT need to be touched here.
         existing_doc_vecs = conn.execute(
             "SELECT paper_id, embedding FROM paper_embeddings"
         ).fetchall()
@@ -224,21 +234,6 @@ def migrate(conn: sqlite3.Connection) -> None:
         for row in existing_doc_vecs:
             conn.execute(
                 "INSERT INTO paper_embeddings (paper_id, embedding) VALUES (?, ?)",
-                (row[0], row[1]),
-            )
-
-        # Migrate chunk_vec
-        existing_chunk_vecs = conn.execute(
-            "SELECT chunk_id, embedding FROM chunk_vec"
-        ).fetchall()
-        conn.execute("DROP TABLE IF EXISTS chunk_vec")
-        conn.execute("""CREATE VIRTUAL TABLE chunk_vec USING vec0(
-            chunk_id INTEGER PRIMARY KEY,
-            embedding FLOAT[768] distance_metric=cosine
-        )""")
-        for row in existing_chunk_vecs:
-            conn.execute(
-                "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
                 (row[0], row[1]),
             )
 
