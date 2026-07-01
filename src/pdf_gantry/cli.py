@@ -12,7 +12,7 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
-from .utils import format_count, format_duration, format_pct, format_size, parse_ids
+from .utils import format_count, format_duration, format_pct, format_size, missing_ids, parse_ids
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -1680,11 +1680,22 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         paper_ids,
     ).fetchall()
 
+    # Requested IDs that didn't resolve to a row — a paper was pruned, an ID
+    # was mistyped, or the ID set came from a stale snapshot (e.g. a prior
+    # `search --ids-only`). Surfaced explicitly rather than silently
+    # shrinking the result set, so a caller composing commands doesn't have
+    # to diff input against output itself to notice a drop.
+    found_ids = {r["id"] for r in rows}
+    not_found = missing_ids(paper_ids, found_ids)
+
     if not rows:
         if use_json:
-            click.echo(json.dumps({"count": 0, "papers": []}))
+            click.echo(json.dumps({"count": 0, "papers": [], "not_found": not_found}))
         else:
             click.echo("No papers found for given IDs")
+            if not_found:
+                ids_str = ", ".join(str(i) for i in not_found)
+                click.echo(f"  Not in index: {ids_str}")
         conn.close()
         ctx.exit(EXIT_NO_RESULTS)
         return
@@ -1782,7 +1793,9 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({"count": len(results), "papers": results}, indent=2))
+        click.echo(json.dumps({
+            "count": len(results), "papers": results, "not_found": not_found,
+        }, indent=2))
     else:
         for d in results:
             click.echo(f"[{d.get('id')}] {d.get('filename', '?')}")
@@ -1801,6 +1814,15 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
                 click.echo(f"  Top chunk [{tc['score']:.2f}] {tc.get('section_header') or ''}")
                 click.echo(f"    \"{tc['text'][:300]}\"")
             click.echo()
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"Requested but not in index: {ids_str}")
+
+    # Some (but not all) requested IDs failed to resolve: signal it in the
+    # exit code too, so a caller checking `$?` catches the drop without
+    # having to parse the body.
+    if not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- read ---
