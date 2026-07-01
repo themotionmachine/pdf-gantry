@@ -1,9 +1,6 @@
 """Tests for fuzzy filename lookup."""
 
-import pytest
 
-from pdf_gantry.db import get_connection
-from pdf_gantry.ingest import ingest_directory
 from pdf_gantry.search import find_papers
 
 

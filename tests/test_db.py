@@ -181,18 +181,22 @@ def test_chunk_vec_table_exists(tmp_db):
 def test_has_chunk_embeddings_column(tmp_db):
     """papers table has has_chunk_embeddings column."""
     tmp_db.execute(
-        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
         "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
     )
     tmp_db.commit()
-    row = tmp_db.execute("SELECT has_chunk_embeddings FROM papers WHERE path = 'test.pdf'").fetchone()
+    row = tmp_db.execute(
+        "SELECT has_chunk_embeddings FROM papers WHERE path = 'test.pdf'"
+    ).fetchone()
     assert row["has_chunk_embeddings"] == 0
 
 
 def test_chunks_foreign_key_cascade(tmp_db):
     """Deleting a paper cascades to its chunks."""
     tmp_db.execute(
-        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
         "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
     )
     paper_id = tmp_db.execute("SELECT id FROM papers WHERE path = 'test.pdf'").fetchone()["id"]
@@ -211,11 +215,14 @@ def test_chunks_foreign_key_cascade(tmp_db):
 def test_citekey_column_exists(tmp_db):
     """papers table has citekey and citekey_source columns (schema v4)."""
     tmp_db.execute(
-        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
         "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
     )
     tmp_db.commit()
-    row = tmp_db.execute("SELECT citekey, citekey_source FROM papers WHERE path = 'test.pdf'").fetchone()
+    row = tmp_db.execute(
+        "SELECT citekey, citekey_source FROM papers WHERE path = 'test.pdf'"
+    ).fetchone()
     assert row["citekey"] is None
     assert row["citekey_source"] is None
 
@@ -233,7 +240,8 @@ def test_idempotent_connection(tmp_path):
     db_path = tmp_path / "test.db"
     conn1 = get_connection(str(db_path))
     conn1.execute(
-        "INSERT INTO papers (path, filename, file_hash, file_size, file_modified, indexed_at, updated_at) "
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
         "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
     )
     conn1.commit()

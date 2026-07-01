@@ -1,6 +1,6 @@
 """Data classes for Paper, SearchResult, and related types."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

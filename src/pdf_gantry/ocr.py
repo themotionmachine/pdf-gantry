@@ -26,9 +26,9 @@ def _load_predictors():
     """Load Surya predictors once and cache at module level."""
     global _foundation_predictor, _recognition_predictor, _detection_predictor
     if _recognition_predictor is None:
+        from surya.detection import DetectionPredictor
         from surya.foundation import FoundationPredictor
         from surya.recognition import RecognitionPredictor
-        from surya.detection import DetectionPredictor
 
         _foundation_predictor = FoundationPredictor()
         _recognition_predictor = RecognitionPredictor(_foundation_predictor)
@@ -45,9 +45,10 @@ def ocr_document(pdf_path: Path) -> tuple[str, str]:
     if not _check_surya_available():
         raise ImportError("Surya OCR not installed. Run: pip install pdf-gantry[ocr]")
 
+    import io
+
     import fitz
     from PIL import Image
-    import io
 
     # Open PDF and convert pages to images
     doc = fitz.open(str(pdf_path))
@@ -154,13 +155,15 @@ def process_ocr_documents(
             ).fetchone()
             if existing_fts:
                 conn.execute(
-                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, abstract, text_content) "
+                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
+                    "abstract, text_content) "
                     "VALUES('delete', ?, ?, ?, ?, ?, ?)",
                     (paper_id, paper["filename"] or "", paper["title"] or "",
                      paper["authors"] or "", paper["abstract"] or "", old_text or ""),
                 )
             conn.execute(
-                "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (paper_id, paper["filename"] or "", paper["title"] or "",
                  paper["authors"] or "", paper["abstract"] or "", raw_text),
             )
@@ -170,15 +173,18 @@ def process_ocr_documents(
             from .chunking import chunk_markdown
             raw_chunks = chunk_markdown(markdown, title=paper["title"])
             conn.execute(
-                "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                "DELETE FROM chunk_vec WHERE chunk_id IN "
+                "(SELECT chunk_id FROM chunks WHERE doc_id = ?)",
                 (paper_id,),
             )
             conn.execute("DELETE FROM chunks WHERE doc_id = ?", (paper_id,))
             for i, chunk in enumerate(raw_chunks):
                 conn.execute(
-                    """INSERT INTO chunks (doc_id, chunk_index, section_header, page_start, text, char_offset)
+                    """INSERT INTO chunks
+                    (doc_id, chunk_index, section_header, page_start, text, char_offset)
                     VALUES (?, ?, ?, ?, ?, ?)""",
-                    (paper_id, i, chunk.section_header, chunk.page_start, chunk.text, chunk.char_offset),
+                    (paper_id, i, chunk.section_header, chunk.page_start,
+                     chunk.text, chunk.char_offset),
                 )
 
             conn.execute(

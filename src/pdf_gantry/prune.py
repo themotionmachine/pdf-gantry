@@ -34,7 +34,8 @@ def prune_missing(
 
             # vec0 tables have no CASCADE — delete explicitly
             conn.execute(
-                "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                "DELETE FROM chunk_vec WHERE chunk_id IN "
+                "(SELECT chunk_id FROM chunks WHERE doc_id = ?)",
                 (paper_id,),
             )
             conn.execute(
@@ -56,7 +57,8 @@ def prune_missing(
                     (paper_id,),
                 ).fetchone()
                 conn.execute(
-                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, abstract, text_content) "
+                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
+                    "abstract, text_content) "
                     "VALUES('delete', ?, ?, ?, ?, ?, ?)",
                     (paper_id,
                      paper_data["filename"] or "" if paper_data else "",

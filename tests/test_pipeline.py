@@ -1,9 +1,7 @@
 """Tests for the pipeline (sync) command."""
 
-import pytest
 
 from pdf_gantry.db import get_connection
-from pdf_gantry.ingest import ingest_directory
 from pdf_gantry.pipeline import run_pipeline
 
 
@@ -92,7 +90,8 @@ def _seed_suspicious(db_path):
         """INSERT INTO papers
             (id, path, filename, file_hash, file_size, file_modified,
              page_count, has_text, needs_ocr, indexed_at, updated_at)
-           VALUES (1, 'p1.pdf', 'p1.pdf', 'h1', 1, '2026-01-01', 10, 1, 1, '2026-01-01', '2026-01-01')"""
+           VALUES (1, 'p1.pdf', 'p1.pdf', 'h1', 1, '2026-01-01', 10, 1, 1,
+                   '2026-01-01', '2026-01-01')"""
     )
     conn.execute(
         "INSERT INTO paper_text (paper_id, raw_text, markdown, text_length, markdown_length) "

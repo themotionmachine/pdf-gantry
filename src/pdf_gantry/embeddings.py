@@ -26,7 +26,9 @@ def _serialize_vector(vector) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
 
-def _prepare_text(title: str | None, abstract: str | None, raw_text: str | None, max_chars: int = 30000) -> str:
+def _prepare_text(
+    title: str | None, abstract: str | None, raw_text: str | None, max_chars: int = 30000
+) -> str:
     """Prepare text for embedding: title + abstract + truncated text."""
     parts = []
     if title:
@@ -209,7 +211,8 @@ def embed_chunks(
     for paper in paper_rows:
         paper_titles[paper["id"]] = paper["title"]
         chunks = conn.execute(
-            "SELECT chunk_id, doc_id, chunk_index, section_header, text FROM chunks WHERE doc_id = ?",
+            "SELECT chunk_id, doc_id, chunk_index, section_header, text "
+            "FROM chunks WHERE doc_id = ?",
             (paper["id"],),
         ).fetchall()
         all_chunks.extend(chunks)
@@ -235,14 +238,16 @@ def embed_chunks(
     for batch_start in range(0, len(all_chunks), batch_size):
         batch = all_chunks[batch_start:batch_start + batch_size]
 
-        texts = [
-            f"search_document: {prepare_chunk_text(paper_titles.get(c['doc_id']), c['section_header'], c['text'])}"
-            for c in batch
-        ]
+        texts = []
+        for c in batch:
+            chunk_body = prepare_chunk_text(
+                paper_titles.get(c["doc_id"]), c["section_header"], c["text"]
+            )
+            texts.append(f"search_document: {chunk_body}")
 
         try:
             vectors = model.encode(texts, show_progress_bar=False)
-        except Exception as e:
+        except Exception:
             stats.failed += len(batch)
             completed += len(batch)
             if progress_callback:
@@ -263,7 +268,7 @@ def embed_chunks(
                 )
                 stats.succeeded += 1
                 paper_success_counts[chunk["doc_id"]] += 1
-            except Exception as e:
+            except Exception:
                 stats.failed += 1
 
         conn.commit()

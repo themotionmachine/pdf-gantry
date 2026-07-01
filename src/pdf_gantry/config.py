@@ -6,7 +6,6 @@ from pathlib import Path
 
 import yaml
 
-
 GANTRY_DIR = Path("~/.gantry").expanduser()
 CONFIG_PATH = GANTRY_DIR / "config.yaml"
 

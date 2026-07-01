@@ -4,7 +4,12 @@ import pytest
 
 from pdf_gantry.db import get_connection
 from pdf_gantry.ingest import ingest_directory
-from pdf_gantry.vault import _extract_pdf_references, check_vault, get_orphan_references, get_uncovered_pdfs
+from pdf_gantry.vault import (
+    _extract_pdf_references,
+    check_vault,
+    get_orphan_references,
+    get_uncovered_pdfs,
+)
 
 
 @pytest.fixture

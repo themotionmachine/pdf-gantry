@@ -22,7 +22,7 @@ _TABLE_LINE = re.compile(r'^\|.*\|$')
 def _is_table_block(text: str) -> bool:
     """Check if text is a markdown table."""
     lines = text.strip().split('\n')
-    return len(lines) >= 2 and all(_TABLE_LINE.match(l.strip()) for l in lines if l.strip())
+    return len(lines) >= 2 and all(_TABLE_LINE.match(ln.strip()) for ln in lines if ln.strip())
 
 
 def _split_into_sections(markdown: str) -> list[tuple[str | None, str, int]]:

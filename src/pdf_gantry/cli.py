@@ -1,19 +1,18 @@
 """Click CLI entry point and command group."""
 
 import json
-import sys
 from functools import wraps
 from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
-from .utils import format_count, format_pct, format_size, format_duration, parse_ids
+from .utils import format_count, format_duration, format_pct, format_size, parse_ids
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -235,7 +234,9 @@ def ingest(ctx, dry_run, json_output):
             f"{format_count(stats.missing)} missing)"
         )
         if not dry_run and stats.new > 0:
-            click.echo(f"Indexed {format_count(stats.new)} new documents in {stats.elapsed_seconds}s")
+            click.echo(
+                f"Indexed {format_count(stats.new)} new documents in {stats.elapsed_seconds}s"
+            )
         if stats.evicted > 0:
             click.echo(
                 f"\n{format_count(stats.evicted)} files evicted from iCloud (skipped). "
@@ -271,11 +272,19 @@ def status(ctx, json_output):
     info = StatusInfo(db_path=str(cfg.db_path))
     info.total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
     info.with_text = conn.execute("SELECT COUNT(*) FROM papers WHERE has_text = 1").fetchone()[0]
-    info.with_markdown = conn.execute("SELECT COUNT(*) FROM papers WHERE has_markdown = 1").fetchone()[0]
-    info.with_embeddings = conn.execute("SELECT COUNT(*) FROM papers WHERE has_embeddings = 1").fetchone()[0]
+    info.with_markdown = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE has_markdown = 1"
+    ).fetchone()[0]
+    info.with_embeddings = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE has_embeddings = 1"
+    ).fetchone()[0]
     info.needs_ocr = conn.execute("SELECT COUNT(*) FROM papers WHERE needs_ocr = 1").fetchone()[0]
-    info.has_errors = conn.execute("SELECT COUNT(*) FROM papers WHERE error_count > 0").fetchone()[0]
-    info.with_chunk_embeddings = conn.execute("SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1").fetchone()[0]
+    info.has_errors = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE error_count > 0"
+    ).fetchone()[0]
+    info.with_chunk_embeddings = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
+    ).fetchone()[0]
     from .queue import suspicious_extraction_condition
     info.suspicious_extraction = conn.execute(
         f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
@@ -298,7 +307,9 @@ def status(ctx, json_output):
             "db_size_bytes": info.db_size_bytes,
             "pct_text": round(info.with_text / info.total * 100, 1) if info.total else 0,
             "pct_markdown": round(info.with_markdown / info.total * 100, 1) if info.total else 0,
-            "pct_embeddings": round(info.with_embeddings / info.total * 100, 1) if info.total else 0,
+            "pct_embeddings": (
+                round(info.with_embeddings / info.total * 100, 1) if info.total else 0
+            ),
             "pct_chunk_embeddings": (
                 round(info.with_chunk_embeddings / info.total * 100, 1) if info.total else 0
             ),
@@ -307,12 +318,30 @@ def status(ctx, json_output):
         click.echo(f"pdf_gantry index: {info.db_path}")
         click.echo()
         click.echo(f"Documents:       {format_count(info.total)}")
-        click.echo(f"  With text:     {format_count(info.with_text)} ({format_pct(info.with_text, info.total)})")
-        click.echo(f"  With markdown: {format_count(info.with_markdown)} ({format_pct(info.with_markdown, info.total)})")
-        click.echo(f"  With embeddings: {format_count(info.with_embeddings)} ({format_pct(info.with_embeddings, info.total)})")
-        click.echo(f"  With chunk embeddings: {format_count(info.with_chunk_embeddings)} ({format_pct(info.with_chunk_embeddings, info.total)})")
-        click.echo(f"  Needs OCR:     {format_count(info.needs_ocr)} ({format_pct(info.needs_ocr, info.total)})")
-        click.echo(f"  Has errors:    {format_count(info.has_errors)} ({format_pct(info.has_errors, info.total)})")
+        click.echo(
+            f"  With text:     {format_count(info.with_text)} "
+            f"({format_pct(info.with_text, info.total)})"
+        )
+        click.echo(
+            f"  With markdown: {format_count(info.with_markdown)} "
+            f"({format_pct(info.with_markdown, info.total)})"
+        )
+        click.echo(
+            f"  With embeddings: {format_count(info.with_embeddings)} "
+            f"({format_pct(info.with_embeddings, info.total)})"
+        )
+        click.echo(
+            f"  With chunk embeddings: {format_count(info.with_chunk_embeddings)} "
+            f"({format_pct(info.with_chunk_embeddings, info.total)})"
+        )
+        click.echo(
+            f"  Needs OCR:     {format_count(info.needs_ocr)} "
+            f"({format_pct(info.needs_ocr, info.total)})"
+        )
+        click.echo(
+            f"  Has errors:    {format_count(info.has_errors)} "
+            f"({format_pct(info.has_errors, info.total)})"
+        )
         if info.suspicious_extraction:
             click.echo(f"  Suspicious extraction: {format_count(info.suspicious_extraction)} "
                        f"({format_pct(info.suspicious_extraction, info.total)}) "
@@ -419,7 +448,9 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
     task = None
     if not use_json:
         actual = len(paper_ids) if limit is None else min(len(paper_ids), limit)
-        err_console.print(f"Processing {format_count(actual)} documents with {method} ({workers} workers)")
+        err_console.print(
+            f"Processing {format_count(actual)} documents with {method} ({workers} workers)"
+        )
         progress_bar = Progress(
             BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TextColumn("{task.completed}/{task.total}"),
@@ -455,10 +486,16 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
             "method": method,
         }, indent=2))
     else:
-        click.echo(f"Processed {format_count(stats.total)} documents in {format_duration(stats.elapsed_seconds)}")
+        click.echo(
+            f"Processed {format_count(stats.total)} documents "
+            f"in {format_duration(stats.elapsed_seconds)}"
+        )
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         if stats.failed > 0:
-            click.echo(f"  Failed: {format_count(stats.failed)} (use 'gantry queue --has errors' to see failures)")
+            click.echo(
+                f"  Failed: {format_count(stats.failed)} "
+                f"(use 'gantry queue --has errors' to see failures)"
+            )
 
     if stats.failed > 0 and stats.succeeded > 0:
         ctx.exit(EXIT_PARTIAL)
@@ -569,10 +606,16 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
             "method": "surya",
         }, indent=2))
     else:
-        click.echo(f"OCR'd {format_count(stats.total)} documents in {format_duration(stats.elapsed_seconds)}")
+        click.echo(
+            f"OCR'd {format_count(stats.total)} documents "
+            f"in {format_duration(stats.elapsed_seconds)}"
+        )
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         if stats.failed > 0:
-            click.echo(f"  Failed: {format_count(stats.failed)} (use 'gantry queue --has errors' to see failures)")
+            click.echo(
+                f"  Failed: {format_count(stats.failed)} "
+                f"(use 'gantry queue --has errors' to see failures)"
+            )
 
     if stats.failed > 0 and stats.succeeded > 0:
         ctx.exit(EXIT_PARTIAL)
@@ -587,7 +630,8 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
 @click.option("--hybrid", is_flag=True, help="Combine FTS5 and vector search (default)")
 @click.option("--fts", "fts_only", is_flag=True, help="Use FTS5 only, skip vector search")
-@click.option("--components", is_flag=True, help="Include FTS and vector component scores (hybrid only)")
+@click.option("--components", is_flag=True,
+              help="Include FTS and vector component scores (hybrid only)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include in JSON output")
 @click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
@@ -626,7 +670,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
         return
 
     conn = get_connection(cfg.db_path)
-    from .search import fts_search, search_count, hybrid_search
+    from .search import fts_search, hybrid_search, search_count
 
     # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
     use_hybrid = not fts_only
@@ -875,7 +919,8 @@ def errors(ctx, json_output):
 
     conn = get_connection(cfg.db_path)
     rows = conn.execute(
-        "SELECT id, filename, last_error, error_count, last_error_at FROM papers WHERE error_count > 0 ORDER BY error_count DESC"
+        "SELECT id, filename, last_error, error_count, last_error_at "
+        "FROM papers WHERE error_count > 0 ORDER BY error_count DESC"
     ).fetchall()
     conn.close()
 
@@ -949,7 +994,7 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
         return
 
     from .embeddings import embed_query
-    from .search import semantic_search, cascade_search
+    from .search import cascade_search, semantic_search
 
     try:
         query_vec = embed_query(cfg.embedding.model, query)
@@ -1033,7 +1078,10 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, batch_size, dry_run, json_output):
+def embed(
+    ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, batch_size,
+    dry_run, json_output,
+):
     """Generate embeddings for documents with text."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -1048,7 +1096,7 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
         return
 
     conn = get_connection(cfg.db_path)
-    from .embeddings import embed_documents, embed_chunks
+    from .embeddings import embed_chunks, embed_documents
     from .queue import build_filter_query
 
     if batch_size is None:
@@ -1085,7 +1133,9 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
         if use_json:
             click.echo(json.dumps({"would_embed": len(paper_ids), "model": cfg.embedding.model}))
         else:
-            click.echo(f"Would embed {format_count(len(paper_ids))} documents with {cfg.embedding.model}")
+            click.echo(
+                f"Would embed {format_count(len(paper_ids))} documents with {cfg.embedding.model}"
+            )
         conn.close()
         return
 
@@ -1153,7 +1203,10 @@ def embed(ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, ba
             "model": cfg.embedding.model,
         }, indent=2))
     else:
-        click.echo(f"Done. {format_count(stats.succeeded)} documents embedded in {format_duration(stats.elapsed_seconds)}")
+        click.echo(
+            f"Done. {format_count(stats.succeeded)} documents embedded "
+            f"in {format_duration(stats.elapsed_seconds)}"
+        )
         if stats.failed > 0:
             click.echo(f"  Failed: {format_count(stats.failed)}")
 
@@ -1274,7 +1327,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             "elapsed_seconds": stats.elapsed_seconds,
         }, indent=2))
     else:
-        click.echo(f"Enriched {format_count(stats.total)} documents in {format_duration(stats.elapsed_seconds)}")
+        click.echo(
+            f"Enriched {format_count(stats.total)} documents "
+            f"in {format_duration(stats.elapsed_seconds)}"
+        )
         click.echo(f"  DOI found in text: {format_count(stats.doi_found)}")
         click.echo(f"  Matched via title: {format_count(stats.matched_by_title)}")
         click.echo(f"  No match found: {format_count(stats.no_match)}")
@@ -1500,7 +1556,10 @@ def prune(ctx, dry_run, json_output):
         if stats["pruned"] == 0:
             click.echo(f"{prefix}No ghost entries found ({stats['remaining']} papers in index)")
         else:
-            click.echo(f"{prefix}Pruned {stats['pruned']} ghost entries ({stats['remaining']} remaining)")
+            click.echo(
+                f"{prefix}Pruned {stats['pruned']} ghost entries "
+                f"({stats['remaining']} remaining)"
+            )
             for f in stats["pruned_files"]:
                 click.echo(f"  - {f}")
 
@@ -1833,9 +1892,13 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
     # Resolve identifier to paper
     try:
         paper_id = int(identifier)
-        paper = conn.execute("SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        paper = conn.execute(
+            "SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)
+        ).fetchone()
     except ValueError:
-        paper = conn.execute("SELECT id, filename, title FROM papers WHERE filename = ?", (identifier,)).fetchone()
+        paper = conn.execute(
+            "SELECT id, filename, title FROM papers WHERE filename = ?", (identifier,)
+        ).fetchone()
 
     if not paper:
         msg = f"Paper not found: {identifier}"
@@ -1849,7 +1912,8 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
 
     if list_chunks:
         chunks = conn.execute(
-            "SELECT chunk_id, chunk_index, section_header, LENGTH(text) as text_len FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
+            "SELECT chunk_id, chunk_index, section_header, LENGTH(text) as text_len "
+            "FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
             (paper["id"],),
         ).fetchall()
         conn.close()
@@ -1871,7 +1935,9 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             click.echo(f"{paper['filename']} — {len(chunks)} chunks")
             for c in chunks:
                 header = f" [{c['section_header']}]" if c["section_header"] else ""
-                click.echo(f"  {c['chunk_index']:3d}. (id={c['chunk_id']}) {c['text_len']:,} chars{header}")
+                click.echo(
+                    f"  {c['chunk_index']:3d}. (id={c['chunk_id']}) {c['text_len']:,} chars{header}"
+                )
         return
 
     # Default: read full markdown
@@ -1953,10 +2019,15 @@ def vault_check(ctx, json_output):
     else:
         click.echo(f"Vault: {cfg.vault_dir}")
         pct = format_pct(stats.with_notes, stats.total_pdfs)
-        click.echo(f"PDFs with source notes:    {format_count(stats.with_notes)} / {format_count(stats.total_pdfs)} ({pct})")
+        click.echo(
+            f"PDFs with source notes:    {format_count(stats.with_notes)} / "
+            f"{format_count(stats.total_pdfs)} ({pct})"
+        )
         click.echo(f"PDFs without source notes: {format_count(stats.without_notes)}")
         if stats.orphan_references:
-            click.echo(f"\nOrphaned references (PDFs not in library): {len(stats.orphan_references)}")
+            click.echo(
+                f"\nOrphaned references (PDFs not in library): {len(stats.orphan_references)}"
+            )
             for o in stats.orphan_references[:10]:
                 click.echo(f"  - [[{o['reference']}]] in {o['note_path']}")
             if len(stats.orphan_references) > 10:
@@ -2087,7 +2158,8 @@ def check(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_out
     bib_path = Path(bib_path)
 
     from .link import apply_matches as do_apply_matches
-    from .link import parse_bib_file, reconcile as do_reconcile
+    from .link import parse_bib_file
+    from .link import reconcile as do_reconcile
 
     start = time.monotonic()
     entries = parse_bib_file(bib_path)

@@ -4,11 +4,15 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-import yaml
 import pytest
+import yaml
 
 from pdf_gantry.config import (
-    Config, load_config, save_config, set_config_value, CONFIG_PATH, GANTRY_DIR,
+    GANTRY_DIR,
+    Config,
+    load_config,
+    save_config,
+    set_config_value,
 )
 
 

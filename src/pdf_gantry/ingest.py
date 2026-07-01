@@ -1,9 +1,8 @@
 """File scanning and registration of PDFs into the database."""
 
-import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -108,7 +107,7 @@ def ingest_directory(
 
         stat = pdf_path.stat()
         size = stat.st_size
-        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
 
         # Fast path: if path+size+mtime match, skip hash
         if _fast_path_match(conn, rel_path, size, mtime):
@@ -140,7 +139,8 @@ def ingest_directory(
                 stats.already_indexed += 1
                 if not dry_run:
                     conn.execute(
-                        "UPDATE papers SET file_size = ?, file_modified = ?, updated_at = ? WHERE id = ?",
+                        "UPDATE papers SET file_size = ?, file_modified = ?, updated_at = ? "
+                        "WHERE id = ?",
                         (size, mtime, now_iso(), row["id"]),
                     )
             else:
@@ -148,7 +148,10 @@ def ingest_directory(
                 stats.changed += 1
                 if not dry_run:
                     page_count, classification = _get_pdf_metadata(pdf_path)
-                    is_scanned = 1 if classification == "scanned" else (0 if classification == "digital" else None)
+                    is_scanned = (
+                        1 if classification == "scanned"
+                        else (0 if classification == "digital" else None)
+                    )
                     needs_ocr = 1 if classification in ("scanned", "mixed") else 0
                     conn.execute(
                         """UPDATE papers SET
@@ -157,14 +160,18 @@ def ingest_directory(
                             has_text = 0, has_markdown = 0, has_embeddings = 0,
                             updated_at = ?
                         WHERE id = ?""",
-                        (fhash, size, mtime, page_count, is_scanned, needs_ocr, now_iso(), row["id"]),
+                        (fhash, size, mtime, page_count, is_scanned, needs_ocr,
+                         now_iso(), row["id"]),
                     )
         else:
             # New file
             stats.new += 1
             if not dry_run:
                 page_count, classification = _get_pdf_metadata(pdf_path)
-                is_scanned = 1 if classification == "scanned" else (0 if classification == "digital" else None)
+                is_scanned = (
+                    1 if classification == "scanned"
+                    else (0 if classification == "digital" else None)
+                )
                 needs_ocr = 1 if classification in ("scanned", "mixed") else 0
                 now = now_iso()
                 conn.execute(

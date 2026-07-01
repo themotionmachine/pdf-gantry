@@ -1,12 +1,10 @@
 """Tests for PDF ingestion."""
 
-import shutil
 
 import fitz
-import pytest
 
 from pdf_gantry.db import get_connection
-from pdf_gantry.ingest import ingest_directory, classify_document
+from pdf_gantry.ingest import classify_document, ingest_directory
 
 
 def test_ingest_new_pdfs(tmp_path, papers_dir):

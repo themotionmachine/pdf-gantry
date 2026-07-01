@@ -77,12 +77,14 @@ def check_vault(
         if filename in found_pdfs:
             # Find the note that references this PDF (for vault_note_path)
             conn.execute(
-                "UPDATE papers SET vault_note_path = 'found', vault_checked_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE papers SET vault_note_path = 'found', vault_checked_at = ?, "
+                "updated_at = ? WHERE id = ?",
                 (now, now, paper_id),
             )
         else:
             conn.execute(
-                "UPDATE papers SET vault_note_path = NULL, vault_checked_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE papers SET vault_note_path = NULL, vault_checked_at = ?, "
+                "updated_at = ? WHERE id = ?",
                 (now, now, paper_id),
             )
     conn.commit()
@@ -115,6 +117,7 @@ def get_orphan_references(conn: sqlite3.Connection, vault_dir: Path) -> list[dic
 def get_uncovered_pdfs(conn: sqlite3.Connection) -> list[dict]:
     """Find PDFs without any vault note referencing them."""
     rows = conn.execute(
-        "SELECT id, filename FROM papers WHERE vault_note_path IS NULL AND vault_checked_at IS NOT NULL"
+        "SELECT id, filename FROM papers "
+        "WHERE vault_note_path IS NULL AND vault_checked_at IS NOT NULL"
     ).fetchall()
     return [dict(row) for row in rows]

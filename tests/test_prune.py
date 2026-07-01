@@ -142,16 +142,24 @@ def test_prune_cleans_related_tables(tmp_path, papers_dir):
     paper_id = paper["id"]
 
     # Verify related data exists
-    assert conn2.execute("SELECT COUNT(*) FROM paper_text WHERE paper_id = ?", (paper_id,)).fetchone()[0] > 0
-    assert conn2.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (paper_id,)).fetchone()[0] > 0
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM paper_text WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0] > 0
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (paper_id,)
+    ).fetchone()[0] > 0
 
     # Delete file and prune
     (papers_dir / "ml_nlp_paper.pdf").unlink()
     prune_missing(conn2, papers_dir)
 
     # All related data should be gone
-    assert conn2.execute("SELECT COUNT(*) FROM paper_text WHERE paper_id = ?", (paper_id,)).fetchone()[0] == 0
-    assert conn2.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (paper_id,)).fetchone()[0] == 0
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM paper_text WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0] == 0
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (paper_id,)
+    ).fetchone()[0] == 0
     conn2.close()
     conn.close()
 

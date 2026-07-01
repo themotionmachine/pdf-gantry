@@ -77,7 +77,6 @@ def test_fts_phrase_query(searchable_db):
 
 def test_fts_hyphenated_query(searchable_db):
     """Hyphenated terms don't crash FTS5."""
-    from pdf_gantry.search import _sanitize_fts_query
     # Should not raise "no such column" error
     results = fts_search(searchable_db, "cross-national")
     # May or may not find results, but should not error

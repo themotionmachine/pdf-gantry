@@ -54,8 +54,8 @@ def extract_text_marker(pdf_path: Path) -> tuple[str, str]:
         raise ImportError("Marker not installed. Run: pip install pdf-gantry[quality]")
 
     if not _MARKER_MODELS:
-        from marker.models import create_model_dict
         from marker.config.parser import ConfigParser
+        from marker.models import create_model_dict
         config_parser = ConfigParser({"output_format": "markdown"})
         _MARKER_MODELS["models"] = create_model_dict()
         _MARKER_MODELS["config"] = config_parser.generate_config_dict()
@@ -131,14 +131,17 @@ def _process_single(
         ).fetchone()
         if existing_fts:
             conn.execute(
-                "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, abstract, text_content) "
+                "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
+                "abstract, text_content) "
                 "VALUES('delete', ?, ?, ?, ?, ?, ?)",
                 (paper_id, row["filename"] or "", row["title"] or "",
                  row["authors"] or "", row["abstract"] or "", old_content or ""),
             )
         conn.execute(
-            "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) VALUES (?, ?, ?, ?, ?, ?)",
-            (paper_id, row["filename"] or "", row["title"] or "", row["authors"] or "", row["abstract"] or "", raw_text),
+            "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (paper_id, row["filename"] or "", row["title"] or "",
+             row["authors"] or "", row["abstract"] or "", raw_text),
         )
 
         # Generate and store chunks
@@ -147,16 +150,19 @@ def _process_single(
 
         # Clear old chunks (and their embeddings — vec0 has no CASCADE)
         conn.execute(
-            "DELETE FROM chunk_vec WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+            "DELETE FROM chunk_vec WHERE chunk_id IN "
+            "(SELECT chunk_id FROM chunks WHERE doc_id = ?)",
             (paper_id,),
         )
         conn.execute("DELETE FROM chunks WHERE doc_id = ?", (paper_id,))
 
         for i, chunk in enumerate(raw_chunks):
             conn.execute(
-                """INSERT INTO chunks (doc_id, chunk_index, section_header, page_start, text, char_offset)
+                """INSERT INTO chunks
+                (doc_id, chunk_index, section_header, page_start, text, char_offset)
                 VALUES (?, ?, ?, ?, ?, ?)""",
-                (paper_id, i, chunk.section_header, chunk.page_start, chunk.text, chunk.char_offset),
+                (paper_id, i, chunk.section_header, chunk.page_start,
+                 chunk.text, chunk.char_offset),
             )
 
         # Update processing flags (reset chunk embeddings since chunks changed)

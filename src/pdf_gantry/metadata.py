@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 from .utils import now_iso
 
-
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
 
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper"

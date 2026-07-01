@@ -32,7 +32,6 @@ def test_marker_returns_markdown_format(sample_pdf):
 
 def test_marker_import_error_when_missing(sample_pdf, monkeypatch):
     """extract_text_marker gives clear error when marker isn't installed."""
-    import pdf_gantry.process as proc
     # Temporarily hide the function's ability to import marker
     import builtins
     real_import = builtins.__import__

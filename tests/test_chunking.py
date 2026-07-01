@@ -1,8 +1,7 @@
 """Tests for structure-aware markdown chunking."""
 
-import pytest
 
-from pdf_gantry.chunking import chunk_markdown, prepare_chunk_text, RawChunk
+from pdf_gantry.chunking import RawChunk, chunk_markdown, prepare_chunk_text
 
 
 def test_basic_splitting():
