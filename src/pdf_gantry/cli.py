@@ -13,7 +13,7 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
-from .utils import format_count, format_pct, format_size, format_duration
+from .utils import format_count, format_pct, format_size, format_duration, parse_ids
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -291,6 +291,7 @@ def status(ctx, json_output):
             "with_text": info.with_text,
             "with_markdown": info.with_markdown,
             "with_embeddings": info.with_embeddings,
+            "with_chunk_embeddings": info.with_chunk_embeddings,
             "needs_ocr": info.needs_ocr,
             "has_errors": info.has_errors,
             "suspicious_extraction": info.suspicious_extraction,
@@ -298,6 +299,9 @@ def status(ctx, json_output):
             "pct_text": round(info.with_text / info.total * 100, 1) if info.total else 0,
             "pct_markdown": round(info.with_markdown / info.total * 100, 1) if info.total else 0,
             "pct_embeddings": round(info.with_embeddings / info.total * 100, 1) if info.total else 0,
+            "pct_chunk_embeddings": (
+                round(info.with_chunk_embeddings / info.total * 100, 1) if info.total else 0
+            ),
         }, indent=2))
     else:
         click.echo(f"pdf_gantry index: {info.db_path}")
@@ -482,7 +486,7 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
     if ids is not None:
         # Surgical mode: OCR exactly these papers, regardless of needs_ocr state.
         try:
-            paper_ids = [int(x.strip()) for x in ids.split(",")]
+            paper_ids = parse_ids(ids)
         except ValueError:
             msg = "Invalid --ids: must be comma-separated integers"
             if use_json:
@@ -602,7 +606,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     restrict_ids = None
     if restrict_to_ids is not None:
         try:
-            restrict_ids = [int(x.strip()) for x in restrict_to_ids.split(",") if x.strip()]
+            restrict_ids = parse_ids(restrict_to_ids)
         except ValueError:
             msg = "Invalid --restrict-to-ids: must be comma-separated integers"
             if use_json:
@@ -626,6 +630,10 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
 
     # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
     use_hybrid = not fts_only
+    # Track whether we fell back from hybrid to FTS due to missing embeddings.
+    # This lets us emit a machine-readable ``mode`` in JSON so a remote agent
+    # can distinguish full hybrid output from silently-degraded FTS output.
+    embed_degraded = False
 
     try:
         if use_hybrid:
@@ -635,6 +643,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
             except ImportError:
                 click.echo("Embeddings unavailable; falling back to FTS.", err=True)
                 use_hybrid = False
+                embed_degraded = True
         if use_hybrid:
             results = hybrid_search(conn, query, query_vec, limit=limit, restrict_ids=restrict_ids)
             total = len(results)
@@ -660,9 +669,22 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     finally:
         conn.close()
 
+    # Compute the machine-readable mode that describes which retrieval path ran.
+    #   "hybrid"   — FTS5 + vector RRF fusion both executed
+    #   "fts"      — FTS5 only, embeddings were requested but unavailable (degraded)
+    #   "fts_only" — caller explicitly passed --fts (not a degradation)
+    # This is the window: the mode lives in the execution-path decision above
+    # but was invisible to any agent reading JSON output.  Now it crosses over.
+    if use_hybrid:
+        search_mode = "hybrid"
+    elif embed_degraded:
+        search_mode = "fts"
+    else:
+        search_mode = "fts_only"
+
     if not results:
         if use_json:
-            click.echo(json.dumps({"query": query, "total": 0, "results": []}))
+            click.echo(json.dumps({"query": query, "total": 0, "results": [], "mode": search_mode}))
         else:
             click.echo(f'No results for "{query}"')
         ctx.exit(EXIT_NO_RESULTS)
@@ -712,6 +734,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
         click.echo(json.dumps({
             "query": query,
             "total": total,
+            "mode": search_mode,
             "results": result_dicts,
         }, indent=2))
     else:
@@ -906,7 +929,7 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
     restrict_ids = None
     if restrict_to_ids is not None:
         try:
-            restrict_ids = [int(x.strip()) for x in restrict_to_ids.split(",") if x.strip()]
+            restrict_ids = parse_ids(restrict_to_ids)
         except ValueError:
             msg = "Invalid --restrict-to-ids: must be comma-separated integers"
             if use_json:
@@ -1299,7 +1322,7 @@ def retry(ctx, max_attempts, ids, json_output):
     if ids is not None:
         # Surgical un-quarantine: reset exactly these papers, ignore the cap.
         try:
-            paper_ids = [int(x.strip()) for x in ids.split(",")]
+            paper_ids = parse_ids(ids)
         except ValueError:
             msg = "Invalid --ids: must be comma-separated integers"
             if use_json:
@@ -1553,9 +1576,11 @@ def find(ctx, fragment, limit, json_output):
               help="Include chunk texts for each paper")
 @click.option("-q", "--query", default=None,
               help="Attach each paper's single best-matching chunk for this query")
+@click.option("--context", "context_chars", type=int, default=None,
+              help="Expand each top chunk with N chars of surrounding context (requires --query)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def info(ctx, ids, field_list, include_chunks, query, json_output):
+def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output):
     """Fetch metadata for specific papers by ID."""
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -1570,7 +1595,7 @@ def info(ctx, ids, field_list, include_chunks, query, json_output):
         return
 
     try:
-        paper_ids = [int(x.strip()) for x in ids.split(",")]
+        paper_ids = parse_ids(ids)
     except ValueError:
         msg = "Invalid --ids: must be comma-separated integers"
         if use_json:
@@ -1609,7 +1634,7 @@ def info(ctx, ids, field_list, include_chunks, query, json_output):
     if query:
         try:
             from .embeddings import embed_query
-            from .search import best_chunk_per_doc
+            from .search import best_chunk_per_doc, get_chunk_context
             query_vec = embed_query(cfg.embedding.model, query)
             top_chunks = best_chunk_per_doc(conn, query_vec, paper_ids)
         except ImportError as e:
@@ -1621,6 +1646,27 @@ def info(ctx, ids, field_list, include_chunks, query, json_output):
                 click.echo(msg, err=True)
             ctx.exit(EXIT_ERROR)
             return
+
+    # Batch-load all chunks for requested papers in a single query (not N+1).
+    # This replaces one SELECT per paper with one SELECT for all papers.
+    chunks_by_doc: dict[int, list[dict]] = {}
+    if include_chunks:
+        import collections
+        chunks_by_doc = collections.defaultdict(list)
+        chunk_rows = conn.execute(
+            f"""SELECT doc_id, chunk_id, chunk_index, section_header, text
+                FROM chunks
+                WHERE doc_id IN ({placeholders})
+                ORDER BY doc_id, chunk_index""",
+            paper_ids,
+        ).fetchall()
+        for c in chunk_rows:
+            chunks_by_doc[c["doc_id"]].append({
+                "chunk_id": c["chunk_id"],
+                "chunk_index": c["chunk_index"],
+                "section_header": c["section_header"],
+                "text": c["text"],
+            })
 
     results = []
     for r in rows:
@@ -1646,30 +1692,27 @@ def info(ctx, ids, field_list, include_chunks, query, json_output):
         }
 
         if include_chunks:
-            chunks = conn.execute(
-                "SELECT chunk_id, chunk_index, section_header, text FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
-                (r["id"],),
-            ).fetchall()
-            d["chunks"] = [
-                {
-                    "chunk_id": c["chunk_id"],
-                    "chunk_index": c["chunk_index"],
-                    "section_header": c["section_header"],
-                    "text": c["text"],
-                }
-                for c in chunks
-            ]
+            d["chunks"] = chunks_by_doc.get(r["id"], [])
 
         if query:
             tc = top_chunks.get(r["id"])
-            d["top_chunk"] = None if tc is None else {
-                "chunk_id": tc.chunk_id,
-                "chunk_index": tc.chunk_index,
-                "section_header": tc.section_header,
-                "page_start": tc.page_start,
-                "score": tc.score,
-                "text": tc.chunk_text,
-            }
+            if tc is None:
+                d["top_chunk"] = None
+            else:
+                chunk_dict = {
+                    "chunk_id": tc.chunk_id,
+                    "chunk_index": tc.chunk_index,
+                    "section_header": tc.section_header,
+                    "page_start": tc.page_start,
+                    "score": tc.score,
+                    "text": tc.chunk_text,
+                }
+                if context_chars is not None:
+                    chunk_ctx = get_chunk_context(conn, tc.chunk_id, max_chars=context_chars)
+                    if chunk_ctx is not None:
+                        chunk_dict["context"] = chunk_ctx["context"]
+                        chunk_dict["total_chunks"] = chunk_ctx["total_chunks"]
+                d["top_chunk"] = chunk_dict
 
         if field_list:
             fields = {f.strip() for f in field_list.split(",")}

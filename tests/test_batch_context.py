@@ -165,3 +165,63 @@ def test_info_query_respects_fields(cli_chunked_db):
     assert result.exit_code == 0
     paper = json.loads(result.output)["papers"][0]
     assert set(paper.keys()) == {"id", "top_chunk"}
+
+
+# --- CLI: info --query --context (context-expanded batch retrieval) ---
+
+
+def test_info_query_context_expands_window(cli_chunked_db):
+    """--context N combines best_chunk_per_doc with get_chunk_context in one call.
+
+    Proves the chain: search --ids-only | info --ids --query X --context N
+    returns context-expanded excerpts for all N papers in two CLI calls total
+    instead of N+2.  The fixture has two chunks per doc; with max_chars=5000
+    both neighbours should appear in the expanded context.
+    """
+    tmp_path, doc_a, doc_b = cli_chunked_db
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["info", "--ids", f"{doc_a},{doc_b}", "--query", "anything",
+         "--context", "5000", "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    by_id = {p["id"]: p for p in payload["papers"]}
+
+    # doc_a: query on axis 1 → best chunk is "alpha chunk one" (index 1).
+    tc_a = by_id[doc_a]["top_chunk"]
+    assert "context" in tc_a
+    # Context must contain the target chunk's own text.
+    assert tc_a["text"] in tc_a["context"]
+    # With max_chars=5000 both chunks easily fit; the window expands to include index 0.
+    assert "alpha chunk zero" in tc_a["context"]
+    assert "alpha chunk one" in tc_a["context"]
+    # total_chunks lets the agent know the doc's chunk count without a second call.
+    assert tc_a["total_chunks"] == 2
+
+
+def test_info_query_without_context_unchanged(cli_chunked_db):
+    """Without --context the top_chunk shape is identical to the prior contract."""
+    tmp_path, doc_a, _ = cli_chunked_db
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["info", "--ids", str(doc_a), "--query", "anything", "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    tc = payload["papers"][0]["top_chunk"]
+    assert "context" not in tc
+    assert "total_chunks" not in tc
+
+
+def test_info_context_without_query_is_ignored(cli_chunked_db):
+    """--context without --query does not crash and produces no top_chunk."""
+    tmp_path, doc_a, _ = cli_chunked_db
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["info", "--ids", str(doc_a), "--context", "1000", "--json"],
+    )
+    assert result.exit_code == 0
+    paper = json.loads(result.output)["papers"][0]
+    assert "top_chunk" not in paper

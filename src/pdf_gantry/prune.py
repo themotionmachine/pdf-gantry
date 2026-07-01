@@ -15,6 +15,11 @@ def prune_missing(
     Cleans up: papers, paper_text, papers_fts, chunks, chunk_vec, paper_embeddings.
     Returns stats dict with pruned count, remaining count, and pruned filenames.
     """
+    if not papers_dir.is_dir():
+        raise FileNotFoundError(
+            f"papers_dir does not exist or is not a directory: {papers_dir}"
+        )
+
     rows = conn.execute("SELECT id, path, filename FROM papers").fetchall()
 
     missing = []

@@ -1,9 +1,59 @@
 """Shared test fixtures."""
 
-import pytest
+import unittest.mock
+
 import fitz  # PyMuPDF
+import pytest
 
 from pdf_gantry.db import get_connection
+
+
+class _StubModel:
+    """Zero-cost stand-in for SentenceTransformer — returns deterministic 768-d vectors.
+
+    Tests that verify DB-level contracts (DELETE-before-INSERT on vec0, quarantine
+    exclusion, pipeline orchestration) don't care whether vector values are real
+    embeddings. What they need is for the embed path to complete without crashing and
+    to write correctly-serializable bytes into the vec0 tables.
+
+    The real nomic-embed-text-v2-moe takes 11-17 s to load from disk. This stub
+    takes < 1 ms. The one test that validates the ImportError signal when the model
+    is genuinely absent (test_embed_documents_propagates_import_error) overrides
+    this fixture locally with a function that raises ImportError, so the session-level
+    stub does not shadow that contract.
+    """
+
+    DIM = 768
+
+    def encode(self, texts, show_progress_bar=False, **kwargs):
+        """Return a list of 768-element float lists (one per input string)."""
+        if isinstance(texts, str):
+            # embed_query passes a single string; return a flat vector.
+            return [0.01 * (i % 100) for i in range(self.DIM)]
+        return [[0.01 * (i % 100) for i in range(self.DIM)] for _ in texts]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _stub_embedding_model():
+    """Patch _get_embedding_model for the entire test session.
+
+    Without this patch the real ML model is loaded at least three times per run
+    (once cold, twice from OS page cache) contributing ~43 s of dead time to a
+    107-s suite. DB-level tests don't need real embeddings — they need vectors
+    of the right shape that serialize without error. The _StubModel above satisfies
+    that contract in < 1 ms per call.
+
+    Tests that explicitly probe the ImportError signal (e.g.
+    test_embed_documents_propagates_import_error) use function-scoped monkeypatch
+    to temporarily replace this stub with a raising callable for their own scope.
+    """
+    patcher = unittest.mock.patch(
+        "pdf_gantry.embeddings._get_embedding_model",
+        return_value=_StubModel(),
+    )
+    patcher.start()
+    yield
+    patcher.stop()
 
 
 @pytest.fixture
