@@ -12,7 +12,15 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
-from .utils import format_count, format_duration, format_pct, format_size, missing_ids, parse_ids
+from .utils import (
+    format_count,
+    format_duration,
+    format_pct,
+    format_size,
+    missing_ids,
+    parse_ids,
+    resolve_ids,
+)
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -60,6 +68,19 @@ def parse_ids_option(ctx, value, use_json, flag_name="--ids"):
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
         return None  # pragma: no cover - ctx.exit() raises SystemExit
+
+
+def _print_not_found(label, ids, ids_only):
+    """Print a ``label: ids`` diagnostic line, or nothing if ``ids`` is empty.
+
+    ``--ids-only`` output is a bare-ID stdout pipe; a diagnostic line there
+    would corrupt it for a consuming shell pipeline, so it's routed to
+    stderr instead of being silently dropped.
+    """
+    if not ids:
+        return
+    ids_str = ", ".join(str(i) for i in ids)
+    click.echo(f"  {label}: {ids_str}", err=ids_only)
 
 
 def filter_options(f):
@@ -720,6 +741,13 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     conn = get_connection(cfg.db_path)
     from .search import fts_search, hybrid_search, search_count
 
+    # Resolve --restrict-to-ids against `papers` up front rather than letting
+    # a bad id silently fall out of the search's WHERE id IN (...) clause —
+    # otherwise a stale/mistyped id and "nothing matched" look identical.
+    restrict_not_found: list[int] = []
+    if restrict_ids is not None:
+        restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
+
     # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
     use_hybrid = not fts_only
     # Track whether we fell back from hybrid to FTS due to missing embeddings.
@@ -776,9 +804,13 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
 
     if not results:
         if use_json:
-            click.echo(json.dumps({"query": query, "total": 0, "results": [], "mode": search_mode}))
+            click.echo(json.dumps({
+                "query": query, "total": 0, "results": [], "mode": search_mode,
+                "not_found": restrict_not_found,
+            }))
         else:
             click.echo(f'No results for "{query}"')
+            _print_not_found("Not in index", restrict_not_found, ids_only)
         ctx.exit(EXIT_NO_RESULTS)
         return
 
@@ -786,6 +818,9 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     if ids_only:
         for r in results:
             click.echo(r.id)
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+        if restrict_not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     # Lookup citekeys for result papers
@@ -828,9 +863,11 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
             "total": total,
             "mode": search_mode,
             "results": result_dicts,
+            "not_found": restrict_not_found,
         }, indent=2))
     else:
         click.echo(f'Found {total} results for "{query}"')
+        _print_not_found("Not in index", restrict_not_found, ids_only=False)
         click.echo()
         for i, r in enumerate(results, 1):
             ck = citekey_map.get(r.id)
@@ -844,6 +881,9 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
             if r.snippet:
                 click.echo(f"     \"{r.snippet}\"")
             click.echo()
+
+    if restrict_not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- queue ---
@@ -1134,6 +1174,13 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 
     conn = get_connection(cfg.db_path)
 
+    # Resolve --restrict-to-ids against `papers` up front rather than letting
+    # a bad id silently fall out of the search's WHERE id IN (...) clause —
+    # otherwise a stale/mistyped id and "nothing matched" look identical.
+    restrict_not_found: list[int] = []
+    if restrict_ids is not None:
+        restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
+
     # Use cascade search if chunk embeddings exist, unless --doc-only
     has_chunks = conn.execute(
         "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
@@ -1151,9 +1198,12 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 
     if not results:
         if use_json:
-            click.echo(json.dumps({"query": query, "total": 0, "results": []}))
+            click.echo(json.dumps({
+                "query": query, "total": 0, "results": [], "not_found": restrict_not_found,
+            }))
         else:
             click.echo(f'No results for "{query}"')
+            _print_not_found("Not in index", restrict_not_found, ids_only)
         ctx.exit(EXIT_NO_RESULTS)
         return
 
@@ -1161,6 +1211,9 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
     if ids_only:
         for r in results:
             click.echo(r.id)
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+        if restrict_not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if use_json:
@@ -1184,15 +1237,20 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
             "query": query,
             "total": len(results),
             "results": result_dicts,
+            "not_found": restrict_not_found,
         }, indent=2))
     else:
         click.echo(f'Found {len(results)} results for "{query}"')
+        _print_not_found("Not in index", restrict_not_found, ids_only=False)
         click.echo()
         for i, r in enumerate(results, 1):
             click.echo(f" {i:2d}. [{r.score:.4f}] {r.filename}")
             if r.snippet:
                 click.echo(f'     "{r.snippet[:100]}..."')
             click.echo()
+
+    if restrict_not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- embed ---
@@ -1507,17 +1565,33 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
     if threshold is not None:
         kwargs["threshold"] = threshold
     results = verify_documents(conn, **kwargs)
+
+    # --ids names specific papers to audit, but a requested id can miss for two
+    # different reasons: it doesn't exist at all (not_found), or it exists but
+    # isn't title-sourced metadata and so is outside verify's scope by design
+    # (skipped_ineligible, e.g. DOI- or filename-sourced). Collapsing the two
+    # would misreport a working filter as a corpus defect.
+    not_found: list[int] = []
+    skipped_ineligible: list[int] = []
+    if paper_ids is not None:
+        found, not_found = resolve_ids(conn, paper_ids)
+        checked_ids = {r.paper_id for r in results}
+        skipped_ineligible = [i for i in found if i not in checked_ids]
     conn.close()
 
     if not results:
         if use_json:
             click.echo(json.dumps({
                 "total": 0, "suspect_count": 0, "results": [],
+                "not_found": not_found, "skipped_ineligible": skipped_ineligible,
             }))
         elif ids_only:
-            pass
+            _print_not_found("Not in index", not_found, ids_only=True)
+            _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=True)
         else:
             click.echo("Nothing to verify (no title-sourced metadata matches found)")
+            _print_not_found("Not in index", not_found, ids_only=False)
+            _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=False)
         ctx.exit(EXIT_NO_RESULTS)
         return
 
@@ -1526,7 +1600,9 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
     if ids_only:
         for r in suspects:
             click.echo(r.paper_id)
-        if suspects:
+        _print_not_found("Not in index", not_found, ids_only=True)
+        _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=True)
+        if suspects or not_found or skipped_ineligible:
             ctx.exit(EXIT_PARTIAL)
         return
 
@@ -1535,6 +1611,8 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
             "total": len(results),
             "suspect_count": len(suspects),
             "threshold": threshold if threshold is not None else SUSPECT_THRESHOLD,
+            "not_found": not_found,
+            "skipped_ineligible": skipped_ineligible,
             "results": [
                 {
                     "paper_id": r.paper_id,
@@ -1552,12 +1630,14 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
             f"Checked {format_count(len(results))} title-sourced matches: "
             f"{format_count(len(suspects))} suspect"
         )
+        _print_not_found("Not in index", not_found, ids_only=False)
+        _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=False)
         for r in suspects:
             click.echo(f"  [{r.paper_id}] {r.filename} (similarity={r.similarity:.2f})")
             click.echo(f"    stored:    {r.stored_title!r}")
             click.echo(f"    extracted: {r.extracted_title_guess!r}")
 
-    if suspects:
+    if suspects or not_found or skipped_ineligible:
         ctx.exit(EXIT_PARTIAL)
 
 

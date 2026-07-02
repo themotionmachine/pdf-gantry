@@ -204,3 +204,101 @@ def test_semantic_ids_only_and_restrict(cli_corpus):
     assert result.exit_code == 0
     ids = {int(ln) for ln in result.output.splitlines() if ln.strip()}
     assert ids == {b, c}
+
+
+# --- CLI: --restrict-to-ids reports unresolved IDs instead of silently dropping them ---
+#
+# A bad ID in --restrict-to-ids used to just shrink the search's candidate set with
+# no signal -- indistinguishable from "your scope was fine but nothing matched."
+# resolve_ids() (utils.py) now splits the requested set into found/not_found up
+# front, mirroring the not_found convention info/ocr/retry already use for --ids.
+
+
+def test_search_restrict_to_ids_reports_not_found(cli_corpus):
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["search", "climate", "--fts", "--restrict-to-ids", f"{a},{bogus}", "--json"]
+    )
+    payload = json.loads(result.output)
+    assert payload["not_found"] == [bogus]
+    assert {r["id"] for r in payload["results"]} == {a}
+    assert result.exit_code == 3  # EXIT_PARTIAL: real results, but scope had a bad id
+
+
+def test_search_restrict_to_ids_all_valid_not_found_empty(cli_corpus):
+    tmp_path, a, b, c = cli_corpus
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["search", "climate", "--fts", "--restrict-to-ids", f"{a},{b}", "--json"]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["not_found"] == []
+
+
+def test_search_restrict_to_ids_not_found_plain_text(cli_corpus):
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["search", "climate", "--fts", "--restrict-to-ids", f"{a},{bogus}"]
+    )
+    assert "Not in index" in result.output
+    assert str(bogus) in result.output
+    assert result.exit_code == 3
+
+
+def test_search_restrict_to_ids_all_missing_exits_no_results(cli_corpus):
+    """When every restrict-to-ids id is bogus, it's a no-results run, not a partial one."""
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["search", "climate", "--fts", "--restrict-to-ids", str(bogus), "--json"]
+    )
+    assert result.exit_code == 2  # EXIT_NO_RESULTS
+    payload = json.loads(result.output)
+    assert payload["not_found"] == [bogus]
+
+
+def test_search_ids_only_reports_not_found_to_stderr(cli_corpus):
+    """--ids-only is a pure stdout pipe; not_found goes to stderr, not stdout."""
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["search", "climate", "--fts", "--restrict-to-ids", f"{a},{bogus}", "--ids-only"]
+    )
+    ids = [int(ln) for ln in result.stdout.splitlines() if ln.strip()]
+    assert ids == [a]
+    assert str(bogus) in result.stderr
+    assert result.exit_code == 3
+
+
+def test_semantic_restrict_to_ids_reports_not_found(cli_corpus):
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["semantic", "climate", "--doc-only", "--restrict-to-ids", f"{a},{bogus}", "--json"]
+    )
+    payload = json.loads(result.output)
+    assert payload["not_found"] == [bogus]
+    assert {r["id"] for r in payload["results"]} == {a}
+    assert result.exit_code == 3
+
+
+def test_semantic_ids_only_reports_not_found_to_stderr(cli_corpus):
+    tmp_path, a, b, c = cli_corpus
+    bogus = max(a, b, c) + 1000
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["semantic", "climate", "--doc-only", "--restrict-to-ids", f"{a},{bogus}", "--ids-only"],
+    )
+    ids = [int(ln) for ln in result.stdout.splitlines() if ln.strip()]
+    assert ids == [a]
+    assert str(bogus) in result.stderr
+    assert result.exit_code == 3

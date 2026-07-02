@@ -278,3 +278,112 @@ def test_cli_verify_scoped_by_ids_flag(tmp_path, monkeypatch):
     data = json.loads(result.output)
     assert data["total"] == 1
     assert data["results"][0]["paper_id"] == 1
+
+
+# --- CLI: --ids reports IDs that don't exist vs. exist but aren't title-sourced ---
+#
+# verify --ids is doubly ambiguous compared to info/ocr/retry's --ids: a requested
+# id that doesn't show up in results might not exist at all (not_found), or it might
+# exist but be DOI/filename-sourced and so outside verify's scope by design
+# (skipped_ineligible) -- not a data problem. Collapsing the two would misreport a
+# working filter as a corpus defect.
+
+
+def test_cli_verify_ids_reports_not_found(tmp_path, monkeypatch):
+    conn = get_connection(str(tmp_path / "index.db"))
+    _seed_paper(
+        conn, 1, title="Deep Learning for Natural Language Processing",
+        metadata_source="openalex_title",
+        raw_text="Deep Learning for Natural Language Processing\nAbstract: we present...",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["verify", "--ids", "1,999", "--json"])
+    data = json.loads(result.output)
+    assert data["not_found"] == [999]
+    assert data["skipped_ineligible"] == []
+    assert data["total"] == 1
+    assert result.exit_code == 3  # EXIT_PARTIAL: real results, but one requested id missing
+
+
+def test_cli_verify_ids_reports_skipped_ineligible(tmp_path, monkeypatch):
+    conn = get_connection(str(tmp_path / "index.db"))
+    _seed_paper(
+        conn, 1, title="Deep Learning for Natural Language Processing",
+        metadata_source="openalex_title",
+        raw_text="Deep Learning for Natural Language Processing\nAbstract: we present...",
+    )
+    _seed_paper(
+        conn, 2, title="DOI Sourced", metadata_source="openalex_doi",
+        raw_text="DOI Sourced\nbody",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["verify", "--ids", "1,2", "--json"])
+    data = json.loads(result.output)
+    assert data["not_found"] == []
+    assert data["skipped_ineligible"] == [2]
+    assert data["total"] == 1
+    assert result.exit_code == 3
+
+
+def test_cli_verify_ids_all_unresolved_exits_no_results(tmp_path, monkeypatch):
+    """A requested id that's DOI-sourced and one that doesn't exist -- zero checked."""
+    conn = get_connection(str(tmp_path / "index.db"))
+    _seed_paper(
+        conn, 2, title="DOI Sourced", metadata_source="openalex_doi",
+        raw_text="DOI Sourced\nbody",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["verify", "--ids", "2,999", "--json"])
+    assert result.exit_code == 2  # EXIT_NO_RESULTS
+    data = json.loads(result.output)
+    assert data["not_found"] == [999]
+    assert data["skipped_ineligible"] == [2]
+
+
+def test_cli_verify_ids_all_resolved_no_diagnostic_fields_populated(tmp_path, monkeypatch):
+    conn = get_connection(str(tmp_path / "index.db"))
+    _seed_paper(
+        conn, 1, title="Deep Learning for Natural Language Processing",
+        metadata_source="openalex_title",
+        raw_text="Deep Learning for Natural Language Processing\nAbstract: we present...",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["verify", "--ids", "1", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["not_found"] == []
+    assert data["skipped_ineligible"] == []
+
+
+def test_cli_verify_ids_only_reports_unresolved_to_stderr(tmp_path, monkeypatch):
+    conn = get_connection(str(tmp_path / "index.db"))
+    _seed_paper(
+        conn, 1, title="Deep Learning for Natural Language Processing",
+        metadata_source="openalex_title",
+        raw_text="Introduction to Statistical Mechanics\nbody",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["verify", "--ids", "1,999", "--ids-only"])
+    assert result.stdout.strip() == "1"
+    assert "999" in result.stderr
+    assert result.exit_code == 3

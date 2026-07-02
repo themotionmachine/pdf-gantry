@@ -1,6 +1,7 @@
 """Shared utilities: hashing, formatting, helpers."""
 
 import hashlib
+import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -102,3 +103,35 @@ def missing_ids(requested: list[int], found: Iterable[int]) -> list[int]:
             out.append(i)
             seen.add(i)
     return out
+
+
+def resolve_ids(
+    conn: sqlite3.Connection, requested: list[int]
+) -> tuple[list[int], list[int]]:
+    """Split ``requested`` paper IDs into those present in ``papers`` and those not.
+
+    Runs one existence query up front rather than letting a downstream
+    ``WHERE id IN (...)`` silently filter out unresolved IDs — the same
+    caller-composes-commands failure mode ``missing_ids`` closes for
+    fetch-target commands (``info``/``ocr``/``retry``), applied here to
+    scoping-filter commands (``search``/``semantic --restrict-to-ids``,
+    ``verify --ids``) where a bad ID would otherwise just shrink the
+    candidate set with no signal.
+
+    Both ``found`` and ``not_found`` preserve order of first appearance in
+    ``requested``, with duplicates collapsed.
+
+    Examples::
+
+        resolve_ids(conn, [1, 2, 999])  -> ([1, 2], [999])
+    """
+    if not requested:
+        return [], []
+    placeholders = ",".join("?" * len(requested))
+    rows = conn.execute(
+        f"SELECT id FROM papers WHERE id IN ({placeholders})", requested
+    ).fetchall()
+    existing = {row["id"] for row in rows}
+    not_found = missing_ids(requested, existing)
+    found = [i for i in dict.fromkeys(requested) if i in existing]
+    return found, not_found
