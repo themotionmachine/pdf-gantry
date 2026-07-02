@@ -24,24 +24,40 @@ def classify_document(pdf_path: Path, scan_threshold: float = 0.05) -> str:
     except Exception:
         return "digital"  # default if we can't open
 
-    if doc.page_count == 0:
-        doc.close()
-        return "digital"
+    try:
+        if doc.page_count == 0:
+            return "digital"
 
-    ratios = []
-    for page in doc:
-        page_area = page.rect.width * page.rect.height
-        if page_area == 0:
-            ratios.append(0.0)
-            continue
-        blocks = page.get_text("blocks")
-        text_area = sum(
-            (b[2] - b[0]) * (b[3] - b[1])
-            for b in blocks
-            if b[6] == 0  # type 0 = text block
-        )
-        ratios.append(text_area / page_area)
-    doc.close()
+        # fitz.open() succeeds on a password-protected PDF without raising —
+        # it only throws once page content is touched without authenticating.
+        # A locked PDF (DRM'd publisher export, accidentally-encrypted
+        # download) is unreadable to us either way, so treat it the same as
+        # any other file we can't classify rather than letting it escape and
+        # abort the whole ingest run.
+        if doc.needs_pass:
+            return "digital"
+
+        ratios = []
+        try:
+            for page in doc:
+                page_area = page.rect.width * page.rect.height
+                if page_area == 0:
+                    ratios.append(0.0)
+                    continue
+                blocks = page.get_text("blocks")
+                text_area = sum(
+                    (b[2] - b[0]) * (b[3] - b[1])
+                    for b in blocks
+                    if b[6] == 0  # type 0 = text block
+                )
+                ratios.append(text_area / page_area)
+        except Exception:
+            # Some other decode failure surfaced mid-document (corrupt page,
+            # unsupported filter). Same fallback as "can't open" — don't let
+            # one bad page take down the batch.
+            return "digital"
+    finally:
+        doc.close()
 
     if not ratios:
         return "digital"
@@ -55,17 +71,25 @@ def classify_document(pdf_path: Path, scan_threshold: float = 0.05) -> str:
         return "mixed"
 
 
-def _get_pdf_metadata(pdf_path: Path) -> tuple[int | None, str]:
-    """Get page count and classification for a PDF."""
+def _get_pdf_metadata(pdf_path: Path) -> tuple[int | None, str, bool]:
+    """Get page count, classification, and encrypted flag for a PDF.
+
+    needs_pass is read off the same fitz.open() used for page_count — it's
+    reliable to check before any page content is touched (unlike
+    classify_document's own open, which is a separate handle), so this is a
+    free byproduct rather than an extra file open.
+    """
     try:
         doc = fitz.open(str(pdf_path))
         page_count = doc.page_count
+        is_encrypted = bool(doc.needs_pass)
         doc.close()
     except Exception:
         page_count = None
+        is_encrypted = False
 
     classification = classify_document(pdf_path)
-    return page_count, classification
+    return page_count, classification, is_encrypted
 
 
 def _fast_path_match(conn: sqlite3.Connection, rel_path: str, size: int, mtime: str) -> bool:
@@ -147,7 +171,7 @@ def ingest_directory(
                 # Content changed - reset processing flags
                 stats.changed += 1
                 if not dry_run:
-                    page_count, classification = _get_pdf_metadata(pdf_path)
+                    page_count, classification, is_encrypted = _get_pdf_metadata(pdf_path)
                     is_scanned = (
                         1 if classification == "scanned"
                         else (0 if classification == "digital" else None)
@@ -157,17 +181,18 @@ def ingest_directory(
                         """UPDATE papers SET
                             file_hash = ?, file_size = ?, file_modified = ?,
                             page_count = ?, is_scanned = ?, needs_ocr = ?,
+                            is_encrypted = ?,
                             has_text = 0, has_markdown = 0, has_embeddings = 0,
                             updated_at = ?
                         WHERE id = ?""",
                         (fhash, size, mtime, page_count, is_scanned, needs_ocr,
-                         now_iso(), row["id"]),
+                         int(is_encrypted), now_iso(), row["id"]),
                     )
         else:
             # New file
             stats.new += 1
             if not dry_run:
-                page_count, classification = _get_pdf_metadata(pdf_path)
+                page_count, classification, is_encrypted = _get_pdf_metadata(pdf_path)
                 is_scanned = (
                     1 if classification == "scanned"
                     else (0 if classification == "digital" else None)
@@ -177,10 +202,11 @@ def ingest_directory(
                 conn.execute(
                     """INSERT INTO papers (
                         path, filename, file_hash, file_size, file_modified,
-                        page_count, is_scanned, needs_ocr, indexed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        page_count, is_scanned, needs_ocr, is_encrypted,
+                        indexed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (rel_path, pdf_path.name, fhash, size, mtime,
-                     page_count, is_scanned, needs_ocr, now, now),
+                     page_count, is_scanned, needs_ocr, int(is_encrypted), now, now),
                 )
 
         if progress_callback:

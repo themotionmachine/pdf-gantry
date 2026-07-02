@@ -1,6 +1,8 @@
 """Shared utilities: hashing, formatting, helpers."""
 
 import hashlib
+import sqlite3
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -69,3 +71,67 @@ def parse_ids(s: str) -> list[int]:
     """
     parts = [x.strip() for x in s.split(",")]
     return [int(p) for p in parts if p]
+
+
+def missing_ids(requested: list[int], found: Iterable[int]) -> list[int]:
+    """IDs in ``requested`` that are absent from ``found``.
+
+    Preserves the order of first appearance in ``requested`` and drops
+    duplicates. ``found`` may be any iterable of IDs actually resolved by a
+    lookup (a set, list, or dict of DB rows).
+
+    This exists to close a composition gap: when a caller pipes an ID set
+    from one command (e.g. ``search --ids-only``) into another (e.g.
+    ``info --ids``), some IDs may no longer resolve — a paper was pruned,
+    a digit was mistyped, the ID set is from a stale snapshot. Without this,
+    the callee just returns fewer results than requested and says nothing;
+    the caller has no way to know a drop happened without diffing the sets
+    itself. ``missing_ids`` makes that diff a shared, tested primitive
+    instead of an inline afterthought (or an omission) in each command.
+
+    Examples::
+
+        missing_ids([1, 2, 3], {1, 3})  -> [2]
+        missing_ids([5, 2, 9], {2})     -> [5, 9]   # request order preserved
+        missing_ids([4, 4], set())      -> [4]      # duplicates collapsed
+    """
+    found_set = set(found)
+    seen: set[int] = set()
+    out = []
+    for i in requested:
+        if i not in found_set and i not in seen:
+            out.append(i)
+            seen.add(i)
+    return out
+
+
+def resolve_ids(
+    conn: sqlite3.Connection, requested: list[int]
+) -> tuple[list[int], list[int]]:
+    """Split ``requested`` paper IDs into those present in ``papers`` and those not.
+
+    Runs one existence query up front rather than letting a downstream
+    ``WHERE id IN (...)`` silently filter out unresolved IDs — the same
+    caller-composes-commands failure mode ``missing_ids`` closes for
+    fetch-target commands (``info``/``ocr``/``retry``), applied here to
+    scoping-filter commands (``search``/``semantic --restrict-to-ids``,
+    ``verify --ids``) where a bad ID would otherwise just shrink the
+    candidate set with no signal.
+
+    Both ``found`` and ``not_found`` preserve order of first appearance in
+    ``requested``, with duplicates collapsed.
+
+    Examples::
+
+        resolve_ids(conn, [1, 2, 999])  -> ([1, 2], [999])
+    """
+    if not requested:
+        return [], []
+    placeholders = ",".join("?" * len(requested))
+    rows = conn.execute(
+        f"SELECT id FROM papers WHERE id IN ({placeholders})", requested
+    ).fetchall()
+    existing = {row["id"] for row in rows}
+    not_found = missing_ids(requested, existing)
+    found = [i for i in dict.fromkeys(requested) if i in existing]
+    return found, not_found

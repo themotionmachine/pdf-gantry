@@ -155,6 +155,31 @@ def papers_dir(tmp_path, sample_pdf):
 
 
 @pytest.fixture
+def encrypted_pdf(tmp_path):
+    """Creates a user-password-protected PDF (needs_pass=1).
+
+    PyMuPDF's fitz.open() does *not* raise on a file like this — it opens
+    successfully and reports a nonzero page_count. The ValueError only
+    surfaces later, the first time code touches page content (page.rect,
+    page.get_text()) without having authenticated. This is exactly the shape
+    of PDF a real ~2000-file academic corpus can contain: a DRM'd publisher
+    export or an accidentally-locked download.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "you cannot read this without a password")
+    pdf_path = tmp_path / "locked.pdf"
+    doc.save(
+        str(pdf_path),
+        encryption=fitz.PDF_ENCRYPT_AES_256,
+        user_pw="secret",
+        owner_pw="owner",
+    )
+    doc.close()
+    return pdf_path
+
+
+@pytest.fixture
 def config_dir(tmp_path):
     """Provides a temporary config directory."""
     d = tmp_path / "config"

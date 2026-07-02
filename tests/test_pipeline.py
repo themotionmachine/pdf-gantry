@@ -1,6 +1,8 @@
 """Tests for the pipeline (sync) command."""
 
 
+import shutil
+
 from pdf_gantry.db import get_connection
 from pdf_gantry.pipeline import run_pipeline
 
@@ -17,6 +19,35 @@ def test_pipeline_ingests_and_processes(tmp_path, papers_dir):
     # Chunks should be generated
     chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     assert chunk_count > 0
+    conn.close()
+
+
+def test_pipeline_full_sweep_skips_encrypted_paper(tmp_path, papers_dir, encrypted_pdf):
+    """The default full-corpus sweep (no filename given) ingests an encrypted
+    PDF but doesn't hand it to process_documents — it's flagged is_encrypted
+    at ingest time and there's nothing process/extract can do with it.
+
+    Guards the copy of the default-selection query duplicated in
+    pipeline.py's full-sweep branch (separate from process.py's own copy).
+    """
+    shutil.copy(encrypted_pdf, papers_dir / "locked.pdf")
+
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+
+    stats = run_pipeline(conn, papers_dir, db_path, workers=1)
+
+    # 3 files ingested (2 normal + 1 locked); only the 2 normal ones processed.
+    assert stats["ingested"] == 3
+    assert stats["processed"] == 2
+
+    locked_row = conn.execute(
+        "SELECT has_text, error_count FROM papers WHERE filename = 'locked.pdf'"
+    ).fetchone()
+    assert locked_row["has_text"] == 0
+    assert locked_row["error_count"] == 0, (
+        "encrypted paper should be skipped up front, not attempted and failed"
+    )
     conn.close()
 
 

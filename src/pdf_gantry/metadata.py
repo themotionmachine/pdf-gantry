@@ -1,5 +1,6 @@
 """Semantic Scholar API integration for metadata enrichment."""
 
+import difflib
 import json
 import re
 import sqlite3
@@ -10,8 +11,108 @@ from .utils import now_iso
 
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
 
+_TITLE_NORMALIZE_RE = re.compile(r'[^a-z0-9\s]')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+# Below this similarity, a title-search-sourced metadata match is flagged
+# `metadata_suspect` — the stored title doesn't resemble what's actually on
+# the PDF's first page closely enough to trust the DOI/authors/year that
+# rode in with it. Calibrated loosely (SequenceMatcher ratio, not a strict
+# edit distance): distinguishing titles score well above this; an unrelated
+# title lands well below it.
+SUSPECT_THRESHOLD = 0.55
+
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper"
 FIELDS = "title,authors,year,abstract,citationCount,influentialCitationCount,externalIds"
+
+
+# Fields `enrich_documents` populates from a provider. `metadata_enriched_at`
+# being set does NOT mean these are filled in -- a paper matched by title
+# (no DOI exists) or one whose provider has no abstract on file still gets
+# marked "enriched", and every filter in queue.py (`needs metadata`) only
+# looks at `doi IS NULL OR metadata_enriched_at IS NULL`. Once enrichment has
+# run once, a permanently-incomplete paper is invisible to every existing
+# command. field_completeness()/gap_ids() exist to make that gap visible.
+GAP_FIELDS = ("title", "authors", "year", "abstract", "doi")
+
+_FIELD_EMPTY_SQL = {
+    "title": "(title IS NULL OR title = '')",
+    # authors is a JSON-encoded list; '[]' is non-NULL but zero authors.
+    "authors": "(authors IS NULL OR authors = '' OR authors = '[]')",
+    "year": "(year IS NULL)",
+    "abstract": "(abstract IS NULL OR abstract = '')",
+    "doi": "(doi IS NULL OR doi = '')",
+}
+
+
+def _check_fields(fields: list[str]) -> None:
+    unknown = [f for f in fields if f not in _FIELD_EMPTY_SQL]
+    if unknown:
+        raise ValueError(
+            f"Unknown metadata field(s): {', '.join(unknown)}. "
+            f"Valid fields: {', '.join(GAP_FIELDS)}"
+        )
+
+
+def field_completeness(
+    conn: sqlite3.Connection, fields: list[str] | None = None
+) -> dict:
+    """Per-field metadata completeness across the whole corpus.
+
+    For each field, splits the gap into:
+      - ``never_attempted``: enrichment has never run for this paper
+        (``metadata_enriched_at IS NULL``) -- the ordinary, expected gap.
+      - ``attempted_incomplete``: enrichment ran and the field is *still*
+        empty. Re-running ``enrich`` with the same provider won't fix
+        these -- the provider simply doesn't have the data (or the paper
+        was matched by title with no DOI to find). These are the gaps
+        that look identical to "done" everywhere else in gantry.
+    """
+    fields = list(fields) if fields is not None else list(GAP_FIELDS)
+    _check_fields(fields)
+
+    total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    field_stats = {}
+    for field in fields:
+        empty = _FIELD_EMPTY_SQL[field]
+        row = conn.execute(
+            f"""SELECT
+                SUM(CASE WHEN {empty} THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {empty} AND metadata_enriched_at IS NULL
+                    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {empty} AND metadata_enriched_at IS NOT NULL
+                    THEN 1 ELSE 0 END)
+            FROM papers"""
+        ).fetchone()
+        missing = row[0] or 0
+        never_attempted = row[1] or 0
+        attempted_incomplete = row[2] or 0
+        field_stats[field] = {
+            "missing": missing,
+            "never_attempted": never_attempted,
+            "attempted_incomplete": attempted_incomplete,
+            "complete": total - missing,
+        }
+    return {"total": total, "fields": field_stats}
+
+
+def gap_ids(
+    conn: sqlite3.Connection, field: str, attempted_only: bool = False
+) -> list[int]:
+    """Paper IDs missing ``field``, sorted ascending.
+
+    With ``attempted_only=True``, scopes to papers where enrichment already
+    ran and still left the field empty -- the silent-failure bucket that
+    ``queue --needs metadata`` never re-surfaces. Chain straight into
+    ``gantry info --ids`` or ``gantry enrich --ids`` (via a different
+    ``--provider``) without round-tripping full JSON through an agent.
+    """
+    _check_fields([field])
+    where = _FIELD_EMPTY_SQL[field]
+    if attempted_only:
+        where += " AND metadata_enriched_at IS NOT NULL"
+    rows = conn.execute(f"SELECT id FROM papers WHERE {where} ORDER BY id").fetchall()
+    return [r[0] for r in rows]
 
 
 @dataclass
@@ -277,3 +378,114 @@ def enrich_documents(
     conn.commit()
     stats.elapsed_seconds = round(time.time() - start, 1)
     return stats
+
+
+# ---------------------------------------------------------------------------
+# gantry verify — auditing title-search-sourced metadata matches
+#
+# enrich_documents() above has three fallback tiers: DOI (exact), filename
+# (author-surname + year heuristic), and title search (fuzzy text query,
+# top-result-wins). The first two are effectively unambiguous. Title search
+# is not: querying OpenAlex or Semantic Scholar with a generic or truncated
+# title guess (see _extract_title_from_text) can return a plausible-looking
+# but *wrong* paper, and nothing before this module ever checked. The wrong
+# title/authors/year/DOI then gets written back with full confidence and
+# `metadata_enriched_at` set, so the paper never gets re-attempted either.
+#
+# verify_documents() re-derives the title actually printed on the PDF and
+# compares it against what got stored, for every paper whose metadata came
+# from a title search. Low-similarity matches are flagged `metadata_suspect`
+# in the papers table (queryable via `queue --is metadata-suspect`) so the
+# mismatch becomes a fact an agent can find and act on, not a silent one.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VerifyResult:
+    """The verdict for one title-search-sourced metadata match."""
+    paper_id: int
+    filename: str
+    stored_title: str | None
+    extracted_title_guess: str | None
+    similarity: float
+    suspect: bool
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for comparison."""
+    t = title.lower()
+    t = _TITLE_NORMALIZE_RE.sub(" ", t)
+    t = _WHITESPACE_RE.sub(" ", t).strip()
+    return t
+
+
+def title_similarity(a: str | None, b: str | None) -> float:
+    """Similarity ratio in [0.0, 1.0] between two titles, format-insensitive.
+
+    Returns 0.0 if either title is missing or empty — there's nothing to
+    compare, and an absent title should never read as a confident match.
+    """
+    if not a or not b:
+        return 0.0
+    na, nb = _normalize_title(a), _normalize_title(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def verify_documents(
+    conn: sqlite3.Connection,
+    paper_ids: list[int] | None = None,
+    threshold: float = SUSPECT_THRESHOLD,
+    limit: int | None = None,
+) -> list[VerifyResult]:
+    """Audit title-search-sourced metadata against each PDF's own extracted title.
+
+    Scoped to papers whose ``metadata_source`` ends in ``_title`` (the only
+    fallback tier that involved an unverified fuzzy match) — DOI and
+    filename-sourced matches are exact by construction and are skipped.
+
+    Persists the verdict to ``metadata_suspect`` / ``metadata_verify_score`` /
+    ``metadata_verified_at`` on each checked paper, and returns results
+    ordered by ascending similarity so the worst mismatches surface first.
+    """
+    query = """SELECT p.id, p.filename, p.title, pt.raw_text
+        FROM papers p
+        LEFT JOIN paper_text pt ON pt.paper_id = p.id
+        WHERE p.metadata_source LIKE '%\\_title' ESCAPE '\\'"""
+    params: list = []
+
+    if paper_ids is not None:
+        placeholders = ",".join("?" * len(paper_ids))
+        query += f" AND p.id IN ({placeholders})"
+        params.extend(paper_ids)
+
+    rows = conn.execute(query, params).fetchall()
+    if limit:
+        rows = rows[:limit]
+
+    results = []
+    now = now_iso()
+    for row in rows:
+        raw_text = row["raw_text"] or ""
+        extracted_guess = _extract_title_from_text(raw_text) if raw_text else None
+        similarity = title_similarity(row["title"], extracted_guess)
+        suspect = similarity < threshold
+
+        results.append(VerifyResult(
+            paper_id=row["id"],
+            filename=row["filename"],
+            stored_title=row["title"],
+            extracted_title_guess=extracted_guess,
+            similarity=round(similarity, 4),
+            suspect=suspect,
+        ))
+
+        conn.execute(
+            "UPDATE papers SET metadata_suspect = ?, metadata_verify_score = ?, "
+            "metadata_verified_at = ? WHERE id = ?",
+            (int(suspect), similarity, now, row["id"]),
+        )
+
+    conn.commit()
+    results.sort(key=lambda r: r.similarity)
+    return results

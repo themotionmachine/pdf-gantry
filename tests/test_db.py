@@ -7,7 +7,7 @@ import sqlite_vec
 
 from pdf_gantry.db import SCHEMA_VERSION, get_connection, get_schema_version
 
-assert SCHEMA_VERSION == 4, "Update tests if schema version changes"
+assert SCHEMA_VERSION == 6, "Update tests if schema version changes"
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +233,117 @@ def test_citekey_index_exists(tmp_db):
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_papers_citekey'"
     ).fetchone()
     assert row is not None
+
+
+def test_metadata_suspect_columns_exist(tmp_db):
+    """papers table has metadata_suspect, metadata_verify_score, metadata_verified_at (schema v5).
+
+    These back `gantry verify`: the title-search fallback in enrich_documents()
+    accepts the top API result with no confidence check, so a wrong-paper match
+    can silently overwrite title/authors/year/DOI. verify_documents() re-checks
+    title-sourced matches against the extracted PDF text and persists the
+    verdict here so it survives past a single command invocation and is
+    filterable via `queue --is metadata-suspect`.
+    """
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    tmp_db.commit()
+    row = tmp_db.execute(
+        "SELECT metadata_suspect, metadata_verify_score, metadata_verified_at "
+        "FROM papers WHERE path = 'test.pdf'"
+    ).fetchone()
+    assert row["metadata_suspect"] == 0
+    assert row["metadata_verify_score"] is None
+    assert row["metadata_verified_at"] is None
+
+
+def test_metadata_suspect_index_exists(tmp_db):
+    """Index on metadata_suspect column exists (schema v5)."""
+    row = tmp_db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_papers_metadata_suspect'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_is_encrypted_column_exists(tmp_db):
+    """papers table has an is_encrypted column (schema v6).
+
+    classify_document() already detects a password-protected PDF (needs_pass)
+    at ingest time, but Round 2's fix folded that fact into the ordinary
+    'digital' classification with no separate signal — a locked PDF and a
+    normal one look identical everywhere downstream. is_encrypted makes the
+    fact queryable (`queue --is encrypted`) instead of silently absorbed.
+    """
+    tmp_db.execute(
+        "INSERT INTO papers (path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at) "
+        "VALUES ('test.pdf', 'test.pdf', 'abc123', 1000, '2024-01-01', '2024-01-01', '2024-01-01')"
+    )
+    tmp_db.commit()
+    row = tmp_db.execute(
+        "SELECT is_encrypted FROM papers WHERE path = 'test.pdf'"
+    ).fetchone()
+    assert row["is_encrypted"] == 0
+
+
+def test_schema_convergence_is_encrypted(tmp_path):
+    """Init path and migration path from v1 agree on the is_encrypted column."""
+    fresh_db = tmp_path / "fresh.db"
+    conn_fresh = get_connection(str(fresh_db))
+    fresh_col = next(
+        (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_fresh.execute("PRAGMA table_info(papers)")
+        if row["name"] == "is_encrypted"
+    )
+    conn_fresh.close()
+
+    v1_db = tmp_path / "v1.db"
+    _make_v1_db(v1_db)
+    conn_migrated = get_connection(str(v1_db))
+    migrated_col = next(
+        (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_migrated.execute("PRAGMA table_info(papers)")
+        if row["name"] == "is_encrypted"
+    )
+    conn_migrated.close()
+
+    assert fresh_col == migrated_col, (
+        "Init path and migration path produced different is_encrypted columns.\n"
+        f"Fresh:    {fresh_col}\n"
+        f"Migrated: {migrated_col}"
+    )
+
+
+def test_schema_convergence_metadata_suspect(tmp_path):
+    """Init path and migration path from v1 agree on the metadata_suspect column set."""
+    fresh_db = tmp_path / "fresh.db"
+    conn_fresh = get_connection(str(fresh_db))
+    fresh_cols = {
+        row["name"]: (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_fresh.execute("PRAGMA table_info(papers)")
+        if row["name"] in ("metadata_suspect", "metadata_verify_score", "metadata_verified_at")
+    }
+    conn_fresh.close()
+
+    v1_db = tmp_path / "v1.db"
+    _make_v1_db(v1_db)
+    conn_migrated = get_connection(str(v1_db))
+    migrated_cols = {
+        row["name"]: (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+        for row in conn_migrated.execute("PRAGMA table_info(papers)")
+        if row["name"] in ("metadata_suspect", "metadata_verify_score", "metadata_verified_at")
+    }
+    conn_migrated.close()
+
+    assert set(fresh_cols) == {"metadata_suspect", "metadata_verify_score", "metadata_verified_at"}
+    assert fresh_cols == migrated_cols, (
+        "Init path and migration path produced different metadata_suspect columns.\n"
+        f"Fresh:    {fresh_cols}\n"
+        f"Migrated: {migrated_cols}"
+    )
 
 
 def test_idempotent_connection(tmp_path):

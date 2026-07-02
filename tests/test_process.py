@@ -130,6 +130,74 @@ def test_chunks_generated_after_processing(tmp_path, papers_dir):
     conn.close()
 
 
+# --- Default selection must not retry known-unreadable (encrypted) papers ---
+
+
+def test_default_selection_skips_encrypted_papers(tmp_path):
+    """process_documents(paper_ids=None) — the default 'needs text' sweep —
+    must not select a paper flagged is_encrypted at ingest time.
+
+    classify_document() reports a password-protected PDF as "digital"
+    (Round 2's fix), so is_scanned alone doesn't exclude it. Without this,
+    a locked PDF gets re-attempted on every default sweep, failing
+    extraction every time, until it exhausts the quarantine retry cap —
+    burning cycles to rediscover a fact ingest already knew.
+    """
+    db_path = tmp_path / "test.db"
+    conn = get_connection(str(db_path))
+    conn.execute(
+        "INSERT INTO papers (id, path, filename, file_hash, file_size, "
+        "file_modified, indexed_at, updated_at, has_text, is_encrypted) "
+        "VALUES (1, 'locked.pdf', 'locked.pdf', 'h1', 1, '2026-01-01', "
+        "'2026-01-01', '2026-01-01', 0, 1)"
+    )
+    conn.commit()
+
+    stats = process_documents(conn, tmp_path, db_path, workers=1)
+
+    assert stats.total == 0
+    conn.close()
+
+
+def test_cli_process_default_sweep_skips_encrypted(
+    tmp_path, papers_dir, encrypted_pdf, monkeypatch
+):
+    """`gantry process` with no explicit filters (the real default sweep) must
+    not select an encrypted paper — closing the seam one layer up from
+    build_filter_query: the CLI's default_select branch has to actually pass
+    exclude_encrypted through, not just the lower-level function support it.
+    """
+    import shutil
+
+    from click.testing import CliRunner
+
+    from pdf_gantry.cli import cli
+
+    shutil.copy(encrypted_pdf, papers_dir / "locked.pdf")
+
+    db_path = tmp_path / "index.db"
+    conn = get_connection(str(db_path))
+    ingest_directory(conn, papers_dir)
+    conn.close()
+
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(papers_dir))
+
+    result = CliRunner().invoke(cli, ["process", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    # Only the 2 normal papers are selected — the locked one is excluded,
+    # not attempted-and-failed.
+    assert data["total"] == 2
+
+    conn2 = get_connection(str(db_path))
+    locked_row = conn2.execute(
+        "SELECT error_count FROM papers WHERE filename = 'locked.pdf'"
+    ).fetchone()
+    assert locked_row["error_count"] == 0
+    conn2.close()
+
+
 # --- Re-processing correctness: --force selection + stale-artifact cleanup ---
 
 

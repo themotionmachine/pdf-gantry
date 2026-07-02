@@ -12,7 +12,15 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
-from .utils import format_count, format_duration, format_pct, format_size, parse_ids
+from .utils import (
+    format_count,
+    format_duration,
+    format_pct,
+    format_size,
+    missing_ids,
+    parse_ids,
+    resolve_ids,
+)
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -36,6 +44,45 @@ def require_papers_dir(ctx, cfg, use_json):
         ctx.exit(EXIT_ERROR)
 
 
+def parse_ids_option(ctx, value, use_json, flag_name="--ids"):
+    """Parse a comma-separated --ids/--restrict-to-ids value, or exit uniformly.
+
+    Every command that accepts an --ids-style option needs identical handling
+    when the value fails to parse: same error message shape, same JSON/text
+    branching, same exit code. Before this helper, six call sites (ocr,
+    search, semantic, verify, retry, info) each hand-rolled an independent
+    copy of this try/except block -- one more place for the message or exit
+    code to silently drift the next time someone touches it.
+
+    Returns ``None`` if ``value`` is ``None`` (the option was omitted).
+    """
+    if value is None:
+        return None
+    try:
+        return parse_ids(value)
+    except ValueError:
+        msg = f"Invalid {flag_name}: must be comma-separated integers"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return None  # pragma: no cover - ctx.exit() raises SystemExit
+
+
+def _print_not_found(label, ids, ids_only):
+    """Print a ``label: ids`` diagnostic line, or nothing if ``ids`` is empty.
+
+    ``--ids-only`` output is a bare-ID stdout pipe; a diagnostic line there
+    would corrupt it for a consuming shell pipeline, so it's routed to
+    stderr instead of being silently dropped.
+    """
+    if not ids:
+        return
+    ids_str = ", ".join(str(i) for i in ids)
+    click.echo(f"  {label}: {ids_str}", err=ids_only)
+
+
 def filter_options(f):
     """Shared Click options for document filtering."""
     @click.option("--needs", multiple=True,
@@ -51,7 +98,10 @@ def filter_options(f):
                   ]),
                   help="Filter to documents with this property")
     @click.option("--is", "is_prop", multiple=True,
-                  type=click.Choice(["scanned", "digital", "suspicious", "broken"]),
+                  type=click.Choice([
+                      "scanned", "digital", "suspicious", "broken", "metadata-suspect",
+                      "encrypted",
+                  ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
                   help="Documents with outdated embedding model version")
@@ -422,6 +472,12 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
             # Skip permanently-broken papers on the default sweep; an explicit
             # filter or --force opts back in (so they remain re-tryable).
             exclude_quarantined=default_select,
+            # Same reasoning for encrypted PDFs: classify_document() reports
+            # them as "digital" (Round 2), so is_prop=["digital"] alone would
+            # still select them — they'd just fail every extraction attempt
+            # and burn through the quarantine cap instead of never being
+            # tried at all.
+            exclude_encrypted=default_select,
             max_retries=cfg.processing.max_retries,
         )
 
@@ -520,18 +576,22 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
 
     conn = get_connection(cfg.db_path)
 
+    not_found: list[int] = []
     if ids is not None:
         # Surgical mode: OCR exactly these papers, regardless of needs_ocr state.
-        try:
-            paper_ids = parse_ids(ids)
-        except ValueError:
-            msg = "Invalid --ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+        paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+        # Requested IDs that don't resolve to a row were previously dropped
+        # silently -- process_ocr_documents just selected fewer rows than
+        # asked for. Surfaced explicitly, same convention as `info --ids`.
+        if paper_ids:
+            placeholders = ",".join("?" * len(paper_ids))
+            found_ids = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM papers WHERE id IN ({placeholders})", paper_ids
+                ).fetchall()
+            }
+            not_found = missing_ids(paper_ids, found_ids)
     else:
         from .queue import build_filter_query
 
@@ -551,9 +611,19 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
     if dry_run:
         count = len(paper_ids) if limit is None else min(len(paper_ids), limit)
         if use_json:
-            click.echo(json.dumps({"would_process": count, "method": "surya"}))
+            payload = {"would_process": count, "method": "surya"}
+            if ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(f"Would OCR {format_count(count)} documents with Surya")
+            if not_found:
+                ids_str = ", ".join(str(i) for i in not_found)
+                click.echo(f"  Not in index: {ids_str}")
+        if not_found and len(not_found) == len(set(paper_ids)):
+            ctx.exit(EXIT_NO_RESULTS)
+        elif not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if not paper_ids:
@@ -598,13 +668,16 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({
+        payload = {
             "total": stats.total,
             "succeeded": stats.succeeded,
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
             "method": "surya",
-        }, indent=2))
+        }
+        if ids is not None:
+            payload["not_found"] = not_found
+        click.echo(json.dumps(payload, indent=2))
     else:
         click.echo(
             f"OCR'd {format_count(stats.total)} documents "
@@ -616,11 +689,18 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
                 f"  Failed: {format_count(stats.failed)} "
                 f"(use 'gantry queue --has errors' to see failures)"
             )
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"  Not in index: {ids_str}")
 
     if stats.failed > 0 and stats.succeeded > 0:
         ctx.exit(EXIT_PARTIAL)
     elif stats.failed > 0 and stats.succeeded == 0:
         ctx.exit(EXIT_ERROR)
+    elif not_found and len(not_found) == len(set(paper_ids)):
+        ctx.exit(EXIT_NO_RESULTS)
+    elif not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- search ---
@@ -647,18 +727,7 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     # --ids-only is a pure pipe format: it wins over --json.
     use_json = (json_output or ctx.obj["json"]) and not ids_only
 
-    restrict_ids = None
-    if restrict_to_ids is not None:
-        try:
-            restrict_ids = parse_ids(restrict_to_ids)
-        except ValueError:
-            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+    restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -671,6 +740,13 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
 
     conn = get_connection(cfg.db_path)
     from .search import fts_search, hybrid_search, search_count
+
+    # Resolve --restrict-to-ids against `papers` up front rather than letting
+    # a bad id silently fall out of the search's WHERE id IN (...) clause —
+    # otherwise a stale/mistyped id and "nothing matched" look identical.
+    restrict_not_found: list[int] = []
+    if restrict_ids is not None:
+        restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
 
     # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
     use_hybrid = not fts_only
@@ -728,9 +804,13 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
 
     if not results:
         if use_json:
-            click.echo(json.dumps({"query": query, "total": 0, "results": [], "mode": search_mode}))
+            click.echo(json.dumps({
+                "query": query, "total": 0, "results": [], "mode": search_mode,
+                "not_found": restrict_not_found,
+            }))
         else:
             click.echo(f'No results for "{query}"')
+            _print_not_found("Not in index", restrict_not_found, ids_only)
         ctx.exit(EXIT_NO_RESULTS)
         return
 
@@ -738,6 +818,9 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     if ids_only:
         for r in results:
             click.echo(r.id)
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+        if restrict_not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     # Lookup citekeys for result papers
@@ -780,9 +863,11 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
             "total": total,
             "mode": search_mode,
             "results": result_dicts,
+            "not_found": restrict_not_found,
         }, indent=2))
     else:
         click.echo(f'Found {total} results for "{query}"')
+        _print_not_found("Not in index", restrict_not_found, ids_only=False)
         click.echo()
         for i, r in enumerate(results, 1):
             ck = citekey_map.get(r.id)
@@ -796,6 +881,9 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
             if r.snippet:
                 click.echo(f"     \"{r.snippet}\"")
             click.echo()
+
+    if restrict_not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- queue ---
@@ -952,6 +1040,95 @@ def errors(ctx, json_output):
             click.echo(f"  {r['filename']}: {r['last_error']} (x{r['error_count']})")
 
 
+# --- gaps ---
+
+@cli.command()
+@click.option("--field", "field_name",
+              type=click.Choice(["title", "authors", "year", "abstract", "doi"]),
+              default=None,
+              help="Scope to one metadata field; without this, show the per-field summary")
+@click.option("--attempted-only", is_flag=True,
+              help="With --field, only papers where enrichment already ran and still left it "
+                   "empty (re-running the same provider won't fix these)")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="With --field, emit bare paper IDs, one per line "
+                   "(pipe into enrich --ids / info --ids)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def gaps(ctx, field_name, attempted_only, ids_only, json_output):
+    """Show metadata completeness gaps (title/authors/year/abstract/doi).
+
+    `metadata_enriched_at` being set doesn't mean a paper's metadata is
+    complete -- a provider miss on one field looks identical to full success
+    everywhere else in gantry. This reports per-field gaps and, scoped to
+    --field, splits "never enriched" from "enriched and still empty" so you
+    can tell a genuine provider gap from unfinished work.
+    """
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    conn = get_connection(cfg.db_path)
+    from .metadata import GAP_FIELDS, field_completeness, gap_ids
+
+    if field_name is None:
+        result = field_completeness(conn)
+        conn.close()
+
+        if use_json:
+            click.echo(json.dumps(result, indent=2))
+        else:
+            click.echo(f"Metadata completeness across {format_count(result['total'])} papers")
+            click.echo()
+            for field in GAP_FIELDS:
+                stats = result["fields"][field]
+                click.echo(
+                    f"  {field:10s} complete={stats['complete']:5d}  "
+                    f"missing={stats['missing']:5d}  "
+                    f"(never_attempted={stats['never_attempted']}, "
+                    f"attempted_incomplete={stats['attempted_incomplete']})"
+                )
+        return
+
+    ids = gap_ids(conn, field_name, attempted_only=attempted_only)
+    conn.close()
+
+    if not ids:
+        if use_json:
+            click.echo(json.dumps({"field": field_name, "attempted_only": attempted_only,
+                                    "count": 0, "ids": []}))
+        elif not ids_only:
+            click.echo(f"No gaps for field '{field_name}'")
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    if ids_only:
+        for i in ids:
+            click.echo(i)
+        return
+
+    if use_json:
+        click.echo(json.dumps({
+            "field": field_name,
+            "attempted_only": attempted_only,
+            "count": len(ids),
+            "ids": ids,
+        }, indent=2))
+    else:
+        scope = " (attempted-but-still-empty only)" if attempted_only else ""
+        click.echo(f"{len(ids)} papers missing '{field_name}'{scope}")
+        click.echo()
+        click.echo(", ".join(str(i) for i in ids))
+
+
 # --- semantic ---
 
 @cli.command()
@@ -971,18 +1148,7 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
     cfg = ctx.obj["config"]
     use_json = (json_output or ctx.obj["json"]) and not ids_only
 
-    restrict_ids = None
-    if restrict_to_ids is not None:
-        try:
-            restrict_ids = parse_ids(restrict_to_ids)
-        except ValueError:
-            msg = "Invalid --restrict-to-ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
+    restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -1008,6 +1174,13 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 
     conn = get_connection(cfg.db_path)
 
+    # Resolve --restrict-to-ids against `papers` up front rather than letting
+    # a bad id silently fall out of the search's WHERE id IN (...) clause —
+    # otherwise a stale/mistyped id and "nothing matched" look identical.
+    restrict_not_found: list[int] = []
+    if restrict_ids is not None:
+        restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
+
     # Use cascade search if chunk embeddings exist, unless --doc-only
     has_chunks = conn.execute(
         "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
@@ -1025,9 +1198,12 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 
     if not results:
         if use_json:
-            click.echo(json.dumps({"query": query, "total": 0, "results": []}))
+            click.echo(json.dumps({
+                "query": query, "total": 0, "results": [], "not_found": restrict_not_found,
+            }))
         else:
             click.echo(f'No results for "{query}"')
+            _print_not_found("Not in index", restrict_not_found, ids_only)
         ctx.exit(EXIT_NO_RESULTS)
         return
 
@@ -1035,6 +1211,9 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
     if ids_only:
         for r in results:
             click.echo(r.id)
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+        if restrict_not_found:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if use_json:
@@ -1058,15 +1237,20 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
             "query": query,
             "total": len(results),
             "results": result_dicts,
+            "not_found": restrict_not_found,
         }, indent=2))
     else:
         click.echo(f'Found {len(results)} results for "{query}"')
+        _print_not_found("Not in index", restrict_not_found, ids_only=False)
         click.echo()
         for i, r in enumerate(results, 1):
             click.echo(f" {i:2d}. [{r.score:.4f}] {r.filename}")
             if r.snippet:
                 click.echo(f'     "{r.snippet[:100]}..."')
             click.echo()
+
+    if restrict_not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- embed ---
@@ -1338,6 +1522,125 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             click.echo(f"  API errors: {format_count(stats.api_errors)}")
 
 
+# --- verify ---
+
+@cli.command()
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to verify (default: all "
+                   "unverified title-sourced matches)")
+@click.option("--threshold", type=float, default=None,
+              help="Similarity below which a match is flagged suspect "
+                   "(default: metadata.SUSPECT_THRESHOLD)")
+@click.option("--limit", type=int, default=None, help="Max papers to check")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare suspect paper IDs, one per line (for piping)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def verify(ctx, ids, threshold, limit, ids_only, json_output):
+    """Audit title-search-sourced metadata against each PDF's own title.
+
+    enrich's title-search fallback accepts the top API result with no
+    confidence check. This re-derives the title actually printed on each
+    PDF and flags matches (metadata_suspect) whose stored title doesn't
+    resemble it — findable afterward via `queue --is metadata-suspect`.
+    """
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .metadata import SUSPECT_THRESHOLD, verify_documents
+
+    conn = get_connection(cfg.db_path)
+    kwargs = {"paper_ids": paper_ids, "limit": limit}
+    if threshold is not None:
+        kwargs["threshold"] = threshold
+    results = verify_documents(conn, **kwargs)
+
+    # --ids names specific papers to audit, but a requested id can miss for two
+    # different reasons: it doesn't exist at all (not_found), or it exists but
+    # isn't title-sourced metadata and so is outside verify's scope by design
+    # (skipped_ineligible, e.g. DOI- or filename-sourced). Collapsing the two
+    # would misreport a working filter as a corpus defect.
+    not_found: list[int] = []
+    skipped_ineligible: list[int] = []
+    if paper_ids is not None:
+        found, not_found = resolve_ids(conn, paper_ids)
+        checked_ids = {r.paper_id for r in results}
+        skipped_ineligible = [i for i in found if i not in checked_ids]
+    conn.close()
+
+    if not results:
+        if use_json:
+            click.echo(json.dumps({
+                "total": 0, "suspect_count": 0, "results": [],
+                "not_found": not_found, "skipped_ineligible": skipped_ineligible,
+            }))
+        elif ids_only:
+            _print_not_found("Not in index", not_found, ids_only=True)
+            _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=True)
+        else:
+            click.echo("Nothing to verify (no title-sourced metadata matches found)")
+            _print_not_found("Not in index", not_found, ids_only=False)
+            _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=False)
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+
+    suspects = [r for r in results if r.suspect]
+
+    if ids_only:
+        for r in suspects:
+            click.echo(r.paper_id)
+        _print_not_found("Not in index", not_found, ids_only=True)
+        _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=True)
+        if suspects or not_found or skipped_ineligible:
+            ctx.exit(EXIT_PARTIAL)
+        return
+
+    if use_json:
+        click.echo(json.dumps({
+            "total": len(results),
+            "suspect_count": len(suspects),
+            "threshold": threshold if threshold is not None else SUSPECT_THRESHOLD,
+            "not_found": not_found,
+            "skipped_ineligible": skipped_ineligible,
+            "results": [
+                {
+                    "paper_id": r.paper_id,
+                    "filename": r.filename,
+                    "stored_title": r.stored_title,
+                    "extracted_title_guess": r.extracted_title_guess,
+                    "similarity": r.similarity,
+                    "suspect": r.suspect,
+                }
+                for r in results
+            ],
+        }, indent=2))
+    else:
+        click.echo(
+            f"Checked {format_count(len(results))} title-sourced matches: "
+            f"{format_count(len(suspects))} suspect"
+        )
+        _print_not_found("Not in index", not_found, ids_only=False)
+        _print_not_found("Not title-sourced (skipped)", skipped_ineligible, ids_only=False)
+        for r in suspects:
+            click.echo(f"  [{r.paper_id}] {r.filename} (similarity={r.similarity:.2f})")
+            click.echo(f"    stored:    {r.stored_title!r}")
+            click.echo(f"    extracted: {r.extracted_title_guess!r}")
+
+    if suspects or not_found or skipped_ineligible:
+        ctx.exit(EXIT_PARTIAL)
+
+
 # --- retry ---
 
 @cli.command()
@@ -1375,19 +1678,24 @@ def retry(ctx, max_attempts, ids, json_output):
     conn = get_connection(cfg.db_path)
     from .process import process_documents, reset_errors
 
+    not_found: list[int] = []
     if ids is not None:
         # Surgical un-quarantine: reset exactly these papers, ignore the cap.
-        try:
-            paper_ids = parse_ids(ids)
-        except ValueError:
-            msg = "Invalid --ids: must be comma-separated integers"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            conn.close()
-            ctx.exit(EXIT_ERROR)
-            return
+        paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+        # Requested IDs that don't resolve to a row were previously dropped
+        # silently -- reset_errors/process_documents just acted on fewer
+        # papers than asked for. Surfaced explicitly, same convention as
+        # `info --ids` and `ocr --ids`.
+        if paper_ids:
+            placeholders = ",".join("?" * len(paper_ids))
+            found_ids = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM papers WHERE id IN ({placeholders})", paper_ids
+                ).fetchall()
+            }
+            not_found = missing_ids(paper_ids, found_ids)
+
         reset_errors(conn, paper_ids)
     else:
         rows = conn.execute(
@@ -1437,16 +1745,27 @@ def retry(ctx, max_attempts, ids, json_output):
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({
+        payload = {
             "total": stats.total,
             "succeeded": stats.succeeded,
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
-        }, indent=2))
+        }
+        if ids is not None:
+            payload["not_found"] = not_found
+        click.echo(json.dumps(payload, indent=2))
     else:
         click.echo(f"Retried {format_count(stats.total)} documents")
         click.echo(f"  Succeeded: {format_count(stats.succeeded)}")
         click.echo(f"  Still failing: {format_count(stats.failed)}")
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"  Not in index: {ids_str}")
+
+    if not_found and len(not_found) == len(set(paper_ids)):
+        ctx.exit(EXIT_NO_RESULTS)
+    elif not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- pipeline ---
@@ -1653,16 +1972,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         ctx.exit(EXIT_ERROR)
         return
 
-    try:
-        paper_ids = parse_ids(ids)
-    except ValueError:
-        msg = "Invalid --ids: must be comma-separated integers"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
-        return
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
 
     conn = get_connection(cfg.db_path)
 
@@ -1680,11 +1990,22 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         paper_ids,
     ).fetchall()
 
+    # Requested IDs that didn't resolve to a row — a paper was pruned, an ID
+    # was mistyped, or the ID set came from a stale snapshot (e.g. a prior
+    # `search --ids-only`). Surfaced explicitly rather than silently
+    # shrinking the result set, so a caller composing commands doesn't have
+    # to diff input against output itself to notice a drop.
+    found_ids = {r["id"] for r in rows}
+    not_found = missing_ids(paper_ids, found_ids)
+
     if not rows:
         if use_json:
-            click.echo(json.dumps({"count": 0, "papers": []}))
+            click.echo(json.dumps({"count": 0, "papers": [], "not_found": not_found}))
         else:
             click.echo("No papers found for given IDs")
+            if not_found:
+                ids_str = ", ".join(str(i) for i in not_found)
+                click.echo(f"  Not in index: {ids_str}")
         conn.close()
         ctx.exit(EXIT_NO_RESULTS)
         return
@@ -1782,7 +2103,9 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
     conn.close()
 
     if use_json:
-        click.echo(json.dumps({"count": len(results), "papers": results}, indent=2))
+        click.echo(json.dumps({
+            "count": len(results), "papers": results, "not_found": not_found,
+        }, indent=2))
     else:
         for d in results:
             click.echo(f"[{d.get('id')}] {d.get('filename', '?')}")
@@ -1801,6 +2124,15 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
                 click.echo(f"  Top chunk [{tc['score']:.2f}] {tc.get('section_header') or ''}")
                 click.echo(f"    \"{tc['text'][:300]}\"")
             click.echo()
+        if not_found:
+            ids_str = ", ".join(str(i) for i in not_found)
+            click.echo(f"Requested but not in index: {ids_str}")
+
+    # Some (but not all) requested IDs failed to resolve: signal it in the
+    # exit code too, so a caller checking `$?` catches the drop without
+    # having to parse the body.
+    if not_found:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- read ---

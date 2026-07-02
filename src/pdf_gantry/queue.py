@@ -46,6 +46,7 @@ def build_filter_query(
     stale_embeddings: bool = False,
     current_model_version: str | None = None,
     exclude_quarantined: bool = False,
+    exclude_encrypted: bool = False,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[str, list]:
     """
@@ -97,12 +98,19 @@ def build_filter_query(
                 conditions.append(f"({suspicious_extraction_condition()})")
             elif p == "broken":
                 conditions.append(quarantine_condition(max_retries))
+            elif p == "metadata-suspect":
+                conditions.append("metadata_suspect = 1")
+            elif p == "encrypted":
+                conditions.append("is_encrypted = 1")
 
     if has_errors:
         conditions.append("error_count > 0")
 
     if exclude_quarantined:
         conditions.append(not_quarantined_condition(max_retries))
+
+    if exclude_encrypted:
+        conditions.append("is_encrypted = 0")
 
     if stale_embeddings and current_model_version:
         conditions.append("has_embeddings = 1 AND embedding_model_version != ?")

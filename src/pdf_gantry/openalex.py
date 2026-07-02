@@ -33,7 +33,7 @@ def parse_openalex_work(work: dict | None) -> dict | None:
         return None
 
     authors = [
-        a.get("author", {}).get("display_name", "")
+        (a.get("author") or {}).get("display_name", "")
         for a in work.get("authorships", [])
     ]
 
