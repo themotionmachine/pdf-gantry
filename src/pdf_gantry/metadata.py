@@ -26,6 +26,95 @@ SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper"
 FIELDS = "title,authors,year,abstract,citationCount,influentialCitationCount,externalIds"
 
 
+# Fields `enrich_documents` populates from a provider. `metadata_enriched_at`
+# being set does NOT mean these are filled in -- a paper matched by title
+# (no DOI exists) or one whose provider has no abstract on file still gets
+# marked "enriched", and every filter in queue.py (`needs metadata`) only
+# looks at `doi IS NULL OR metadata_enriched_at IS NULL`. Once enrichment has
+# run once, a permanently-incomplete paper is invisible to every existing
+# command. field_completeness()/gap_ids() exist to make that gap visible.
+GAP_FIELDS = ("title", "authors", "year", "abstract", "doi")
+
+_FIELD_EMPTY_SQL = {
+    "title": "(title IS NULL OR title = '')",
+    # authors is a JSON-encoded list; '[]' is non-NULL but zero authors.
+    "authors": "(authors IS NULL OR authors = '' OR authors = '[]')",
+    "year": "(year IS NULL)",
+    "abstract": "(abstract IS NULL OR abstract = '')",
+    "doi": "(doi IS NULL OR doi = '')",
+}
+
+
+def _check_fields(fields: list[str]) -> None:
+    unknown = [f for f in fields if f not in _FIELD_EMPTY_SQL]
+    if unknown:
+        raise ValueError(
+            f"Unknown metadata field(s): {', '.join(unknown)}. "
+            f"Valid fields: {', '.join(GAP_FIELDS)}"
+        )
+
+
+def field_completeness(
+    conn: sqlite3.Connection, fields: list[str] | None = None
+) -> dict:
+    """Per-field metadata completeness across the whole corpus.
+
+    For each field, splits the gap into:
+      - ``never_attempted``: enrichment has never run for this paper
+        (``metadata_enriched_at IS NULL``) -- the ordinary, expected gap.
+      - ``attempted_incomplete``: enrichment ran and the field is *still*
+        empty. Re-running ``enrich`` with the same provider won't fix
+        these -- the provider simply doesn't have the data (or the paper
+        was matched by title with no DOI to find). These are the gaps
+        that look identical to "done" everywhere else in gantry.
+    """
+    fields = list(fields) if fields is not None else list(GAP_FIELDS)
+    _check_fields(fields)
+
+    total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    field_stats = {}
+    for field in fields:
+        empty = _FIELD_EMPTY_SQL[field]
+        row = conn.execute(
+            f"""SELECT
+                SUM(CASE WHEN {empty} THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {empty} AND metadata_enriched_at IS NULL
+                    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {empty} AND metadata_enriched_at IS NOT NULL
+                    THEN 1 ELSE 0 END)
+            FROM papers"""
+        ).fetchone()
+        missing = row[0] or 0
+        never_attempted = row[1] or 0
+        attempted_incomplete = row[2] or 0
+        field_stats[field] = {
+            "missing": missing,
+            "never_attempted": never_attempted,
+            "attempted_incomplete": attempted_incomplete,
+            "complete": total - missing,
+        }
+    return {"total": total, "fields": field_stats}
+
+
+def gap_ids(
+    conn: sqlite3.Connection, field: str, attempted_only: bool = False
+) -> list[int]:
+    """Paper IDs missing ``field``, sorted ascending.
+
+    With ``attempted_only=True``, scopes to papers where enrichment already
+    ran and still left the field empty -- the silent-failure bucket that
+    ``queue --needs metadata`` never re-surfaces. Chain straight into
+    ``gantry info --ids`` or ``gantry enrich --ids`` (via a different
+    ``--provider``) without round-tripping full JSON through an agent.
+    """
+    _check_fields([field])
+    where = _FIELD_EMPTY_SQL[field]
+    if attempted_only:
+        where += " AND metadata_enriched_at IS NOT NULL"
+    rows = conn.execute(f"SELECT id FROM papers WHERE {where} ORDER BY id").fetchall()
+    return [r[0] for r in rows]
+
+
 @dataclass
 class EnrichStats:
     """Statistics from metadata enrichment."""
