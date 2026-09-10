@@ -190,3 +190,82 @@ def test_cli_enrich_defaults_to_openalex(tmp_path, monkeypatch):
     conn.close()
     assert row["title"] == "OA CLI"
     assert row["metadata_source"] == "openalex"
+
+
+# --- containment verification + boilerplate-aware extraction ---------------
+
+def test_title_containment_is_position_free():
+    """A masthead above the title must not affect the verdict."""
+    from pdf_gantry.metadata import title_containment
+    page = (
+        "AFRICAN HUMAN RIGHTS LAW JOURNAL\n"
+        "Volume 22 No 1 2022\n"
+        "Freedom of expression and African elections: mitigating the insidious\n"
+        "effect of emerging approaches to addressing the false news threat\n"
+    )
+    assert title_containment(
+        "Freedom of expression and African elections: Mitigating the insidious "
+        "effect of emerging approaches to addressing the false news threat", page
+    ) > 0.6
+    assert title_containment("Diffusion of Innovations", page) < 0.4
+
+
+def test_title_containment_missing_side_is_zero():
+    from pdf_gantry.metadata import title_containment
+    assert title_containment(None, "text") == 0.0
+    assert title_containment("Title", None) == 0.0
+    assert title_containment("Title", "") == 0.0
+
+
+def test_corpus_boilerplate_learns_recurring_lines(tmp_path):
+    """Boilerplate is defined by recurrence across documents, not by a rule list."""
+    from pdf_gantry.db import get_connection
+    from pdf_gantry.metadata import corpus_boilerplate
+    conn = get_connection(str(tmp_path / "index.db"))
+    for i in range(4):
+        conn.execute(
+            "INSERT INTO papers (id, path, filename, file_hash, file_size, "
+            "file_modified, indexed_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, '2026-01-01', '2026-01-01', '2026-01-01')",
+            (i + 1, f"/p/p{i}.pdf", f"p{i}.pdf", f"h{i}"),
+        )
+        conn.execute(
+            "INSERT INTO paper_text (paper_id, raw_text, markdown, text_length, "
+            "markdown_length) VALUES (?, ?, '', 0, 0)",
+            (
+                i + 1,
+                "JOURNAL OF THINGS\n"
+                f"Article views: {i}\n"
+                # Distinct words, not a shared stem plus a digit: normalize_line
+                # folds digits, so "Study 1"/"Study 2" WOULD collapse together.
+                f"{['Antelopes', 'Bicycles', 'Cartography', 'Dowsing'][i]} Considered\n",
+            ),
+        )
+    conn.commit()
+
+    boiler = corpus_boilerplate(conn, min_documents=3)
+    assert "journal of things" in boiler
+    assert "article views: #" in boiler  # digits folded, so it collapses
+    assert not any(k.startswith("antelopes") for k in boiler)
+    conn.close()
+
+
+def test_extract_title_skips_boilerplate_masthead():
+    from pdf_gantry.metadata import _extract_title_from_text
+    page = (
+        "JOURNAL OF THINGS\n"
+        "Downloaded from example.org on 4 May 2024\n"
+        "What Is Actually Being Annotated? A Measurement Problem\n"
+        "Jane Q. Researcher and John Doe\n"
+        "Abstract\n"
+        "We present...\n"
+    )
+    got = _extract_title_from_text(page, boilerplate={"journal of things"})
+    assert got.startswith("What Is Actually Being Annotated?")
+
+
+def test_extract_title_falls_back_when_everything_filtered():
+    """A weak query beats no query for the title-search tier."""
+    from pdf_gantry.metadata import _extract_title_from_text
+    page = "Some Plausible Heading Line\n"
+    assert _extract_title_from_text(page, boilerplate={"some plausible heading line"})
