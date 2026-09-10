@@ -11,6 +11,27 @@ from .utils import now_iso
 
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
 
+# A paper's OWN doi is printed in its front matter; every other doi in the file
+# belongs to something it cites. Searching the whole document and taking the
+# first hit (the pre-2026-09 behaviour) therefore mis-identifies any paper whose
+# doi is not printed on page 1 — it silently adopts a reference-list doi and,
+# because the doi tier is treated as exact, writes that work's title/authors/year
+# over the paper with full confidence. Bound the search instead.
+DOI_HEAD_CHARS = 6000  # ~first two pages of extracted text
+
+# Never read a doi out of the reference section, however early it starts.
+_REFERENCES_RE = re.compile(
+    r'\n\s*(references|bibliography|works cited|reference list|notes and references)\s*\n',
+    re.I,
+)
+
+# Front-matter dois are usually adjacent to one of these; reference-list dois
+# rarely are (they sit after a page range or a closing quote).
+_SELF_DOI_CONTEXT = re.compile(
+    r'(doi\.org|dx\.doi\.org|\bdoi\b\s*[:.]|to cite|how to cite|cite this|permalink)',
+    re.I,
+)
+
 _TITLE_NORMALIZE_RE = re.compile(r'[^a-z0-9\s]')
 _WHITESPACE_RE = re.compile(r'\s+')
 
@@ -123,18 +144,52 @@ class EnrichStats:
     matched_by_title: int = 0
     no_match: int = 0
     api_errors: int = 0
+    suspect: int = 0
     elapsed_seconds: float = 0.0
 
 
-def extract_doi(text: str) -> str | None:
-    """Extract a DOI from text content."""
-    match = DOI_PATTERN.search(text)
-    if match:
-        doi = match.group(0)
-        # Clean trailing punctuation
-        doi = doi.rstrip(".,;:)]}")
-        return doi
-    return None
+def extract_doi(text: str, head_chars: int = DOI_HEAD_CHARS) -> str | None:
+    """Extract the paper's OWN doi from its front matter.
+
+    Scoped deliberately: only the first ``head_chars`` of extracted text, and
+    never past a reference-section heading. Among candidates in that window,
+    prefer one that appears in a self-citation context (``doi.org``, ``DOI:``,
+    ``How to cite``) and then the one that repeats most often — a paper's own
+    doi is typically printed more than once in its front matter, a cited one
+    is not. Returns None rather than guessing when the window holds no doi;
+    the caller falls through to the title-search tier, which is verified.
+    """
+    if not text:
+        return None
+
+    cut = len(text)
+    ref = _REFERENCES_RE.search(text)
+    if ref:
+        cut = ref.start()
+    head = text[:min(cut, head_chars)]
+
+    candidates: list[tuple[str, int]] = []  # (doi, start offset)
+    for match in DOI_PATTERN.finditer(head):
+        doi = match.group(0).rstrip(".,;:)]}")
+        if doi:
+            candidates.append((doi, match.start()))
+    if not candidates:
+        return None
+
+    counts: dict[str, int] = {}
+    contextual: dict[str, bool] = {}
+    for doi, start in candidates:
+        counts[doi] = counts.get(doi, 0) + 1
+        if not contextual.get(doi):
+            window = head[max(0, start - 60):start]
+            contextual[doi] = bool(_SELF_DOI_CONTEXT.search(window))
+
+    def rank(item: tuple[str, int]) -> tuple[int, int, int]:
+        doi, start = item
+        # contextual first, then most-repeated, then earliest
+        return (0 if contextual.get(doi) else 1, -counts[doi], start)
+
+    return min(candidates, key=rank)[0]
 
 
 def _fetch_by_doi(doi: str, rate_limit: float = 0.1) -> dict | None:
@@ -293,11 +348,12 @@ def enrich_documents(
         metadata = None
         source = None
 
-        # Try DOI first
+        # Try DOI first. A scraped doi is a hypothesis, not a fact: it is only
+        # written back below, once a provider lookup on it actually resolved.
+        scraped_doi = False
         if not doi and raw_text:
             doi = extract_doi(raw_text)
-            if doi:
-                conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (doi, paper_id))
+            scraped_doi = bool(doi)
 
         if doi:
             stats.doi_found += 1
@@ -332,6 +388,20 @@ def enrich_documents(
         if metadata:
             now = now_iso()
             authors = json.dumps(metadata.get("authors") or [])
+            # Verify EVERY tier, not just title search. A doi lifted from the
+            # text is only as trustworthy as the claim that it belongs to this
+            # paper, so score the provider's title against the one printed on
+            # the PDF and record the verdict rather than asserting confidence.
+            printed_title = _extract_title_from_text(raw_text) if raw_text else None
+            verify_score = title_similarity(metadata.get("title"), printed_title)
+            suspect = 1 if verify_score < SUSPECT_THRESHOLD else 0
+            if suspect and scraped_doi and source == prov["doi_source"]:
+                # The doi was a guess AND its answer doesn't match the page:
+                # two independent reasons to disbelieve it. Drop the doi so a
+                # later pass re-attempts rather than inheriting the bad key.
+                metadata = dict(metadata)
+                metadata["doi"] = None
+                doi = None
             ss_id = (
                 metadata.get("source_id")
                 if prov["is_semantic_scholar"] else None
@@ -346,6 +416,9 @@ def enrich_documents(
                     doi = COALESCE(?, doi),
                     metadata_source = ?,
                     metadata_enriched_at = ?,
+                    metadata_suspect = ?,
+                    metadata_verify_score = ?,
+                    metadata_verified_at = ?,
                     updated_at = ?
                 WHERE id = ?""",
                 (
@@ -354,11 +427,13 @@ def enrich_documents(
                     metadata.get("year"),
                     metadata.get("abstract"),
                     ss_id,
-                    metadata.get("doi"),
+                    metadata.get("doi") or (doi if not scraped_doi else None),
                     source,
-                    now, now, paper_id,
+                    now, suspect, round(verify_score, 3), now, now, paper_id,
                 ),
             )
+            if suspect:
+                stats.suspect += 1
         else:
             if not (doi and stats.api_errors > 0):
                 stats.no_match += 1
@@ -385,8 +460,9 @@ def enrich_documents(
 #
 # enrich_documents() above has three fallback tiers: DOI (exact), filename
 # (author-surname + year heuristic), and title search (fuzzy text query,
-# top-result-wins). The first two are effectively unambiguous. Title search
-# is not: querying OpenAlex or Semantic Scholar with a generic or truncated
+# top-result-wins). NONE of the three is unambiguous — the doi tier reads the
+# doi out of the paper's own text and can pick up a cited work's. Title search
+# likewise: querying OpenAlex or Semantic Scholar with a generic or truncated
 # title guess (see _extract_title_from_text) can return a plausible-looking
 # but *wrong* paper, and nothing before this module ever checked. The wrong
 # title/authors/year/DOI then gets written back with full confidence and
@@ -440,9 +516,11 @@ def verify_documents(
 ) -> list[VerifyResult]:
     """Audit title-search-sourced metadata against each PDF's own extracted title.
 
-    Scoped to papers whose ``metadata_source`` ends in ``_title`` (the only
-    fallback tier that involved an unverified fuzzy match) — DOI and
-    filename-sourced matches are exact by construction and are skipped.
+    Scoped to every enriched paper. A doi tier is NOT exact by construction:
+    ``extract_doi`` reads the doi out of the PDF's own text, so it is exact
+    only if that doi belongs to this paper — and before 2026-09-10 it was
+    routinely lifted from the reference list, silently overwriting good
+    metadata with a cited work's.
 
     Persists the verdict to ``metadata_suspect`` / ``metadata_verify_score`` /
     ``metadata_verified_at`` on each checked paper, and returns results
@@ -451,7 +529,7 @@ def verify_documents(
     query = """SELECT p.id, p.filename, p.title, pt.raw_text
         FROM papers p
         LEFT JOIN paper_text pt ON pt.paper_id = p.id
-        WHERE p.metadata_source LIKE '%\\_title' ESCAPE '\\'"""
+        WHERE p.metadata_source IS NOT NULL"""
     params: list = []
 
     if paper_ids is not None:
