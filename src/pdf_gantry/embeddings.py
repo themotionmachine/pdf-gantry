@@ -3,22 +3,35 @@
 import sqlite3
 import struct
 import time
+import warnings
 from pathlib import Path
 
 from .models import ProcessStats
 from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 from .utils import now_iso
 
+# Nomic's remote modeling code warns on every load that an optional speed-up
+# fork is missing. It is advice, not a fault, and agents were silencing it
+# with ``2>/dev/null``, which also hid real errors. Filter only that message.
+_MEGABLOCKS_WARNING = r"Install Nomic's megablocks fork"
 
-def _get_embedding_model(model_name: str):
-    """Load the sentence-transformers model."""
+
+def _load_sentence_transformer(model_name: str):
+    """Construct the SentenceTransformer, minus the megablocks advisory warning."""
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
         raise ImportError(
             "sentence-transformers not installed. Run: pip install pdf-gantry[embeddings]"
         )
-    return SentenceTransformer(model_name, trust_remote_code=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_MEGABLOCKS_WARNING, category=UserWarning)
+        return SentenceTransformer(model_name, trust_remote_code=True)
+
+
+def _get_embedding_model(model_name: str):
+    """Load the sentence-transformers model."""
+    return _load_sentence_transformer(model_name)
 
 
 def _serialize_vector(vector) -> bytes:
@@ -296,9 +309,25 @@ def embed_chunks(
     return stats
 
 
-def embed_query(model_name: str, query: str) -> bytes:
-    """Embed a query string and return serialized vector."""
+# Query-side model cache: (loader, model) per model name. A process that
+# embeds many queries (search/semantic --queries-file) pays the ~12 s model
+# load once. The loader identity is part of the entry so a swapped-in loader
+# (tests, or a patched environment) is never shadowed by a stale model.
+_QUERY_MODEL_CACHE: dict[str, tuple] = {}
+
+
+def _query_model(model_name: str):
+    cached = _QUERY_MODEL_CACHE.get(model_name)
+    if cached is not None and cached[0] is _get_embedding_model:
+        return cached[1]
     model = _get_embedding_model(model_name)
+    _QUERY_MODEL_CACHE[model_name] = (_get_embedding_model, model)
+    return model
+
+
+def embed_query(model_name: str, query: str) -> bytes:
+    """Embed a query string and return serialized vector (model cached per process)."""
+    model = _query_model(model_name)
     vector = model.encode(f"search_query: {query}", show_progress_bar=False)
     return _serialize_vector(vector)
 

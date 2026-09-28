@@ -15,9 +15,22 @@ $ gantry search "predictive processing" --fields id --json -n 5
 {
   "query": "predictive processing",
   "total": 5,
+  "returned": 5,
+  "mode": "hybrid",
   "results": [{"id": 942}, {"id": 1112}, {"id": 999}, {"id": 1616}, {"id": 182}]
 }
 ```
+
+When the agent needs enough to judge the hits but not a full JSON payload, `--format oneline` prints one tab-separated line per hit: id, score, year, citekey, title (the filename when there is no title):
+
+```bash
+$ gantry search "Deepfakes and Social Media: Implications" --fts --format oneline -n 3
+1014	1			Mashinini 2020.pdf
+499	0.98	2020		Deepfakes and Disinformation: Exploring the Impact of Synthetic Political Video on Deception, Uncertainty, and Trust in News
+347	0.98	2021		AI and the Future of Disinformation Campaigns: Part 2: A Threat Model
+```
+
+Paste titles as they are. Query text is literal by default, so colons, parentheses, apostrophes and `C++` are safe. `"quoted phrases"`, `word*` prefixes and an `AND`/`OR`/`NOT` between two terms still work. Pass `--fts-syntax` if you want raw FTS5 syntax such as column filters or `NEAR`.
 
 Or skip JSON entirely and emit bare ranked IDs, one per line, to pipe straight into the next step:
 
@@ -29,6 +42,20 @@ $ gantry search "predictive processing" --ids-only -n 5
 1616
 182
 ```
+
+Loading the embedding model takes about 12 s, so don't loop over queries in the shell. Put them in a file (or on stdin with `-`) and the model loads once. On the real ~2,000-paper index, 20 hybrid queries took 15 s this way, against about 12 s for each separate call:
+
+```bash
+$ printf '%s\n' "deepfakes elections" "content moderation" | gantry search --queries-file - --format oneline -n 3
+0	1014	0.0328			Mashinini 2020.pdf
+0	500	0.032			Deepfakes and the New Disinformation War- The Coming Age of Post-Truth Geopolitics.pdf
+0	944	0.0318			Law of Ukraine on AI Technologies.pdf
+1	650	0.0325	2024		Decentralised content moderation
+1	1304	0.032			SSRN-id4213674.pdf
+1	531	0.031	2021		Do Platform Migrations Compromise Content Moderation? Evidence from r/The_Donald and r/Incels
+```
+
+With `--json` this returns `{"queries": [{"query", "mode", "total", "returned", "results", "not_found"}, ...]}`. With `--format oneline`, each line starts with the 0-based query index. `--ids-only` prints the de-duplicated union of hits, in the order they were first seen.
 
 To ask "which of *these* papers discuss X?", scope a search to a candidate set instead of searching globally and filtering client-side:
 
@@ -98,7 +125,9 @@ uv pip install -e ".[all]"        # everything
 Gantry holds to a few rules so that agents (and scripts) can rely on it:
 
 - **`--json` on every command.** Structured output goes to stdout; progress bars and chatter go to stderr. Pipes stay clean.
-- **`--fields` trims payloads.** Ask for `id,filename,top_chunk` and that is all you get. Tokens are the budget; spend them on content.
+- **`--fields` trims payloads.** Ask for `id,filename,top_chunk` and that is all you get. Tokens are the budget; spend them on content. An unknown field name gets a warning on stderr that lists the valid names; it is not dropped silently.
+- **One shape per concept.** `authors` is always a JSON list of names (`[]` when unknown) in `search`, `semantic`, `info`, `find` and `read`. Search results carry `title`, `year`, `authors` and `citekey`.
+- **Counts say what they count.** In `search`/`semantic` JSON, `returned` is the number of results in the response. `total` is the global FTS5 match count for `search --fts` without `--restrict-to-ids`, regardless of `-n`. Hybrid and semantic search rank rather than match, so there `total` equals `returned`. The `mode` field reports the retrieval path that actually ran: `hybrid`, `vector_fallback` (FTS5 rejected the query, so the results are vector-only), `fts` (embeddings unavailable), `fts_only` (`--fts`), or, for `semantic`, `cascade` or `doc`.
 - **Exit codes carry meaning.**
 
   | Code | Meaning |
@@ -185,8 +214,8 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 
 | Command | Description |
 |---------|-------------|
-| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only. `--ids-only` emits bare ranked IDs for piping; `--restrict-to-ids` scopes the search to a candidate set |
-| `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only` and `--restrict-to-ids` |
+| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--queries-file PATH\|-` runs many queries with one model load |
+| `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only`, `--format oneline`, `--restrict-to-ids` and `--queries-file` |
 | `gantry find <words>` | Known-item lookup over title, authors, year, citekey, DOI and filename: `find "Mind games"`, `find "Zhang 2022"`, `find "Flew & Martin"`. Every word must match some field; title matches rank first; each result reports `matched_fields`. `--ids-only` for piping |
 | `gantry read <id>` | Read a document's text, list its chunks (`--chunks`), read chunks by per-paper position (`--index 28-41`), or read one chunk by `chunk_id` (`--chunk`, which must belong to that paper) and expand it with `--context` |
 | `gantry info <ids…>` | Metadata for specific papers; takes IDs (`info 12 13`, `info 12,13`), filenames or citekeys (`info @smith2020`), or `--ids`. `--query` attaches each paper's best-matching chunk |
@@ -229,7 +258,7 @@ Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables overri
 
 - **Change detection:** PDFs are SHA-256 hashed at ingest; only new or changed files are reprocessed.
 - **Extraction:** PyMuPDF4LLM by default, Marker as an optional higher-quality backend.
-- **Search:** contentless FTS5 for keywords, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable.
+- **Search:** contentless FTS5 for keywords, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable, and to vector-only if FTS5 rejects a raw `--fts-syntax` query. Each result's `snippet` is the passage that matched: the best vector chunk, else the chunk containing the most query terms, else a window of text around the first term. It is not the first 200 characters of the file, which are usually a masthead.
 - **Chunks:** documents are split into addressable chunks with per-chunk embeddings, so retrieval can land on a passage instead of a paper.
 - **Scanned PDFs:** classified at ingest and routed to the OCR queue.
 - **Quarantine:** a paper that fails processing/embedding `processing.max_retries` times (default 3) is skipped by default selection so a permanently-broken PDF isn't re-attempted on every run. Find them with `gantry queue --is broken`; un-quarantine a fixed file with `gantry retry --ids <ids>`.

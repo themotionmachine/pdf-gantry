@@ -178,3 +178,11 @@ def test_find_cli_ids_only_no_results(find_cli):
     result = CliRunner().invoke(cli, ["find", "zzzz", "--ids-only"])
     assert result.exit_code == 2
     assert result.stdout == ""
+
+
+def test_find_returns_authors_as_list(meta_db):
+    """find emits authors as a real list, like search/info/read (B7)."""
+    conn, ids = meta_db
+    results = find_papers(conn, "Flew & Martin")
+    assert results[0]["id"] == ids["flew"]
+    assert results[0]["authors"] == ["Terry Flew", "Fiona Martin"]

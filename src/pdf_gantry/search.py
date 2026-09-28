@@ -6,26 +6,77 @@ import sqlite3
 from collections import defaultdict
 
 from .models import ChunkResult, SearchResult
+from .utils import parse_authors
+
+_FTS_OPERATORS = {"AND", "OR", "NOT"}
+# A balanced double-quoted phrase, or a run of non-space characters.
+_FTS_TOKEN_RE = re.compile(r'"[^"]*"\*?|[^\s"]+')
+_WORD_CHAR_RE = re.compile(r"\w")
 
 
-def _sanitize_fts_query(query: str) -> str:
+def _legacy_hyphen_sanitize(query: str) -> str:
+    """Replace hyphens with spaces (FTS5 reads ``a-b`` as a column filter)."""
+    return query.replace("-", " ")
+
+
+def _quote_fts_term(text: str) -> str:
+    """Quote one term as an FTS5 string, escaping embedded double quotes."""
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _sanitize_fts_query(query: str, syntax: bool = False) -> str:
     """
-    Sanitize a query string for FTS5.
+    Turn user text into a safe FTS5 MATCH expression.
 
-    Handles hyphenated terms (e.g. "cross-national") which FTS5 misparses
-    as column filters. Replaces hyphens with spaces except inside quoted phrases.
+    Default (literal) mode treats the text as search terms, never as syntax:
+
+    - each bare word is wrapped in double quotes, so ``:``, ``(``, ``+``,
+      ``^``, ``'``, ``-`` and ``NEAR`` lose their FTS5 meaning;
+    - balanced ``"quoted phrases"`` are kept as phrases;
+    - a trailing ``*`` on a word keeps prefix matching (``adapt*``);
+    - ``AND``/``OR``/``NOT`` (upper case) stay operators only when they sit
+      between two terms; a dangling or leading operator becomes a literal.
+
+    Adjacent terms are implicitly ANDed, exactly as bare FTS5 terms were, so
+    plain queries rank as before. Returns ``""`` when nothing searchable is
+    left (callers treat that as no results).
+
+    ``syntax=True`` passes the query through as raw FTS5 syntax, with only the
+    historical hyphen-to-space rewrite applied. It can raise
+    ``sqlite3.OperationalError`` on malformed input.
     """
-    # Split on quoted sections to preserve them
-    parts = re.split(r'(".*?")', query)
-    sanitized = []
-    for part in parts:
-        if part.startswith('"') and part.endswith('"'):
-            # Inside quotes: replace hyphens with spaces but keep quotes
-            sanitized.append(part.replace('-', ' '))
+    if syntax:
+        return _legacy_hyphen_sanitize(query)
+
+    tokens: list[tuple[str, str]] = []  # (kind, text): kind in {"term", "op"}
+    for raw in _FTS_TOKEN_RE.findall(query):
+        if raw.startswith('"') and raw.rstrip("*").endswith('"') and len(raw.rstrip("*")) >= 2:
+            inner = raw.rstrip("*")[1:-1]
+            if _WORD_CHAR_RE.search(inner):
+                star = "*" if raw.endswith("*") else ""
+                tokens.append(("term", _quote_fts_term(inner) + star))
+            continue
+        if raw in _FTS_OPERATORS:
+            tokens.append(("op", raw))
+            continue
+        prefix = raw.endswith("*")
+        word = raw.rstrip("*")
+        if not _WORD_CHAR_RE.search(word):
+            continue
+        tokens.append(("term", _quote_fts_term(word) + ("*" if prefix else "")))
+
+    out: list[str] = []
+    for i, (kind, text) in enumerate(tokens):
+        if kind == "op":
+            prev_is_term = bool(out) and tokens[i - 1][0] == "term"
+            next_is_term = i + 1 < len(tokens) and tokens[i + 1][0] == "term"
+            if prev_is_term and next_is_term:
+                out.append(text)
+            else:
+                out.append(_quote_fts_term(text))
         else:
-            # Outside quotes: replace hyphens with spaces
-            sanitized.append(part.replace('-', ' '))
-    return "".join(sanitized)
+            out.append(text)
+    return " ".join(out)
 
 
 def fts_search(
@@ -33,9 +84,18 @@ def fts_search(
     query: str,
     limit: int = 20,
     restrict_ids: list[int] | None = None,
+    syntax: bool = False,
+    snippets: bool = True,
 ) -> list[SearchResult]:
     """
     Run FTS5 search and return ranked results with snippets.
+
+    The snippet is the chunk that best matches the query terms (see
+    ``attach_snippets``); ``snippets=False`` skips that work.
+
+    ``query`` is literal text by default (see ``_sanitize_fts_query``);
+    ``syntax=True`` passes raw FTS5 syntax and may raise
+    ``sqlite3.OperationalError``.
 
     When ``restrict_ids`` is given, the search is scoped to only those paper
     IDs (a cross-paper "which of THESE discuss X?" query). An empty list yields
@@ -44,7 +104,9 @@ def fts_search(
     if restrict_ids is not None and not restrict_ids:
         return []
 
-    safe_query = _sanitize_fts_query(query)
+    safe_query = _sanitize_fts_query(query, syntax=syntax)
+    if not safe_query.strip():
+        return []
     scope_sql = ""
     params: list = [safe_query]
     if restrict_ids is not None:
@@ -57,11 +119,9 @@ def fts_search(
         f"""SELECT
             p.id, p.filename, p.path, p.title,
             p.has_markdown, p.has_embeddings,
-            rank,
-            SUBSTR(pt.raw_text, 1, 200) as text_preview
+            rank
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
-        LEFT JOIN paper_text pt ON pt.paper_id = p.id
         WHERE papers_fts MATCH ?{scope_sql}
         ORDER BY rank
         LIMIT ?""",
@@ -76,7 +136,6 @@ def fts_search(
             path=row["path"],
             title=row["title"],
             score=abs(row["rank"]),  # FTS5 rank is negative, lower = better
-            snippet=row["text_preview"] or "",
             has_markdown=bool(row["has_markdown"]),
             has_embeddings=bool(row["has_embeddings"]),
         ))
@@ -88,12 +147,16 @@ def fts_search(
             for r in results:
                 r.score = round(r.score / max_score, 2)
 
+    if snippets:
+        attach_snippets(conn, results, query=query)
     return results
 
 
-def search_count(conn: sqlite3.Connection, query: str) -> int:
-    """Return the number of FTS5 matches for a query."""
-    safe_query = _sanitize_fts_query(query)
+def search_count(conn: sqlite3.Connection, query: str, syntax: bool = False) -> int:
+    """Return the number of FTS5 matches for a query (global, ignores any limit)."""
+    safe_query = _sanitize_fts_query(query, syntax=syntax)
+    if not safe_query.strip():
+        return 0
     row = conn.execute(
         "SELECT COUNT(*) FROM papers_fts WHERE papers_fts MATCH ?",
         (safe_query,),
@@ -106,9 +169,13 @@ def semantic_search(
     query_vector: bytes,
     limit: int = 20,
     restrict_ids: list[int] | None = None,
+    snippets: bool = True,
 ) -> list[SearchResult]:
     """
     Run vector similarity search using sqlite-vec.
+
+    Snippets come from each paper's best-matching chunk when chunk
+    embeddings exist (``snippets=False`` skips that work).
 
     When ``restrict_ids`` is given, the comparison is scoped to those papers'
     embeddings via ``vec_distance_cosine`` (not global KNN), mirroring
@@ -123,11 +190,9 @@ def semantic_search(
             f"""SELECT
                 p.id, p.filename, p.path, p.title,
                 p.has_markdown, p.has_embeddings,
-                vec_distance_cosine(e.embedding, ?) AS distance,
-                SUBSTR(pt.raw_text, 1, 200) as text_preview
+                vec_distance_cosine(e.embedding, ?) AS distance
             FROM paper_embeddings e
             INNER JOIN papers p ON p.id = e.paper_id
-            LEFT JOIN paper_text pt ON pt.paper_id = p.id
             WHERE p.id IN ({placeholders})
             ORDER BY distance
             LIMIT ?""",
@@ -138,11 +203,9 @@ def semantic_search(
             """SELECT
                 p.id, p.filename, p.path, p.title,
                 p.has_markdown, p.has_embeddings,
-                e.distance,
-                SUBSTR(pt.raw_text, 1, 200) as text_preview
+                e.distance
             FROM paper_embeddings e
             INNER JOIN papers p ON p.id = e.paper_id
-            LEFT JOIN paper_text pt ON pt.paper_id = p.id
             WHERE e.embedding MATCH ?
                 AND k = ?
             ORDER BY e.distance""",
@@ -159,11 +222,12 @@ def semantic_search(
             path=row["path"],
             title=row["title"],
             score=score,
-            snippet=row["text_preview"] or "",
             has_markdown=bool(row["has_markdown"]),
             has_embeddings=bool(row["has_embeddings"]),
         ))
 
+    if snippets:
+        attach_snippets(conn, results, query_vector=query_vector)
     return results
 
 
@@ -174,6 +238,8 @@ def hybrid_search(
     limit: int = 20,
     rrf_k: int = 60,
     restrict_ids: list[int] | None = None,
+    syntax: bool = False,
+    status: dict | None = None,
 ) -> list[SearchResult]:
     """
     Combine FTS5 and vector search using Reciprocal Rank Fusion (RRF).
@@ -182,17 +248,35 @@ def hybrid_search(
 
     ``restrict_ids`` scopes both components to the given paper set; an empty
     list yields no results.
+
+    If the FTS side raises ``sqlite3.OperationalError`` (only reachable with
+    ``syntax=True``), the search continues vector-only. Pass a ``status``
+    dict to learn which path ran: ``status["mode"]`` is ``"hybrid"`` or
+    ``"vector_fallback"`` (with ``status["fts_error"]`` set).
     """
+    if status is None:
+        status = {}
+    status["mode"] = "hybrid"
     if restrict_ids is not None and not restrict_ids:
         return []
 
     fetch_limit = limit * 2
 
-    # Get FTS5 results
-    fts_results = fts_search(conn, query, limit=fetch_limit, restrict_ids=restrict_ids)
+    # Get FTS5 results; a malformed raw-syntax query degrades to vector-only.
+    try:
+        fts_results = fts_search(
+            conn, query, limit=fetch_limit, restrict_ids=restrict_ids, syntax=syntax,
+            snippets=False,
+        )
+    except sqlite3.OperationalError as e:
+        fts_results = []
+        status["mode"] = "vector_fallback"
+        status["fts_error"] = str(e)
 
     # Get semantic results
-    sem_results = semantic_search(conn, query_vector, limit=fetch_limit, restrict_ids=restrict_ids)
+    sem_results = semantic_search(
+        conn, query_vector, limit=fetch_limit, restrict_ids=restrict_ids, snippets=False,
+    )
 
     # Build RRF scores and track component data
     rrf_scores: dict[int, float] = {}
@@ -225,6 +309,8 @@ def hybrid_search(
             r.score_vector, r.rank_vector = vec_data[doc_id]
         results.append(r)
 
+    # Snippets only for the fused top-``limit``: best vector chunk, then FTS chunk.
+    attach_snippets(conn, results, query=query, query_vector=query_vector)
     return results
 
 
@@ -343,8 +429,8 @@ def cascade_search(
     4. Group by document, top-k mean pooling
     5. Return documents ranked by aggregated score with best chunk as excerpt
     """
-    # Stage 1: doc-level candidates
-    doc_results = semantic_search(conn, query_vector, limit=doc_candidates)
+    # Stage 1: doc-level candidates (snippets are only needed on fallback)
+    doc_results = semantic_search(conn, query_vector, limit=doc_candidates, snippets=False)
     doc_ids_in_top = {r.id for r in doc_results}
 
     # Stage 2: chunk-level search
@@ -352,7 +438,7 @@ def cascade_search(
 
     if not chunk_results:
         # Fall back to doc-level results if no chunks
-        return doc_results[:limit]
+        return attach_snippets(conn, doc_results[:limit], query_vector=query_vector)
 
     # Group chunks by document, apply boost
     doc_chunks: dict[int, list[ChunkResult]] = defaultdict(list)
@@ -379,7 +465,7 @@ def cascade_search(
             path=best_chunk.path,
             title=best_chunk.title,
             score=round(score, 4),
-            snippet=best_chunk.chunk_text[:300],
+            snippet=_trim_snippet(best_chunk.chunk_text, []),
             has_markdown=True,
             has_embeddings=True,
         ))
@@ -500,7 +586,7 @@ def find_papers(
             else:
                 tier = 3
             d = dict(r)
-            d.pop("authors", None)
+            d["authors"] = parse_authors(r["authors"])
             d["matched_fields"] = [f for f in _FIND_FIELDS if f in matched]
             scored.append((tier, r["filename"] or "", r["id"], d))
 
@@ -592,3 +678,141 @@ def get_chunk_context(
         "title": row["title"],
         "total_chunks": total_chunks,
     }
+
+
+# --- snippets ---------------------------------------------------------------
+#
+# A result's snippet should show *why* it matched. The first 200 characters
+# of raw_text are usually a masthead or ISSN line, so instead:
+#   1. best vector chunk (semantic/hybrid, when chunk embeddings exist),
+#   2. else the chunk containing the most query terms (FTS),
+#   3. else a window of raw_text around the first query term,
+#   4. else the start of raw_text.
+# All of this reads the DB only; PDFs are never opened on the read path.
+
+SNIPPET_WIDTH = 300
+_TERM_RE = re.compile(r"\w+")
+
+
+def _query_terms(query: str | None) -> list[str]:
+    """Lower-cased search words from a query, minus FTS operators."""
+    if not query:
+        return []
+    terms = []
+    for word in _TERM_RE.findall(query):
+        if word in _FTS_OPERATORS or len(word) < 2:
+            continue
+        w = word.lower()
+        if w not in terms:
+            terms.append(w)
+    return terms
+
+
+def _match_stem(term: str) -> str:
+    """Crude stem so substring matching tolerates FTS5's porter stemming."""
+    return term if len(term) <= 5 else term[:-2]
+
+
+def _trim_snippet(text: str, terms: list[str], width: int = SNIPPET_WIDTH) -> str:
+    """Collapse whitespace and cut ``width`` chars around the first term hit.
+
+    Cuts snap to word boundaries; "..." marks each truncated side.
+    """
+    flat = " ".join(text.split())
+    if len(flat) <= width:
+        return flat
+    lower = flat.lower()
+    positions = [lower.find(_match_stem(t)) for t in terms]
+    positions = [p for p in positions if p >= 0]
+    start = max(0, min(positions) - width // 5) if positions else 0
+    if start > 0:
+        space = flat.find(" ", start)
+        start = space + 1 if 0 <= space < start + 30 else start
+    end = start + width
+    if end < len(flat):
+        space = flat.rfind(" ", start, end)
+        end = space if space > start + width // 2 else end
+    body = flat[start:end].strip()
+    return ("..." if start > 0 else "") + body + ("..." if end < len(flat) else "")
+
+
+def _fts_best_chunks(
+    conn: sqlite3.Connection, doc_ids: list[int], terms: list[str],
+) -> dict[int, str]:
+    """For each doc, the chunk containing the most distinct query terms."""
+    if not doc_ids or not terms:
+        return {}
+    hit_sql = " + ".join("(instr(lower(text), ?) > 0)" for _ in terms)
+    placeholders = ",".join("?" * len(doc_ids))
+    rows = conn.execute(
+        f"""SELECT doc_id, text FROM (
+                SELECT doc_id, text, hits, ROW_NUMBER() OVER (
+                    PARTITION BY doc_id ORDER BY hits DESC, chunk_index
+                ) AS rn
+                FROM (SELECT doc_id, chunk_index, text, ({hit_sql}) AS hits
+                      FROM chunks WHERE doc_id IN ({placeholders}))
+                WHERE hits > 0
+            ) WHERE rn = 1""",
+        [*(_match_stem(t) for t in terms), *doc_ids],
+    ).fetchall()
+    return {row["doc_id"]: row["text"] for row in rows}
+
+
+def _raw_text_snippets(
+    conn: sqlite3.Connection, doc_ids: list[int], terms: list[str],
+    width: int = SNIPPET_WIDTH,
+) -> dict[int, str]:
+    """A window of raw_text around the first query term (or its start)."""
+    if not doc_ids:
+        return {}
+    stems = [_match_stem(t) for t in terms]
+    pos_sql = "".join(f", instr(lower(raw_text), ?) AS p{i}" for i in range(len(stems)))
+    placeholders = ",".join("?" * len(doc_ids))
+    rows = conn.execute(
+        f"SELECT paper_id{pos_sql} FROM paper_text WHERE paper_id IN ({placeholders})",
+        [*stems, *doc_ids],
+    ).fetchall()
+    out: dict[int, str] = {}
+    for row in rows:
+        hits = [row[f"p{i}"] for i in range(len(stems)) if row[f"p{i}"]]
+        start = max(1, min(hits) - width) if hits else 1
+        text = conn.execute(
+            "SELECT SUBSTR(raw_text, ?, ?) FROM paper_text WHERE paper_id = ?",
+            (start, width * 3, row["paper_id"]),
+        ).fetchone()[0]
+        if text:
+            trimmed = _trim_snippet(text, terms, width)
+            if start > 1 and not trimmed.startswith("..."):
+                trimmed = "..." + trimmed
+            out[row["paper_id"]] = trimmed
+    return out
+
+
+def attach_snippets(
+    conn: sqlite3.Connection,
+    results: list[SearchResult],
+    query: str | None = None,
+    query_vector: bytes | None = None,
+    width: int = SNIPPET_WIDTH,
+) -> list[SearchResult]:
+    """Set each result's ``snippet`` to its most relevant stored text."""
+    if not results:
+        return results
+    terms = _query_terms(query)
+    pending = {r.id for r in results}
+    chosen: dict[int, str] = {}
+
+    if query_vector is not None:
+        for doc_id, chunk in best_chunk_per_doc(conn, query_vector, list(pending)).items():
+            chosen[doc_id] = _trim_snippet(chunk.chunk_text, terms, width)
+        pending -= chosen.keys()
+    if pending and terms:
+        for doc_id, text in _fts_best_chunks(conn, list(pending), terms).items():
+            chosen[doc_id] = _trim_snippet(text, terms, width)
+        pending -= chosen.keys()
+    if pending:
+        chosen.update(_raw_text_snippets(conn, list(pending), terms, width))
+
+    for r in results:
+        r.snippet = chosen.get(r.id, "")
+    return results

@@ -84,10 +84,15 @@ def test_fts_hyphenated_query(searchable_db):
 
 
 def test_sanitize_fts_query():
-    """Hyphen sanitization works correctly."""
+    """Literal mode quotes each term; raw mode keeps the legacy hyphen rewrite."""
     from pdf_gantry.search import _sanitize_fts_query
-    assert _sanitize_fts_query("cross-national") == "cross national"
-    assert _sanitize_fts_query('"self-regulation"') == '"self regulation"'
-    assert _sanitize_fts_query("climate AND cross-border") == "climate AND cross border"
-    # Preserve non-hyphen content
-    assert _sanitize_fts_query("climate change") == "climate change"
+    assert _sanitize_fts_query("cross-national") == '"cross-national"'
+    assert _sanitize_fts_query('"self-regulation"') == '"self-regulation"'
+    assert _sanitize_fts_query("climate AND cross-border") == '"climate" AND "cross-border"'
+    assert _sanitize_fts_query("climate change") == '"climate" "change"'
+    assert _sanitize_fts_query("Media: Implications") == '"Media:" "Implications"'
+    assert _sanitize_fts_query('say "hi') == '"say" "hi"'
+    assert _sanitize_fts_query("AND") == '"AND"'
+    # Raw FTS5 syntax mode: historical behaviour
+    assert _sanitize_fts_query("cross-national", syntax=True) == "cross national"
+    assert _sanitize_fts_query("title:x OR y", syntax=True) == "title:x OR y"
