@@ -2420,6 +2420,62 @@ def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, jso
         click.echo(content)
 
 
+# --- schema ---
+
+@cli.command()
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def schema(ctx, json_output):
+    """Print the index's tables, columns, views and common joins.
+
+    For callers querying ~/.gantry/index.db with raw SQL. The views v_papers
+    and v_chunks are the stable read surface: both are keyed by paper_id.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .db import describe_schema
+    conn = get_connection(cfg.db_path)
+    info = describe_schema(conn)
+    conn.close()
+    info["database"] = str(cfg.db_path)
+
+    if use_json:
+        click.echo(json.dumps(info, indent=2))
+        return
+
+    click.echo(f"{info['database']} (schema v{info['schema_version']})")
+    click.echo()
+    click.echo("Views (stable; prefer these):")
+    for v in info["views"]:
+        click.echo(f"  {v['name']}({', '.join(c['name'] for c in v['columns'])})")
+    click.echo()
+    click.echo("Tables:")
+    for t in info["tables"]:
+        kind = " [virtual]" if t["kind"] == "virtual" else ""
+        cols = ", ".join(
+            c["name"] + (" PK" if c["pk"] else "") for c in t["columns"]
+        )
+        click.echo(f"  {t['name']}{kind}({cols})")
+    click.echo()
+    click.echo("Relationships:")
+    for r in info["relationships"]:
+        click.echo(f"  {r['from']} -> {r['to']}  ({r['note']})")
+    click.echo()
+    click.echo("Common joins:")
+    for note in info["common_joins"]:
+        click.echo(f"  - {note}")
+
+
 # --- vault ---
 
 @cli.group()
