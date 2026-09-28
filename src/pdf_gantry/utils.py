@@ -1,6 +1,8 @@
 """Shared utilities: hashing, formatting, helpers."""
 
 import hashlib
+import json
+import re
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -135,3 +137,49 @@ def resolve_ids(
     not_found = missing_ids(requested, existing)
     found = [i for i in dict.fromkeys(requested) if i in existing]
     return found, not_found
+
+
+_AUTHOR_SPLIT_RE = re.compile(r"\s*;\s*|\s+and\s+")
+
+
+def _split_author_string(value: str) -> list[str]:
+    return [p.strip() for p in _AUTHOR_SPLIT_RE.split(value) if p and p.strip()]
+
+
+def parse_authors(value) -> list[str]:
+    """Normalise a stored ``papers.authors`` value to a list of names.
+
+    ``authors`` is written by several paths and has drifted: enrichment
+    stores a JSON-encoded list (``'["A", "B"]'``), while hand-written SQL
+    left ``;``-separated strings (``"A; B"``) and even a JSON list whose one
+    element is itself ``;``-separated. Output code calls this so every
+    consumer sees one shape, a real list, instead of decoding twice.
+
+    Tolerates ``None``/``''`` (-> ``[]``), JSON lists, JSON strings, and
+    ``;`` or `` and `` separated text. Commas are NOT split on, because
+    ``"Last, First"`` is a single name.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return []
+        items = [text]
+        if text[0] in '["':
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, list):
+                items = decoded
+            elif isinstance(decoded, str):
+                items = [decoded]
+    out: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        out.extend(_split_author_string(str(item)))
+    return out
