@@ -214,3 +214,29 @@ def queue_count(
     )
     row = conn.execute(f"SELECT COUNT(*) FROM papers {where}", params).fetchone()
     return row[0]
+
+
+def pending_counts(
+    conn: sqlite3.Connection, max_retries: int = DEFAULT_MAX_RETRIES
+) -> dict[str, int]:
+    """Counts of outstanding work, as the next default run would select it.
+
+    ``needs_*`` mirror the default selections of process/embed/enrich
+    (quarantined and encrypted papers excluded where those commands skip
+    them), so a poller can ask "is there work left?" without SQL.
+    """
+    ok = not_quarantined_condition(max_retries)
+    predicates = {
+        "needs_text": f"has_text = 0 AND is_encrypted = 0 AND {ok}",
+        "needs_embeddings": f"has_text = 1 AND has_embeddings = 0 AND {ok}",
+        "needs_chunk_embeddings": f"has_text = 1 AND has_chunk_embeddings = 0 AND {ok}",
+        "needs_enrich": never_enriched_condition(),
+        "enrich_misses": miss_condition(),
+        "metadata_suspect": "metadata_suspect = 1",
+        "manual_metadata": manual_condition(),
+    }
+    select = ", ".join(
+        f"COALESCE(SUM(CASE WHEN {p} THEN 1 ELSE 0 END), 0)" for p in predicates.values()
+    )
+    row = conn.execute(f"SELECT {select} FROM papers").fetchone()
+    return dict(zip(predicates, row))

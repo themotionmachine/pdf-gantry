@@ -340,6 +340,8 @@ def status(ctx, json_output):
         f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
     ).fetchone()[0]
     info.db_size_bytes = cfg.db_path.stat().st_size
+    from .queue import pending_counts
+    pending = pending_counts(conn, cfg.processing.max_retries)
 
     conn.close()
 
@@ -363,6 +365,7 @@ def status(ctx, json_output):
             "pct_chunk_embeddings": (
                 round(info.with_chunk_embeddings / info.total * 100, 1) if info.total else 0
             ),
+            **pending,
         }, indent=2))
     else:
         click.echo(f"pdf_gantry index: {info.db_path}")
@@ -396,6 +399,18 @@ def status(ctx, json_output):
             click.echo(f"  Suspicious extraction: {format_count(info.suspicious_extraction)} "
                        f"({format_pct(info.suspicious_extraction, info.total)}) "
                        f"— run 'gantry queue --is suspicious'")
+        click.echo()
+        click.echo("Pending work:")
+        click.echo(f"  Needs text:             {format_count(pending['needs_text'])}")
+        click.echo(f"  Needs embeddings:       {format_count(pending['needs_embeddings'])}")
+        click.echo(
+            f"  Needs chunk embeddings: {format_count(pending['needs_chunk_embeddings'])}"
+        )
+        click.echo(f"  Needs enrich:           {format_count(pending['needs_enrich'])}")
+        click.echo(f"  Enrich misses:          {format_count(pending['enrich_misses'])}"
+                   " (retry: gantry enrich --retry-misses)")
+        click.echo(f"  Metadata suspect:       {format_count(pending['metadata_suspect'])}")
+        click.echo(f"  Manual metadata:        {format_count(pending['manual_metadata'])}")
         click.echo()
         click.echo(f"Database size: {format_size(info.db_size_bytes)}")
 
