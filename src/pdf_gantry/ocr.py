@@ -47,7 +47,7 @@ def ocr_document(pdf_path: Path) -> tuple[str, str]:
 
     import io
 
-    import fitz
+    import pymupdf as fitz  # the `fitz` alias prints to stdout
     from PIL import Image
 
     # Open PDF and convert pages to images

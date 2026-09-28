@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # not `import fitz`: that alias prints a deprecation line to stdout
 
 from .models import IngestStats
 from .utils import file_hash, now_iso
