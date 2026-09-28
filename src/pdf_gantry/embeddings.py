@@ -3,22 +3,35 @@
 import sqlite3
 import struct
 import time
+import warnings
 from pathlib import Path
 
 from .models import ProcessStats
 from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 from .utils import now_iso
 
+# Nomic's remote modeling code warns on every load that an optional speed-up
+# fork is missing. It is advice, not a fault, and agents were silencing it
+# with ``2>/dev/null``, which also hid real errors. Filter only that message.
+_MEGABLOCKS_WARNING = r"Install Nomic's megablocks fork"
 
-def _get_embedding_model(model_name: str):
-    """Load the sentence-transformers model."""
+
+def _load_sentence_transformer(model_name: str):
+    """Construct the SentenceTransformer, minus the megablocks advisory warning."""
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
         raise ImportError(
             "sentence-transformers not installed. Run: pip install pdf-gantry[embeddings]"
         )
-    return SentenceTransformer(model_name, trust_remote_code=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_MEGABLOCKS_WARNING, category=UserWarning)
+        return SentenceTransformer(model_name, trust_remote_code=True)
+
+
+def _get_embedding_model(model_name: str):
+    """Load the sentence-transformers model."""
+    return _load_sentence_transformer(model_name)
 
 
 def _serialize_vector(vector) -> bytes:
