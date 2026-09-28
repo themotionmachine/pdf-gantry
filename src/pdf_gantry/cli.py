@@ -12,12 +12,14 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
+from .retrieval import TOTAL_HELP
 from .utils import (
     format_count,
     format_duration,
     format_pct,
     format_size,
     missing_ids,
+    parse_authors,
     parse_ids,
     resolve_ids,
 )
@@ -705,42 +707,245 @@ def ocr(ctx, needs, has_prop, is_prop, stale_embeddings, ids, limit, dry_run, js
 
 # --- search ---
 
-@cli.command()
-@click.argument("query")
+def _warn_unknown_fields(unknown, valid):
+    """Warn on stderr about --fields names that match no output key.
+
+    Shared by search, semantic and info: an unknown name used to vanish
+    silently, so an agent asking for ``title`` got blank columns and no hint.
+    """
+    if unknown:
+        click.echo(
+            f"Warning: unknown --fields name(s): {', '.join(unknown)}. "
+            f"Valid: {', '.join(valid)}",
+            err=True,
+        )
+
+
+def _read_queries(queries_file):
+    """Non-blank, stripped lines of a --queries-file handle, in order."""
+    return [line.strip() for line in queries_file.read().splitlines() if line.strip()]
+
+
+def _resolve_query_args(ctx, query, queries_file, use_json):
+    """Return (queries, multi) from QUERY / --queries-file, or exit 1."""
+    msg = None
+    if query is not None and queries_file is not None:
+        msg = "Pass either QUERY or --queries-file, not both."
+    elif query is None and queries_file is None:
+        msg = "Missing QUERY (or --queries-file PATH|-)."
+    if msg is None:
+        if queries_file is None:
+            return [query], False
+        queries = _read_queries(queries_file)
+        if queries:
+            return queries, True
+        msg = "--queries-file contained no queries."
+    if use_json:
+        click.echo(json.dumps({"error": msg}))
+    else:
+        click.echo(msg, err=True)
+    ctx.exit(EXIT_ERROR)
+    return None, False  # pragma: no cover
+
+
+def _output_format(fmt, ids_only, json_flag):
+    """Resolve the output format. --ids-only > --format > --json > text."""
+    if ids_only:
+        return "ids"
+    if fmt:
+        return fmt
+    return "json" if json_flag else "text"
+
+
+def _emit_query_results(ctx, outcomes, *, out_fmt, multi, fields, components,
+                        restrict_not_found, score_fmt):
+    """Render one or many QueryOutcomes and set the exit code.
+
+    Exit: 2 if no query returned results (and none failed); otherwise 3 if
+    some --restrict-to-ids ids were not in the index or (multi-query) a query
+    failed; otherwise 0.
+    """
+    from .retrieval import display_title, oneline, paper_meta, result_dict, select_fields
+
+    cfg = ctx.obj["config"]
+    all_ids = [r.id for _, o in outcomes if not isinstance(o, str) for r in o.results]
+    meta = {}
+    if all_ids and out_fmt != "ids":
+        conn = get_connection(cfg.db_path)
+        try:
+            meta = paper_meta(conn, all_ids)
+        finally:
+            conn.close()
+
+    any_results = bool(all_ids)
+    any_failed = False
+
+    def entry(q, o):
+        nonlocal any_failed
+        if isinstance(o, str):
+            any_failed = True
+            return {"query": q, "error": o, "results": []}
+        with_components = components and o.mode in ("hybrid", "vector_fallback")
+        return {
+            "query": o.query,
+            "total": o.total,
+            "returned": o.returned,
+            "mode": o.mode,
+            "results": [
+                select_fields(result_dict(r, meta, components=with_components), fields)
+                for r in o.results
+            ],
+            "not_found": restrict_not_found,
+        }
+
+    if out_fmt == "ids":
+        seen = dict.fromkeys(all_ids)
+        for pid in seen:
+            click.echo(pid)
+        for q, o in outcomes:
+            if isinstance(o, str):
+                any_failed = True
+                click.echo(f"Query {q!r} failed: {o}", err=True)
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+    elif out_fmt == "json":
+        entries = [entry(q, o) for q, o in outcomes]
+        if multi:
+            click.echo(json.dumps({"queries": entries, "not_found": restrict_not_found},
+                                  indent=2))
+        else:
+            click.echo(json.dumps(entries[0], indent=2 if any_results else None))
+    elif out_fmt == "oneline":
+        for i, (q, o) in enumerate(outcomes):
+            if isinstance(o, str):
+                any_failed = True
+                click.echo(f"Query {i} {q!r} failed: {o}", err=True)
+                continue
+            for r in o.results:
+                click.echo(oneline(r, meta, index=i if multi else None))
+        _print_not_found("Not in index", restrict_not_found, ids_only=True)
+    else:
+        for i, (q, o) in enumerate(outcomes):
+            if multi:
+                click.echo(f"== [{i}] {q}")
+            if isinstance(o, str):
+                any_failed = True
+                click.echo(f"Error: {o}", err=True)
+                continue
+            if not o.results:
+                click.echo(f'No results for "{q}"')
+                click.echo()
+                continue
+            click.echo(f'Found {o.total} results for "{q}"')
+            click.echo()
+            for rank, r in enumerate(o.results, 1):
+                ck = meta.get(r.id, {}).get("citekey")
+                ck_str = f" @{ck}" if ck else ""
+                click.echo(f" {rank:2d}. [{r.id}] {display_title(r, meta)}{ck_str}"
+                           f"  ({score_fmt.format(r.score)})")
+                has_components = r.score_fts is not None or r.score_vector is not None
+                if components and has_components and o.mode == "hybrid":
+                    fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
+                    vec_str = (f"vec={r.score_vector:.4f}" if r.score_vector is not None
+                               else "vec=--")
+                    click.echo(f"     {fts_str}  {vec_str}")
+                if r.snippet:
+                    click.echo(f'     "{r.snippet}"')
+                click.echo()
+        _print_not_found("Not in index", restrict_not_found, ids_only=False)
+
+    if not any_results and not any_failed:
+        ctx.exit(EXIT_NO_RESULTS)
+    elif restrict_not_found or any_failed:
+        ctx.exit(EXIT_PARTIAL)
+
+
+def _fail(ctx, msg, use_json):
+    if use_json:
+        click.echo(json.dumps({"error": msg}))
+    else:
+        click.echo(msg, err=True)
+    ctx.exit(EXIT_ERROR)
+
+
+def _cached_embedder(cfg):
+    """An embed(q) callable: one model per process; ImportError remembered."""
+    from . import embeddings
+
+    failure: list[ImportError] = []
+
+    def embed(q):
+        if failure:
+            raise failure[0]
+        try:
+            return embeddings.embed_query(cfg.embedding.model, q)
+        except ImportError as e:
+            failure.append(e)
+            raise
+    return embed
+
+
+_FORMAT_OPTION = click.option(
+    "--format", "out_format", type=click.Choice(["text", "json", "oneline"]), default=None,
+    help="Output format. 'oneline': one tab-separated line per hit "
+         "(id, score, year, citekey, title; title falls back to filename). "
+         "Overrides --json.",
+)
+_QUERIES_FILE_OPTION = click.option(
+    "--queries-file", "queries_file", type=click.File("r"), default=None,
+    help="Run many queries in one process (one per line; '-' reads stdin), "
+         "loading the embedding model once. JSON: {\"queries\": [{query, mode, total, "
+         "returned, results, not_found}, ...]}. oneline: each line prefixed with the "
+         "0-based query index. --ids-only: the de-duplicated union of hits in "
+         "first-seen order.",
+)
+
+
+@cli.command(epilog=TOTAL_HELP)
+@click.argument("query", required=False)
+@_QUERIES_FILE_OPTION
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
 @click.option("--hybrid", is_flag=True, help="Combine FTS5 and vector search (default)")
 @click.option("--fts", "fts_only", is_flag=True, help="Use FTS5 only, skip vector search")
+@click.option("--fts-syntax", "fts_syntax", is_flag=True,
+              help="Pass QUERY to FTS5 as raw syntax (column filters, NEAR, "
+                   "parentheses). By default QUERY is literal text: punctuation "
+                   "is safe, \"phrases\" and word* prefixes work, and AND/OR/NOT "
+                   "between two terms stay operators.")
 @click.option("--components", is_flag=True,
               help="Include FTS and vector component scores (hybrid only)")
 @click.option("--fields", "field_list", type=str, default=None,
-              help="Comma-separated fields to include in JSON output")
+              help="Comma-separated result fields to include in JSON output "
+                   "(e.g. id,title,year,authors,citekey)")
 @click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
               help="Comma-separated paper IDs; scope the search to only these papers")
 @click.option("--ids-only", "ids_only", is_flag=True,
               help="Emit bare ranked paper IDs, one per line (for piping)")
+@_FORMAT_OPTION
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def search(ctx, query, limit, hybrid, fts_only, components, field_list,
-           restrict_to_ids, ids_only, json_output):
-    """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only."""
-    cfg = ctx.obj["config"]
-    # --ids-only is a pure pipe format: it wins over --json.
-    use_json = (json_output or ctx.obj["json"]) and not ids_only
+def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, components,
+           field_list, restrict_to_ids, ids_only, out_format, json_output):
+    """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only.
 
+    JSON 'mode': hybrid | vector_fallback (FTS5 rejected the query, vector
+    only) | fts (embeddings unavailable) | fts_only (--fts).
+    """
+    from .retrieval import SEARCH_RESULT_FIELDS, FtsSyntaxError, run_search, split_fields
+
+    cfg = ctx.obj["config"]
+    out_fmt = _output_format(out_format, ids_only, json_output or ctx.obj["json"])
+    use_json = out_fmt == "json"
+
+    queries, multi = _resolve_query_args(ctx, query, queries_file, use_json)
+    fields, unknown = split_fields(field_list, SEARCH_RESULT_FIELDS)
+    _warn_unknown_fields(unknown, SEARCH_RESULT_FIELDS)
     restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
-        msg = "No database found. Run 'gantry ingest' first."
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
+        _fail(ctx, "No database found. Run 'gantry ingest' first.", use_json)
         return
 
     conn = get_connection(cfg.db_path)
-    from .search import fts_search, hybrid_search, search_count
-
     # Resolve --restrict-to-ids against `papers` up front rather than letting
     # a bad id silently fall out of the search's WHERE id IN (...) clause —
     # otherwise a stale/mistyped id and "nothing matched" look identical.
@@ -748,142 +953,39 @@ def search(ctx, query, limit, hybrid, fts_only, components, field_list,
     if restrict_ids is not None:
         restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
 
-    # Hybrid is the default; --fts opts out. (--hybrid kept for explicitness.)
-    use_hybrid = not fts_only
-    # Track whether we fell back from hybrid to FTS due to missing embeddings.
-    # This lets us emit a machine-readable ``mode`` in JSON so a remote agent
-    # can distinguish full hybrid output from silently-degraded FTS output.
-    embed_degraded = False
-
+    embed = None if fts_only else _cached_embedder(cfg)
+    outcomes = []
+    warned: set[str] = set()
+    fatal = None
     try:
-        if use_hybrid:
-            from .embeddings import embed_query
+        for q in queries:
             try:
-                query_vec = embed_query(cfg.embedding.model, query)
-            except ImportError:
-                click.echo("Embeddings unavailable; falling back to FTS.", err=True)
-                use_hybrid = False
-                embed_degraded = True
-        if use_hybrid:
-            results = hybrid_search(conn, query, query_vec, limit=limit, restrict_ids=restrict_ids)
-            total = len(results)
-        else:
-            results = fts_search(conn, query, limit=limit, restrict_ids=restrict_ids)
-            total = len(results) if restrict_ids is not None else search_count(conn, query)
-    except ImportError as e:
-        msg = str(e)
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
-        return
+                o = run_search(conn, q, embed=embed, fts_only=fts_only, fts_syntax=fts_syntax,
+                               limit=limit, restrict_ids=restrict_ids)
+            except FtsSyntaxError as e:
+                if not multi:
+                    fatal = str(e)
+                    break
+                outcomes.append((q, str(e)))
+                continue
+            for w in o.warnings:
+                if w not in warned:
+                    click.echo(w, err=True)
+                    warned.add(w)
+            outcomes.append((q, o))
     except Exception as e:
-        msg = f"Search error: {e}"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
-        return
+        fatal = f"Search error: {e}"
     finally:
         conn.close()
-
-    # Compute the machine-readable mode that describes which retrieval path ran.
-    #   "hybrid"   — FTS5 + vector RRF fusion both executed
-    #   "fts"      — FTS5 only, embeddings were requested but unavailable (degraded)
-    #   "fts_only" — caller explicitly passed --fts (not a degradation)
-    # This is the window: the mode lives in the execution-path decision above
-    # but was invisible to any agent reading JSON output.  Now it crosses over.
-    if use_hybrid:
-        search_mode = "hybrid"
-    elif embed_degraded:
-        search_mode = "fts"
-    else:
-        search_mode = "fts_only"
-
-    if not results:
-        if use_json:
-            click.echo(json.dumps({
-                "query": query, "total": 0, "results": [], "mode": search_mode,
-                "not_found": restrict_not_found,
-            }))
-        else:
-            click.echo(f'No results for "{query}"')
-            _print_not_found("Not in index", restrict_not_found, ids_only)
-        ctx.exit(EXIT_NO_RESULTS)
+    if fatal:
+        _fail(ctx, fatal, use_json)
         return
 
-    # --ids-only: bare ranked IDs, one per line, nothing else (pipe-friendly).
-    if ids_only:
-        for r in results:
-            click.echo(r.id)
-        _print_not_found("Not in index", restrict_not_found, ids_only=True)
-        if restrict_not_found:
-            ctx.exit(EXIT_PARTIAL)
-        return
-
-    # Lookup citekeys for result papers
-    result_ids = [r.id for r in results]
-    citekey_map = {}
-    if result_ids:
-        placeholders = ",".join("?" * len(result_ids))
-        conn2 = get_connection(cfg.db_path)
-        rows = conn2.execute(
-            f"SELECT id, citekey FROM papers WHERE id IN ({placeholders})", result_ids
-        ).fetchall()
-        citekey_map = {row["id"]: row["citekey"] for row in rows}
-        conn2.close()
-
-    if use_json:
-        result_dicts = []
-        for r in results:
-            d = {
-                "id": r.id,
-                "filename": r.filename,
-                "path": r.path,
-                "score": r.score,
-                "snippet": r.snippet,
-                "has_markdown": r.has_markdown,
-                "has_embeddings": r.has_embeddings,
-                "citekey": citekey_map.get(r.id),
-            }
-            if components and use_hybrid:
-                d["score_fts"] = r.score_fts
-                d["score_vector"] = r.score_vector
-                d["rank_fts"] = r.rank_fts
-                d["rank_vector"] = r.rank_vector
-            if field_list:
-                fields = {f.strip() for f in field_list.split(",")}
-                d = {k: v for k, v in d.items() if k in fields}
-            result_dicts.append(d)
-
-        click.echo(json.dumps({
-            "query": query,
-            "total": total,
-            "mode": search_mode,
-            "results": result_dicts,
-            "not_found": restrict_not_found,
-        }, indent=2))
-    else:
-        click.echo(f'Found {total} results for "{query}"')
-        _print_not_found("Not in index", restrict_not_found, ids_only=False)
-        click.echo()
-        for i, r in enumerate(results, 1):
-            ck = citekey_map.get(r.id)
-            ck_str = f" @{ck}" if ck else ""
-            click.echo(f" {i:2d}. [{r.score:.2f}] {r.filename}{ck_str}")
-            has_components = r.score_fts is not None or r.score_vector is not None
-            if components and use_hybrid and has_components:
-                fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
-                vec_str = f"vec={r.score_vector:.4f}" if r.score_vector is not None else "vec=--"
-                click.echo(f"     {fts_str}  {vec_str}")
-            if r.snippet:
-                click.echo(f"     \"{r.snippet}\"")
-            click.echo()
-
-    if restrict_not_found:
-        ctx.exit(EXIT_PARTIAL)
+    _emit_query_results(
+        ctx, outcomes, out_fmt=out_fmt, multi=multi, fields=fields,
+        components=components, restrict_not_found=restrict_not_found,
+        score_fmt="{:.2f}",
+    )
 
 
 # --- queue ---
@@ -1131,126 +1233,74 @@ def gaps(ctx, field_name, attempted_only, ids_only, json_output):
 
 # --- semantic ---
 
-@cli.command()
-@click.argument("query")
+@cli.command(epilog=TOTAL_HELP)
+@click.argument("query", required=False)
+@_QUERIES_FILE_OPTION
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
 @click.option("--doc-only", is_flag=True, help="Use doc-level embeddings only (skip chunk cascade)")
 @click.option("--fields", "field_list", type=str, default=None,
-              help="Comma-separated fields to include in JSON output")
+              help="Comma-separated result fields to include in JSON output "
+                   "(e.g. id,title,year,authors,citekey)")
 @click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
               help="Comma-separated paper IDs; scope the search to only these papers")
 @click.option("--ids-only", "ids_only", is_flag=True,
               help="Emit bare ranked paper IDs, one per line (for piping)")
+@_FORMAT_OPTION
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only, json_output):
-    """Semantic similarity search (requires embeddings)."""
-    cfg = ctx.obj["config"]
-    use_json = (json_output or ctx.obj["json"]) and not ids_only
+def semantic(ctx, query, queries_file, limit, doc_only, field_list, restrict_to_ids,
+             ids_only, out_format, json_output):
+    """Semantic similarity search (requires embeddings).
 
+    JSON 'mode': cascade (doc filter + chunk retrieval) | doc (doc-level only).
+    """
+    from .retrieval import SEMANTIC_RESULT_FIELDS, run_semantic, split_fields
+
+    cfg = ctx.obj["config"]
+    out_fmt = _output_format(out_format, ids_only, json_output or ctx.obj["json"])
+    use_json = out_fmt == "json"
+
+    queries, multi = _resolve_query_args(ctx, query, queries_file, use_json)
+    fields, unknown = split_fields(field_list, SEMANTIC_RESULT_FIELDS)
+    _warn_unknown_fields(unknown, SEMANTIC_RESULT_FIELDS)
     restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
-        msg = "No database found. Run 'gantry ingest' first."
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
-        ctx.exit(EXIT_ERROR)
+        _fail(ctx, "No database found. Run 'gantry ingest' first.", use_json)
         return
 
-    from .embeddings import embed_query
-    from .search import cascade_search, semantic_search
-
-    try:
-        query_vec = embed_query(cfg.embedding.model, query)
-    except ImportError as e:
-        if use_json:
-            click.echo(json.dumps({"error": str(e)}))
-        else:
-            click.echo(str(e), err=True)
-        ctx.exit(EXIT_ERROR)
-        return
-
+    embed = _cached_embedder(cfg)
     conn = get_connection(cfg.db_path)
-
-    # Resolve --restrict-to-ids against `papers` up front rather than letting
-    # a bad id silently fall out of the search's WHERE id IN (...) clause —
-    # otherwise a stale/mistyped id and "nothing matched" look identical.
     restrict_not_found: list[int] = []
     if restrict_ids is not None:
         restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
 
-    # Use cascade search if chunk embeddings exist, unless --doc-only
     has_chunks = conn.execute(
         "SELECT COUNT(*) FROM papers WHERE has_chunk_embeddings = 1"
     ).fetchone()[0] > 0
 
-    # Restriction scopes to a doc set, so use scoped doc-level cosine (not the
-    # global two-stage cascade).
-    if restrict_ids is not None:
-        results = semantic_search(conn, query_vec, limit=limit, restrict_ids=restrict_ids)
-    elif has_chunks and not doc_only:
-        results = cascade_search(conn, query_vec, limit=limit)
-    else:
-        results = semantic_search(conn, query_vec, limit=limit)
-    conn.close()
-
-    if not results:
-        if use_json:
-            click.echo(json.dumps({
-                "query": query, "total": 0, "results": [], "not_found": restrict_not_found,
-            }))
-        else:
-            click.echo(f'No results for "{query}"')
-            _print_not_found("Not in index", restrict_not_found, ids_only)
-        ctx.exit(EXIT_NO_RESULTS)
+    outcomes = []
+    fatal = None
+    try:
+        for q in queries:
+            query_vec = embed(q)
+            outcomes.append((q, run_semantic(
+                conn, query_vec, q, limit=limit, doc_only=doc_only,
+                restrict_ids=restrict_ids, has_chunks=has_chunks,
+            )))
+    except ImportError as e:
+        fatal = str(e)
+    finally:
+        conn.close()
+    if fatal:
+        _fail(ctx, fatal, use_json)
         return
 
-    # --ids-only: bare ranked IDs, one per line, nothing else (pipe-friendly).
-    if ids_only:
-        for r in results:
-            click.echo(r.id)
-        _print_not_found("Not in index", restrict_not_found, ids_only=True)
-        if restrict_not_found:
-            ctx.exit(EXIT_PARTIAL)
-        return
-
-    if use_json:
-        result_dicts = []
-        for r in results:
-            d = {
-                "id": r.id,
-                "filename": r.filename,
-                "path": r.path,
-                "score": r.score,
-                "snippet": r.snippet,
-                "has_markdown": r.has_markdown,
-                "has_embeddings": r.has_embeddings,
-            }
-            if field_list:
-                fields = {f.strip() for f in field_list.split(",")}
-                d = {k: v for k, v in d.items() if k in fields}
-            result_dicts.append(d)
-
-        click.echo(json.dumps({
-            "query": query,
-            "total": len(results),
-            "results": result_dicts,
-            "not_found": restrict_not_found,
-        }, indent=2))
-    else:
-        click.echo(f'Found {len(results)} results for "{query}"')
-        _print_not_found("Not in index", restrict_not_found, ids_only=False)
-        click.echo()
-        for i, r in enumerate(results, 1):
-            click.echo(f" {i:2d}. [{r.score:.4f}] {r.filename}")
-            if r.snippet:
-                click.echo(f'     "{r.snippet[:100]}..."')
-            click.echo()
-
-    if restrict_not_found:
-        ctx.exit(EXIT_PARTIAL)
+    _emit_query_results(
+        ctx, outcomes, out_fmt=out_fmt, multi=multi, fields=fields,
+        components=False, restrict_not_found=restrict_not_found,
+        score_fmt="{:.4f}",
+    )
 
 
 # --- embed ---
@@ -1927,6 +1977,7 @@ def find(ctx, fragment, limit, json_output):
                     "id": r["id"],
                     "filename": r["filename"],
                     "title": r["title"],
+                    "authors": parse_authors(r.get("authors")),
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
                     "citekey": r.get("citekey"),
@@ -1973,6 +2024,9 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         return
 
     paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    from .retrieval import INFO_FIELDS, split_fields
+    info_fields, unknown_fields = split_fields(field_list, INFO_FIELDS)
+    _warn_unknown_fields(unknown_fields, INFO_FIELDS)
 
     conn = get_connection(cfg.db_path)
 
@@ -2055,7 +2109,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
             "filename": r["filename"],
             "path": r["path"],
             "title": r["title"],
-            "authors": r["authors"],
+            "authors": parse_authors(r["authors"]),
             "year": r["year"],
             "doi": r["doi"],
             "abstract": r["abstract"],
@@ -2094,9 +2148,8 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
                         chunk_dict["total_chunks"] = chunk_ctx["total_chunks"]
                 d["top_chunk"] = chunk_dict
 
-        if field_list:
-            fields = {f.strip() for f in field_list.split(",")}
-            d = {k: v for k, v in d.items() if k in fields}
+        if info_fields is not None:
+            d = {k: v for k, v in d.items() if k in set(info_fields)}
 
         results.append(d)
 
@@ -2112,7 +2165,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
             if d.get("title"):
                 click.echo(f"  Title: {d['title']}")
             if d.get("authors"):
-                click.echo(f"  Authors: {d['authors']}")
+                click.echo(f"  Authors: {'; '.join(d['authors'])}")
             if d.get("year"):
                 click.echo(f"  Year: {d['year']}")
             if d.get("doi"):
@@ -2225,11 +2278,11 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
     try:
         paper_id = int(identifier)
         paper = conn.execute(
-            "SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)
+            "SELECT id, filename, title, authors FROM papers WHERE id = ?", (paper_id,)
         ).fetchone()
     except ValueError:
         paper = conn.execute(
-            "SELECT id, filename, title FROM papers WHERE filename = ?", (identifier,)
+            "SELECT id, filename, title, authors FROM papers WHERE filename = ?", (identifier,)
         ).fetchone()
 
     if not paper:
@@ -2294,6 +2347,7 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             "paper_id": paper["id"],
             "filename": paper["filename"],
             "title": paper["title"],
+            "authors": parse_authors(paper["authors"]),
             "text": content,
         }, indent=2))
     else:

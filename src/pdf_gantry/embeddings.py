@@ -296,8 +296,24 @@ def embed_chunks(
     return stats
 
 
-def embed_query(model_name: str, query: str) -> bytes:
-    """Embed a query string and return serialized vector."""
+# Query-side model cache: (loader, model) per model name. A process that
+# embeds many queries (search/semantic --queries-file) pays the ~12 s model
+# load once. The loader identity is part of the entry so a swapped-in loader
+# (tests, or a patched environment) is never shadowed by a stale model.
+_QUERY_MODEL_CACHE: dict[str, tuple] = {}
+
+
+def _query_model(model_name: str):
+    cached = _QUERY_MODEL_CACHE.get(model_name)
+    if cached is not None and cached[0] is _get_embedding_model:
+        return cached[1]
     model = _get_embedding_model(model_name)
+    _QUERY_MODEL_CACHE[model_name] = (_get_embedding_model, model)
+    return model
+
+
+def embed_query(model_name: str, query: str) -> bytes:
+    """Embed a query string and return serialized vector (model cached per process)."""
+    model = _query_model(model_name)
     vector = model.encode(f"search_query: {query}", show_progress_bar=False)
     return _serialize_vector(vector)
