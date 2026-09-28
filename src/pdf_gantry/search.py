@@ -286,7 +286,7 @@ def best_chunk_per_doc(
     rows = conn.execute(
         f"""SELECT
             c.doc_id, c.chunk_id, c.chunk_index, c.section_header,
-            c.page_start, c.text,
+            c.page_start, c.page_end, c.text,
             p.filename, p.path, p.title,
             vec_distance_cosine(cv.embedding, ?) AS distance
         FROM chunks c
@@ -314,6 +314,7 @@ def best_chunk_per_doc(
             filename=row["filename"],
             path=row["path"],
             title=row["title"],
+            page_end=row["page_end"],
         )
     return best
 
@@ -418,7 +419,7 @@ def get_chunk_context(
     # Get the target chunk with document info
     row = conn.execute(
         """SELECT c.chunk_id, c.doc_id, c.chunk_index, c.section_header,
-                  c.page_start, c.text,
+                  c.page_start, c.page_end, c.text,
                   p.filename, p.path, p.title
         FROM chunks c
         JOIN papers p ON p.id = c.doc_id
@@ -481,6 +482,7 @@ def get_chunk_context(
         "chunk_index": target_index,
         "section_header": row["section_header"],
         "page_start": row["page_start"],
+        "page_end": row["page_end"],
         "chunk_text": target_text,
         "context": "\n\n".join(context_parts),
         "filename": row["filename"],

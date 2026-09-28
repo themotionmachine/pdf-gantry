@@ -2034,7 +2034,8 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         import collections
         chunks_by_doc = collections.defaultdict(list)
         chunk_rows = conn.execute(
-            f"""SELECT doc_id, chunk_id, chunk_index, section_header, text
+            f"""SELECT doc_id, chunk_id, chunk_index, section_header,
+                       page_start, page_end, text
                 FROM chunks
                 WHERE doc_id IN ({placeholders})
                 ORDER BY doc_id, chunk_index""",
@@ -2045,6 +2046,8 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
                 "chunk_id": c["chunk_id"],
                 "chunk_index": c["chunk_index"],
                 "section_header": c["section_header"],
+                "page_start": c["page_start"],
+                "page_end": c["page_end"],
                 "text": c["text"],
             })
 
@@ -2084,6 +2087,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
                     "chunk_index": tc.chunk_index,
                     "section_header": tc.section_header,
                     "page_start": tc.page_start,
+                    "page_end": tc.page_end,
                     "score": tc.score,
                     "text": tc.chunk_text,
                 }
@@ -2211,6 +2215,8 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
                 "title": row["title"],
                 "chunk_index": row["chunk_index"],
                 "section_header": row["section_header"],
+                "page_start": row["page_start"],
+                "page_end": row["page_end"],
                 "text": row["text"],
             }, indent=2))
         else:
@@ -2244,7 +2250,8 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
 
     if list_chunks:
         chunks = conn.execute(
-            "SELECT chunk_id, chunk_index, section_header, LENGTH(text) as text_len "
+            "SELECT chunk_id, chunk_index, section_header, page_start, page_end, "
+            "LENGTH(text) as text_len "
             "FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
             (paper["id"],),
         ).fetchall()
@@ -2258,6 +2265,8 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
                         "chunk_id": c["chunk_id"],
                         "chunk_index": c["chunk_index"],
                         "section_header": c["section_header"],
+                        "page_start": c["page_start"],
+                        "page_end": c["page_end"],
                         "text_length": c["text_len"],
                     }
                     for c in chunks
