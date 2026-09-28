@@ -1676,6 +1676,164 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
         ctx.exit(EXIT_PARTIAL)
 
 
+# --- meta ---
+
+@cli.group()
+def meta():
+    """Set, clear or repair paper metadata by hand (instead of raw SQL).
+
+    Hand-set metadata is recorded as metadata_source 'manual:<by>' and is
+    never overwritten by `gantry enrich`.
+    """
+
+
+def _no_db(ctx, use_json):
+    msg = "No database found. Run 'gantry ingest' first."
+    if use_json:
+        click.echo(json.dumps({"error": msg}))
+    else:
+        click.echo(msg, err=True)
+    ctx.exit(EXIT_ERROR)
+
+
+@meta.command("set")
+@click.option("--id", "paper_id", type=int, required=True, help="Paper ID to edit")
+@click.option("--title", default=None)
+@click.option("--authors", default=None,
+              help='Authors as "A; B" or a JSON list \'["A", "B"]\' (stored as a JSON list)')
+@click.option("--year", type=int, default=None)
+@click.option("--citekey", default=None)
+@click.option("--doi", default=None, help="DOI (a doi.org URL prefix is stripped)")
+@click.option("--abstract", default=None)
+@click.option("--by", default="cli", show_default=True,
+              help="Who set it; recorded as metadata_source 'manual:<by>'")
+@click.option("--dry-run", is_flag=True, help="Show the changes without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_set(ctx, paper_id, title, authors, year, citekey, doi, abstract, by,
+             dry_run, json_output):
+    """Set metadata fields on one paper. Only the fields given are written."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+
+    from .meta import set_metadata
+
+    conn = get_connection(cfg.db_path)
+    try:
+        result = set_metadata(
+            conn, paper_id, title=title, authors=authors, year=year, doi=doi,
+            abstract=abstract, citekey=citekey, by=by, dry_run=dry_run,
+        )
+    except ValueError as e:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({"error": str(e)}))
+        else:
+            click.echo(str(e), err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    except LookupError:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({"error": f"Paper {paper_id} not in index",
+                                   "not_found": [paper_id]}))
+        else:
+            click.echo(f"Paper {paper_id} not in index", err=True)
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        click.echo(f"{prefix}Paper {paper_id} ({result['metadata_source']}):")
+        for field, change in result["changes"].items():
+            click.echo(f"  {field}: {change['old']!r} -> {change['new']!r}")
+
+
+@meta.command("clear")
+@click.option("--ids", required=True, help="Comma-separated paper IDs")
+@click.option("--citekey", "clear_citekey", is_flag=True,
+              help="Also clear citekey (left alone by default)")
+@click.option("--dry-run", is_flag=True, help="Report what would be cleared")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_clear(ctx, ids, clear_citekey, dry_run, json_output):
+    """Null title/authors/year/doi/abstract and reset enrich/verify state.
+
+    The papers become eligible for the next default `gantry enrich`.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .meta import clear_metadata
+
+    conn = get_connection(cfg.db_path)
+    result = clear_metadata(conn, paper_ids, citekey=clear_citekey, dry_run=dry_run)
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        verb = "Would clear" if dry_run else "Cleared"
+        click.echo(f"{verb} {len(result['cleared'])} paper(s): "
+                   f"{', '.join(result['fields'])}")
+        _print_not_found("Not in index", result["not_found"], ids_only=False)
+
+    if not result["cleared"]:
+        ctx.exit(EXIT_NO_RESULTS)
+    elif result["not_found"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
+@meta.command("normalize")
+@click.option("--all-orphans", is_flag=True,
+              help="Also clear abstracts on untitled papers not flagged metadata_suspect")
+@click.option("--dry-run", is_flag=True, help="Report counts without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_normalize(ctx, all_orphans, dry_run, json_output):
+    """Repair hand-written metadata. Idempotent.
+
+    Converts non-JSON authors to JSON lists, 'YYYY-MM-DD HH:MM:SS' timestamps
+    to ISO, clears orphaned abstracts (untitled + metadata_suspect), and tags
+    legacy provider misses as metadata_source 'none:legacy'.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+
+    from .meta import normalize_metadata
+
+    conn = get_connection(cfg.db_path)
+    report = normalize_metadata(conn, dry_run=dry_run, all_orphans=all_orphans)
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+    prefix = "[DRY RUN] " if dry_run else ""
+    click.echo(f"{prefix}Authors converted to JSON lists: {report['authors_normalized']}")
+    for col, n in report["timestamps_normalized"].items():
+        click.echo(f"{prefix}Timestamps converted to ISO ({col}): {n}")
+    click.echo(f"{prefix}Orphaned abstracts cleared: {report['orphan_abstracts_cleared']}")
+    others = report["other_orphan_abstract_ids"]
+    if others:
+        click.echo(f"  Other untitled papers with an abstract (kept; --all-orphans "
+                   f"to clear): {len(others)}")
+    click.echo(f"{prefix}Legacy misses tagged none:legacy: {report['legacy_misses_tagged']}")
+
+
 # --- retry ---
 
 @cli.command()
