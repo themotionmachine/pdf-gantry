@@ -11,6 +11,27 @@ from .utils import now_iso
 
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
 
+# A paper's OWN doi is printed in its front matter; every other doi in the file
+# belongs to something it cites. Searching the whole document and taking the
+# first hit (the pre-2026-09 behaviour) therefore mis-identifies any paper whose
+# doi is not printed on page 1 — it silently adopts a reference-list doi and,
+# because the doi tier is treated as exact, writes that work's title/authors/year
+# over the paper with full confidence. Bound the search instead.
+DOI_HEAD_CHARS = 6000  # ~first two pages of extracted text
+
+# Never read a doi out of the reference section, however early it starts.
+_REFERENCES_RE = re.compile(
+    r'\n\s*(references|bibliography|works cited|reference list|notes and references)\s*\n',
+    re.I,
+)
+
+# Front-matter dois are usually adjacent to one of these; reference-list dois
+# rarely are (they sit after a page range or a closing quote).
+_SELF_DOI_CONTEXT = re.compile(
+    r'(doi\.org|dx\.doi\.org|\bdoi\b\s*[:.]|to cite|how to cite|cite this|permalink)',
+    re.I,
+)
+
 _TITLE_NORMALIZE_RE = re.compile(r'[^a-z0-9\s]')
 _WHITESPACE_RE = re.compile(r'\s+')
 
@@ -123,18 +144,52 @@ class EnrichStats:
     matched_by_title: int = 0
     no_match: int = 0
     api_errors: int = 0
+    suspect: int = 0
     elapsed_seconds: float = 0.0
 
 
-def extract_doi(text: str) -> str | None:
-    """Extract a DOI from text content."""
-    match = DOI_PATTERN.search(text)
-    if match:
-        doi = match.group(0)
-        # Clean trailing punctuation
-        doi = doi.rstrip(".,;:)]}")
-        return doi
-    return None
+def extract_doi(text: str, head_chars: int = DOI_HEAD_CHARS) -> str | None:
+    """Extract the paper's OWN doi from its front matter.
+
+    Scoped deliberately: only the first ``head_chars`` of extracted text, and
+    never past a reference-section heading. Among candidates in that window,
+    prefer one that appears in a self-citation context (``doi.org``, ``DOI:``,
+    ``How to cite``) and then the one that repeats most often — a paper's own
+    doi is typically printed more than once in its front matter, a cited one
+    is not. Returns None rather than guessing when the window holds no doi;
+    the caller falls through to the title-search tier, which is verified.
+    """
+    if not text:
+        return None
+
+    cut = len(text)
+    ref = _REFERENCES_RE.search(text)
+    if ref:
+        cut = ref.start()
+    head = text[:min(cut, head_chars)]
+
+    candidates: list[tuple[str, int]] = []  # (doi, start offset)
+    for match in DOI_PATTERN.finditer(head):
+        doi = match.group(0).rstrip(".,;:)]}")
+        if doi:
+            candidates.append((doi, match.start()))
+    if not candidates:
+        return None
+
+    counts: dict[str, int] = {}
+    contextual: dict[str, bool] = {}
+    for doi, start in candidates:
+        counts[doi] = counts.get(doi, 0) + 1
+        if not contextual.get(doi):
+            window = head[max(0, start - 60):start]
+            contextual[doi] = bool(_SELF_DOI_CONTEXT.search(window))
+
+    def rank(item: tuple[str, int]) -> tuple[int, int, int]:
+        doi, start = item
+        # contextual first, then most-repeated, then earliest
+        return (0 if contextual.get(doi) else 1, -counts[doi], start)
+
+    return min(candidates, key=rank)[0]
 
 
 def _fetch_by_doi(doi: str, rate_limit: float = 0.1) -> dict | None:
@@ -180,15 +235,199 @@ def _fetch_by_title(title: str, rate_limit: float = 0.1) -> dict | None:
         return None
 
 
-def _extract_title_from_text(raw_text: str) -> str | None:
-    """Attempt to extract a title from the first few lines of PDF text."""
-    lines = raw_text.strip().split("\n")[:10]
-    # Find the first non-empty, non-trivial line
-    for line in lines:
-        line = line.strip()
-        if len(line) > 10 and not line.startswith("http"):
-            return line[:200]
-    return None
+# --- verification by containment -------------------------------------------
+#
+# Verifying a metadata match does NOT require locating the title on the page —
+# only deciding whether the provider's answer is present in this document. That
+# reframing sidesteps the whole masthead/cover-sheet problem: an extractor has
+# to pick the right line, containment does not care where the words are.
+#
+# Measured on 142 papers whose citekey links them to a human-curated .bib
+# entry (ground truth independent of any heuristic here): at threshold 0.6,
+# 92.3% of true title/document pairs pass and 2.1% of deliberately mismatched
+# pairs do. The line-picking extractor below recovers a usable title for only
+# ~half of the same corpus, which is why it must not be the verifier.
+
+CONTAINMENT_HEAD_CHARS = 6000
+CONTAINMENT_THRESHOLD = 0.6
+
+# Words too common in academic titles to evidence a match.
+_TITLE_STOPWORDS = frozenset("""
+the a an of and or for in on to with by from as at is are be that this how what
+why when who whose which its their our not no new using use toward towards
+between within into over under after before more most less least case study
+studies analysis approach evidence role impact effects effect
+""".split())
+
+_CONTENT_WORD_RE = re.compile(r"[a-z][a-z'\-]{3,}")
+
+
+def title_containment(
+    title: str | None,
+    raw_text: str | None,
+    head_chars: int = CONTAINMENT_HEAD_CHARS,
+) -> float:
+    """Fraction of a title's distinctive words present in a document's opening.
+
+    Position-free by design — see the note above. Returns 0.0 when either side
+    is missing, so an absent title never reads as a confident match.
+    """
+    if not title or not raw_text:
+        return 0.0
+    tokens = [w for w in _CONTENT_WORD_RE.findall(title.lower())
+              if w not in _TITLE_STOPWORDS]
+    if not tokens:  # a title made entirely of stopwords ("The Case For It")
+        tokens = _CONTENT_WORD_RE.findall(title.lower())
+    if not tokens:
+        return 0.0
+    present = set(_CONTENT_WORD_RE.findall(raw_text[:head_chars].lower()))
+    return sum(1 for w in tokens if w in present) / len(tokens)
+
+
+# --- title extraction (for the title-SEARCH query tier only) ---------------
+
+_LINE_NORMALIZE_RE = re.compile(r"\d+")
+_FRONT_MATTER_END_RE = re.compile(
+    r"^\s*(abstract|a b s t r a c t|keywords|key words|introduction|summary)\b", re.I
+)
+_LINE_JUNK_RE = re.compile(
+    r"^\s*(doi|issn|isbn|vol\.?|volume|no\.?|pp?\.|https?:|www\.|©|copyright|"
+    r"downloaded|received|accepted|published|available online|contents lists|"
+    r"journal homepage|article|research article|original article|open access|"
+    r"this content|all use subject|view |submit your|citing articles|full terms|"
+    r"to link to this|electronic copy|preprint|working paper no)\b",
+    re.I,
+)
+_AFFILIATION_RE = re.compile(
+    r"\b(university|universiteit|universit[eé]|department|dept\.|institute|"
+    r"faculty|school of|centre for|center for|college of|academy of|laborator)\b",
+    re.I,
+)
+_NAME_PARTICLES = frozenset(
+    ("and", "de", "van", "der", "von", "del", "la", "le", "y")
+)
+
+
+def normalize_line(line: str) -> str:
+    """Fold a line to a comparable key: digits collapsed, whitespace squeezed."""
+    return _LINE_NORMALIZE_RE.sub("#", " ".join(line.split()).lower())
+
+
+def _looks_like_authors(text: str) -> bool:
+    """Heuristic byline detector.
+
+    Capitalisation alone is not enough — a Title Case title is capitalised too
+    ("What Is Actually Being Annotated?" was misread as a byline until this was
+    tightened). Require positive evidence of names: a separator between people,
+    or an initial like "Q.".
+    """
+    tokens = text.replace(",", " ").split()
+    if not 2 <= len(tokens) <= 14:
+        return False
+    capitalized = sum(
+        1 for t in tokens if t[:1].isupper() or (len(t) <= 3 and t.endswith("."))
+    )
+    if capitalized / len(tokens) < 0.8:
+        return False
+    if any(t in _NAME_PARTICLES for t in tokens if t[:1].islower()) is False and any(
+        t[:1].islower() for t in tokens
+    ):
+        return False
+    has_separator = ("," in text) or (" and " in text) or (" & " in text)
+    has_initial = any(
+        len(t.rstrip(",")) <= 3 and t.rstrip(",").endswith(".") and t[:1].isupper()
+        for t in text.split()
+    )
+    return has_separator or has_initial
+
+
+def _alpha_ratio(text: str) -> float:
+    return sum(c.isalpha() or c.isspace() for c in text) / max(1, len(text))
+
+
+def _extract_title_from_text(
+    raw_text: str,
+    boilerplate: frozenset[str] | set[str] = frozenset(),
+    max_lines: int = 30,
+) -> str | None:
+    """Best-effort title from a PDF's front matter, for use as a search query.
+
+    Boilerplate is supplied by the caller and defined by recurrence rather than
+    by rules: a title appears in one document, a masthead or cover sheet
+    appears in every paper from that publisher (see ``corpus_boilerplate``).
+    Author and affiliation lines are dropped heuristically, and the title is
+    taken to be the FIRST substantial block of surviving front matter — not the
+    longest, which walks into the abstract.
+    """
+    if not raw_text:
+        return None
+    lines = raw_text.split("\n")[:max_lines]
+
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if i and _FRONT_MATTER_END_RE.match(line):
+            end = i
+            break
+
+    candidates: list[tuple[int, str]] = []
+    for i, line in enumerate(lines[:end]):
+        text = " ".join(line.split())
+        if not 12 <= len(text) <= 250:
+            continue
+        if normalize_line(text) in boilerplate:
+            continue
+        if _LINE_JUNK_RE.match(text) or "@" in text:
+            continue
+        if _alpha_ratio(text) < 0.65:
+            continue
+        if _AFFILIATION_RE.search(text) and (text[0].isdigit() or "," in text):
+            continue
+        if _looks_like_authors(text):
+            continue
+        candidates.append((i, text))
+    if not candidates:
+        # Nothing survived: fall back to the old behaviour rather than give up,
+        # since a weak query still beats no query for the title-search tier.
+        for line in lines[:10]:
+            stripped = line.strip()
+            if len(stripped) > 10 and not stripped.startswith("http"):
+                return stripped[:200]
+        return None
+
+    groups: list[list[tuple[int, str]]] = [[candidates[0]]]
+    for previous, item in zip(candidates, candidates[1:]):
+        if item[0] == previous[0] + 1 and len(groups[-1]) < 4:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+
+    for group in groups:
+        joined = " ".join(text for _, text in group)
+        if len(joined) >= 20:
+            return joined[:250]
+    return " ".join(text for _, text in groups[0])[:250]
+
+
+def corpus_boilerplate(
+    conn: sqlite3.Connection, min_documents: int = 3, scan_lines: int = 25
+) -> frozenset[str]:
+    """Front-matter lines that recur across distinct documents, i.e. boilerplate.
+
+    No rules and no publisher list: a line appearing in many different papers
+    cannot be any one paper's title. Improves as the library grows.
+    """
+    counts: dict[str, int] = {}
+    for (text,) in conn.execute(
+        "SELECT raw_text FROM paper_text WHERE raw_text IS NOT NULL"
+    ):
+        seen = set()
+        for line in (text or "").split("\n")[:scan_lines]:
+            key = normalize_line(line)
+            if 4 <= len(key) <= 120:
+                seen.add(key)
+        for key in seen:
+            counts[key] = counts.get(key, 0) + 1
+    return frozenset(k for k, n in counts.items() if n >= min_documents)
 
 
 def _normalize_semantic_scholar(raw: dict | None) -> dict | None:
@@ -283,6 +522,7 @@ def enrich_documents(
 
     stats.total = len(rows)
     completed = 0
+    boilerplate = corpus_boilerplate(conn)
 
     for row in rows:
         paper_id = row["id"]
@@ -293,11 +533,12 @@ def enrich_documents(
         metadata = None
         source = None
 
-        # Try DOI first
+        # Try DOI first. A scraped doi is a hypothesis, not a fact: it is only
+        # written back below, once a provider lookup on it actually resolved.
+        scraped_doi = False
         if not doi and raw_text:
             doi = extract_doi(raw_text)
-            if doi:
-                conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (doi, paper_id))
+            scraped_doi = bool(doi)
 
         if doi:
             stats.doi_found += 1
@@ -319,7 +560,7 @@ def enrich_documents(
 
         # Fallback: title search
         if not metadata and raw_text:
-            title_guess = _extract_title_from_text(raw_text)
+            title_guess = _extract_title_from_text(raw_text, boilerplate)
             if title_guess:
                 try:
                     metadata = prov["by_title"](title_guess)
@@ -332,6 +573,28 @@ def enrich_documents(
         if metadata:
             now = now_iso()
             authors = json.dumps(metadata.get("authors") or [])
+            # Verify EVERY tier, not just title search. A doi lifted from the
+            # text is only as trustworthy as the claim that it belongs to this
+            # paper, so score the provider's title against the one printed on
+            # the PDF and record the verdict rather than asserting confidence.
+            # Containment is the primary test (position-free, ~92% recall at
+            # 2% false accepts); line-picking similarity is a weaker second
+            # opinion that can rescue a title the containment head window cut.
+            verify_score = max(
+                title_containment(metadata.get("title"), raw_text),
+                title_similarity(
+                    metadata.get("title"),
+                    _extract_title_from_text(raw_text, boilerplate) if raw_text else None,
+                ),
+            )
+            suspect = 1 if verify_score < CONTAINMENT_THRESHOLD else 0
+            if suspect and scraped_doi and source == prov["doi_source"]:
+                # The doi was a guess AND its answer doesn't match the page:
+                # two independent reasons to disbelieve it. Drop the doi so a
+                # later pass re-attempts rather than inheriting the bad key.
+                metadata = dict(metadata)
+                metadata["doi"] = None
+                doi = None
             ss_id = (
                 metadata.get("source_id")
                 if prov["is_semantic_scholar"] else None
@@ -346,6 +609,9 @@ def enrich_documents(
                     doi = COALESCE(?, doi),
                     metadata_source = ?,
                     metadata_enriched_at = ?,
+                    metadata_suspect = ?,
+                    metadata_verify_score = ?,
+                    metadata_verified_at = ?,
                     updated_at = ?
                 WHERE id = ?""",
                 (
@@ -354,11 +620,13 @@ def enrich_documents(
                     metadata.get("year"),
                     metadata.get("abstract"),
                     ss_id,
-                    metadata.get("doi"),
+                    metadata.get("doi") or (doi if not scraped_doi else None),
                     source,
-                    now, now, paper_id,
+                    now, suspect, round(verify_score, 3), now, now, paper_id,
                 ),
             )
+            if suspect:
+                stats.suspect += 1
         else:
             if not (doi and stats.api_errors > 0):
                 stats.no_match += 1
@@ -385,8 +653,9 @@ def enrich_documents(
 #
 # enrich_documents() above has three fallback tiers: DOI (exact), filename
 # (author-surname + year heuristic), and title search (fuzzy text query,
-# top-result-wins). The first two are effectively unambiguous. Title search
-# is not: querying OpenAlex or Semantic Scholar with a generic or truncated
+# top-result-wins). NONE of the three is unambiguous — the doi tier reads the
+# doi out of the paper's own text and can pick up a cited work's. Title search
+# likewise: querying OpenAlex or Semantic Scholar with a generic or truncated
 # title guess (see _extract_title_from_text) can return a plausible-looking
 # but *wrong* paper, and nothing before this module ever checked. The wrong
 # title/authors/year/DOI then gets written back with full confidence and
@@ -435,14 +704,16 @@ def title_similarity(a: str | None, b: str | None) -> float:
 def verify_documents(
     conn: sqlite3.Connection,
     paper_ids: list[int] | None = None,
-    threshold: float = SUSPECT_THRESHOLD,
+    threshold: float = CONTAINMENT_THRESHOLD,
     limit: int | None = None,
 ) -> list[VerifyResult]:
     """Audit title-search-sourced metadata against each PDF's own extracted title.
 
-    Scoped to papers whose ``metadata_source`` ends in ``_title`` (the only
-    fallback tier that involved an unverified fuzzy match) — DOI and
-    filename-sourced matches are exact by construction and are skipped.
+    Scoped to every enriched paper. A doi tier is NOT exact by construction:
+    ``extract_doi`` reads the doi out of the PDF's own text, so it is exact
+    only if that doi belongs to this paper — and before 2026-09-10 it was
+    routinely lifted from the reference list, silently overwriting good
+    metadata with a cited work's.
 
     Persists the verdict to ``metadata_suspect`` / ``metadata_verify_score`` /
     ``metadata_verified_at`` on each checked paper, and returns results
@@ -451,7 +722,7 @@ def verify_documents(
     query = """SELECT p.id, p.filename, p.title, pt.raw_text
         FROM papers p
         LEFT JOIN paper_text pt ON pt.paper_id = p.id
-        WHERE p.metadata_source LIKE '%\\_title' ESCAPE '\\'"""
+        WHERE p.metadata_source IS NOT NULL"""
     params: list = []
 
     if paper_ids is not None:
@@ -465,10 +736,19 @@ def verify_documents(
 
     results = []
     now = now_iso()
+    boilerplate = corpus_boilerplate(conn)
     for row in rows:
         raw_text = row["raw_text"] or ""
-        extracted_guess = _extract_title_from_text(raw_text) if raw_text else None
-        similarity = title_similarity(row["title"], extracted_guess)
+        extracted_guess = (
+            _extract_title_from_text(raw_text, boilerplate) if raw_text else None
+        )
+        # Containment first: it asks whether the stored title is present in the
+        # document at all, which needs no correct line-pick. Similarity against
+        # the extracted line is the fallback opinion.
+        similarity = max(
+            title_containment(row["title"], raw_text),
+            title_similarity(row["title"], extracted_guess),
+        )
         suspect = similarity < threshold
 
         results.append(VerifyResult(

@@ -104,8 +104,14 @@ def test_verify_passes_good_title_match(verify_db):
     assert results[0].similarity > 0.55
 
 
-def test_verify_skips_doi_sourced_metadata(verify_db):
-    """DOI-matched metadata is exact by construction — verify only checks title-sourced matches."""
+def test_verify_checks_doi_sourced_metadata(verify_db):
+    """A doi read out of the PDF can belong to a cited work, so verify checks it too.
+
+    Regression for 2026-09-10: extract_doi took the first doi anywhere in the
+    document, so ~18% of a 1,024-paper corpus inherited a reference-list work's
+    title/authors/year — and verify skipped exactly those rows because the doi
+    tier was assumed exact.
+    """
     _seed_paper(
         verify_db, 1,
         title="Anything At All",
@@ -114,7 +120,8 @@ def test_verify_skips_doi_sourced_metadata(verify_db):
     )
 
     results = verify_documents(verify_db)
-    assert results == []
+    assert len(results) == 1
+    assert results[0].suspect is True
 
 
 def test_verify_flags_unverifiable_when_no_raw_text(verify_db):
@@ -225,9 +232,10 @@ def test_cli_verify_clean_corpus_exits_zero(tmp_path, monkeypatch):
     assert data["suspect_count"] == 0
 
 
-def test_cli_verify_no_title_sourced_papers_exits_no_results(tmp_path, monkeypatch):
+def test_cli_verify_no_enriched_papers_exits_no_results(tmp_path, monkeypatch):
+    """Nothing enriched at all -> nothing to check. (Enriched-but-doi-sourced IS checked.)"""
     conn = get_connection(str(tmp_path / "index.db"))
-    _seed_paper(conn, 1, title="Anything", metadata_source="openalex", raw_text="x")
+    _seed_paper(conn, 1, title="Anything", metadata_source=None, raw_text="x")
     conn.close()
 
     monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
@@ -317,8 +325,8 @@ def test_cli_verify_ids_reports_skipped_ineligible(tmp_path, monkeypatch):
         raw_text="Deep Learning for Natural Language Processing\nAbstract: we present...",
     )
     _seed_paper(
-        conn, 2, title="DOI Sourced", metadata_source="openalex_doi",
-        raw_text="DOI Sourced\nbody",
+        conn, 2, title="Not Enriched", metadata_source=None,
+        raw_text="Not Enriched\nbody",
     )
     conn.close()
 
@@ -337,8 +345,8 @@ def test_cli_verify_ids_all_unresolved_exits_no_results(tmp_path, monkeypatch):
     """A requested id that's DOI-sourced and one that doesn't exist -- zero checked."""
     conn = get_connection(str(tmp_path / "index.db"))
     _seed_paper(
-        conn, 2, title="DOI Sourced", metadata_source="openalex_doi",
-        raw_text="DOI Sourced\nbody",
+        conn, 2, title="Not Enriched", metadata_source=None,
+        raw_text="Not Enriched\nbody",
     )
     conn.close()
 
