@@ -171,7 +171,12 @@ def process_ocr_documents(
             # Re-derive chunks from the OCR markdown — otherwise chunks (and their
             # embeddings) keep answering with the pre-OCR garbage extraction.
             from .chunking import chunk_markdown
-            raw_chunks = chunk_markdown(markdown, title=paper["title"])
+            from .pages import assign_pages_from_ocr_headers
+            # OCR markdown has one "## Page N" section per page, so each
+            # chunk's page comes straight from its section header.
+            raw_chunks = assign_pages_from_ocr_headers(
+                chunk_markdown(markdown, title=paper["title"])
+            )
             conn.execute(
                 "DELETE FROM chunk_vec WHERE chunk_id IN "
                 "(SELECT chunk_id FROM chunks WHERE doc_id = ?)",
@@ -181,10 +186,11 @@ def process_ocr_documents(
             for i, chunk in enumerate(raw_chunks):
                 conn.execute(
                     """INSERT INTO chunks
-                    (doc_id, chunk_index, section_header, page_start, text, char_offset)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (doc_id, chunk_index, section_header, page_start, page_end,
+                     text, char_offset)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (paper_id, i, chunk.section_header, chunk.page_start,
-                     chunk.text, chunk.char_offset),
+                     chunk.page_end, chunk.text, chunk.char_offset),
                 )
 
             conn.execute(

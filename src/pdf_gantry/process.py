@@ -146,7 +146,16 @@ def _process_single(
 
         # Generate and store chunks
         from .chunking import chunk_markdown
-        raw_chunks = chunk_markdown(markdown, title=row["title"])
+        from .pages import pdf_page_texts
+
+        # Per-page text lets each chunk be located on its PDF page(s). The
+        # markdown itself carries no page boundaries. Best effort: a failure
+        # here leaves pages NULL rather than failing the extraction.
+        try:
+            page_texts = pdf_page_texts(full_path)
+        except Exception:
+            page_texts = None
+        raw_chunks = chunk_markdown(markdown, title=row["title"], page_texts=page_texts)
 
         # Clear old chunks (and their embeddings — vec0 has no CASCADE)
         conn.execute(
@@ -159,10 +168,11 @@ def _process_single(
         for i, chunk in enumerate(raw_chunks):
             conn.execute(
                 """INSERT INTO chunks
-                (doc_id, chunk_index, section_header, page_start, text, char_offset)
-                VALUES (?, ?, ?, ?, ?, ?)""",
+                (doc_id, chunk_index, section_header, page_start, page_end,
+                 text, char_offset)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (paper_id, i, chunk.section_header, chunk.page_start,
-                 chunk.text, chunk.char_offset),
+                 chunk.page_end, chunk.text, chunk.char_offset),
             )
 
         # Update processing flags (reset chunk embeddings since chunks changed)

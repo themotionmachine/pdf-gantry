@@ -412,3 +412,20 @@ def test_cli_ocr_ids_invalid(tmp_path, papers_dir, mock_surya, monkeypatch):
 
     assert result.exit_code == 1
     assert "Invalid --ids" in result.output
+
+
+def test_process_ocr_sets_chunk_pages_from_page_headers(tmp_path, papers_dir, mock_surya):
+    """OCR chunks carry the page from their '## Page N' section."""
+    db_path, conn = _setup_ocr_db(tmp_path, papers_dir)
+
+    process_ocr_documents(conn, papers_dir, db_path)
+
+    rows = conn.execute(
+        "SELECT section_header, page_start, page_end FROM chunks"
+    ).fetchall()
+    assert rows
+    for r in rows:
+        assert r["section_header"].startswith("Page ")
+        page = int(r["section_header"].split()[1])
+        assert (r["page_start"], r["page_end"]) == (page, page)
+    conn.close()
