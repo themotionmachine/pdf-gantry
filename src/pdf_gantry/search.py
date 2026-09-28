@@ -6,25 +6,75 @@ from collections import defaultdict
 
 from .models import ChunkResult, SearchResult
 
+_FTS_OPERATORS = {"AND", "OR", "NOT"}
+# A balanced double-quoted phrase, or a run of non-space characters.
+_FTS_TOKEN_RE = re.compile(r'"[^"]*"\*?|[^\s"]+')
+_WORD_CHAR_RE = re.compile(r"\w")
 
-def _sanitize_fts_query(query: str) -> str:
-    """
-    Sanitize a query string for FTS5.
 
-    Handles hyphenated terms (e.g. "cross-national") which FTS5 misparses
-    as column filters. Replaces hyphens with spaces except inside quoted phrases.
+def _legacy_hyphen_sanitize(query: str) -> str:
+    """Replace hyphens with spaces (FTS5 reads ``a-b`` as a column filter)."""
+    return query.replace("-", " ")
+
+
+def _quote_fts_term(text: str) -> str:
+    """Quote one term as an FTS5 string, escaping embedded double quotes."""
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _sanitize_fts_query(query: str, syntax: bool = False) -> str:
     """
-    # Split on quoted sections to preserve them
-    parts = re.split(r'(".*?")', query)
-    sanitized = []
-    for part in parts:
-        if part.startswith('"') and part.endswith('"'):
-            # Inside quotes: replace hyphens with spaces but keep quotes
-            sanitized.append(part.replace('-', ' '))
+    Turn user text into a safe FTS5 MATCH expression.
+
+    Default (literal) mode treats the text as search terms, never as syntax:
+
+    - each bare word is wrapped in double quotes, so ``:``, ``(``, ``+``,
+      ``^``, ``'``, ``-`` and ``NEAR`` lose their FTS5 meaning;
+    - balanced ``"quoted phrases"`` are kept as phrases;
+    - a trailing ``*`` on a word keeps prefix matching (``adapt*``);
+    - ``AND``/``OR``/``NOT`` (upper case) stay operators only when they sit
+      between two terms; a dangling or leading operator becomes a literal.
+
+    Adjacent terms are implicitly ANDed, exactly as bare FTS5 terms were, so
+    plain queries rank as before. Returns ``""`` when nothing searchable is
+    left (callers treat that as no results).
+
+    ``syntax=True`` passes the query through as raw FTS5 syntax, with only the
+    historical hyphen-to-space rewrite applied. It can raise
+    ``sqlite3.OperationalError`` on malformed input.
+    """
+    if syntax:
+        return _legacy_hyphen_sanitize(query)
+
+    tokens: list[tuple[str, str]] = []  # (kind, text): kind in {"term", "op"}
+    for raw in _FTS_TOKEN_RE.findall(query):
+        if raw.startswith('"') and raw.rstrip("*").endswith('"') and len(raw.rstrip("*")) >= 2:
+            inner = raw.rstrip("*")[1:-1]
+            if _WORD_CHAR_RE.search(inner):
+                star = "*" if raw.endswith("*") else ""
+                tokens.append(("term", _quote_fts_term(inner) + star))
+            continue
+        if raw in _FTS_OPERATORS:
+            tokens.append(("op", raw))
+            continue
+        prefix = raw.endswith("*")
+        word = raw.rstrip("*")
+        if not _WORD_CHAR_RE.search(word):
+            continue
+        tokens.append(("term", _quote_fts_term(word) + ("*" if prefix else "")))
+
+    out: list[str] = []
+    for i, (kind, text) in enumerate(tokens):
+        if kind == "op":
+            prev_is_term = bool(out) and tokens[i - 1][0] == "term"
+            next_is_term = i + 1 < len(tokens) and tokens[i + 1][0] == "term"
+            if prev_is_term and next_is_term:
+                out.append(text)
+            else:
+                out.append(_quote_fts_term(text))
         else:
-            # Outside quotes: replace hyphens with spaces
-            sanitized.append(part.replace('-', ' '))
-    return "".join(sanitized)
+            out.append(text)
+    return " ".join(out)
 
 
 def fts_search(
@@ -32,9 +82,14 @@ def fts_search(
     query: str,
     limit: int = 20,
     restrict_ids: list[int] | None = None,
+    syntax: bool = False,
 ) -> list[SearchResult]:
     """
     Run FTS5 search and return ranked results with snippets.
+
+    ``query`` is literal text by default (see ``_sanitize_fts_query``);
+    ``syntax=True`` passes raw FTS5 syntax and may raise
+    ``sqlite3.OperationalError``.
 
     When ``restrict_ids`` is given, the search is scoped to only those paper
     IDs (a cross-paper "which of THESE discuss X?" query). An empty list yields
@@ -43,7 +98,9 @@ def fts_search(
     if restrict_ids is not None and not restrict_ids:
         return []
 
-    safe_query = _sanitize_fts_query(query)
+    safe_query = _sanitize_fts_query(query, syntax=syntax)
+    if not safe_query.strip():
+        return []
     scope_sql = ""
     params: list = [safe_query]
     if restrict_ids is not None:
@@ -90,9 +147,11 @@ def fts_search(
     return results
 
 
-def search_count(conn: sqlite3.Connection, query: str) -> int:
-    """Return the number of FTS5 matches for a query."""
-    safe_query = _sanitize_fts_query(query)
+def search_count(conn: sqlite3.Connection, query: str, syntax: bool = False) -> int:
+    """Return the number of FTS5 matches for a query (global, ignores any limit)."""
+    safe_query = _sanitize_fts_query(query, syntax=syntax)
+    if not safe_query.strip():
+        return 0
     row = conn.execute(
         "SELECT COUNT(*) FROM papers_fts WHERE papers_fts MATCH ?",
         (safe_query,),
@@ -173,6 +232,8 @@ def hybrid_search(
     limit: int = 20,
     rrf_k: int = 60,
     restrict_ids: list[int] | None = None,
+    syntax: bool = False,
+    status: dict | None = None,
 ) -> list[SearchResult]:
     """
     Combine FTS5 and vector search using Reciprocal Rank Fusion (RRF).
@@ -181,14 +242,29 @@ def hybrid_search(
 
     ``restrict_ids`` scopes both components to the given paper set; an empty
     list yields no results.
+
+    If the FTS side raises ``sqlite3.OperationalError`` (only reachable with
+    ``syntax=True``), the search continues vector-only. Pass a ``status``
+    dict to learn which path ran: ``status["mode"]`` is ``"hybrid"`` or
+    ``"vector_fallback"`` (with ``status["fts_error"]`` set).
     """
+    if status is None:
+        status = {}
+    status["mode"] = "hybrid"
     if restrict_ids is not None and not restrict_ids:
         return []
 
     fetch_limit = limit * 2
 
-    # Get FTS5 results
-    fts_results = fts_search(conn, query, limit=fetch_limit, restrict_ids=restrict_ids)
+    # Get FTS5 results; a malformed raw-syntax query degrades to vector-only.
+    try:
+        fts_results = fts_search(
+            conn, query, limit=fetch_limit, restrict_ids=restrict_ids, syntax=syntax,
+        )
+    except sqlite3.OperationalError as e:
+        fts_results = []
+        status["mode"] = "vector_fallback"
+        status["fts_error"] = str(e)
 
     # Get semantic results
     sem_results = semantic_search(conn, query_vector, limit=fetch_limit, restrict_ids=restrict_ids)
@@ -393,7 +469,7 @@ def find_papers(
 ) -> list[dict]:
     """Fuzzy filename lookup using LIKE matching (case-insensitive)."""
     rows = conn.execute(
-        """SELECT id, filename, path, title, page_count, has_text, has_markdown,
+        """SELECT id, filename, path, title, authors, page_count, has_text, has_markdown,
                   has_embeddings, has_chunk_embeddings, is_scanned, citekey
         FROM papers
         WHERE filename LIKE ?
