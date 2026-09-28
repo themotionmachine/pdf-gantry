@@ -223,3 +223,21 @@ def test_ocr_chunks_get_page_from_page_header():
 def test_sqlite_supports_drop_column():
     """Guard for the migration test's setup (DROP COLUMN needs SQLite >= 3.35)."""
     assert sqlite3.sqlite_version_info >= (3, 35, 0)
+
+
+@pytest.mark.parametrize("module", ["pdf_gantry.pages", "pdf_gantry.process"])
+def test_pdf_reading_prints_nothing_to_stdout(module, three_page_pdf):
+    """`import fitz` prints a deprecation line to STDOUT on PyMuPDF >= 1.26,
+    which corrupts `--json` output of any write-path command that opens a PDF.
+    Run in a fresh interpreter, since the line is printed once per process."""
+    import subprocess
+    import sys
+
+    code = (
+        f"import {module}\n"
+        "from pdf_gantry.pages import pdf_page_texts\n"
+        f"pdf_page_texts({str(three_page_pdf)!r})\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == ""

@@ -2300,6 +2300,98 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         click.echo(content)
 
 
+# --- chunks ---
+
+@cli.group()
+def chunks():
+    """Chunk maintenance (write path)."""
+    pass
+
+
+@chunks.command("backfill-pages")
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (default: every paper with unpaged chunks)")
+@click.option("--force", is_flag=True, help="Re-map papers whose chunks already have pages")
+@click.option("--limit", type=int, default=None, help="Map at most N papers")
+@click.option("--dry-run", is_flag=True, help="Compute and report; write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def chunks_backfill_pages(ctx, ids, force, limit, dry_run, json_output):
+    """Set page_start/page_end on existing chunks from their PDFs.
+
+    Locates each chunk's text in the PDF's per-page text. Writes only the two
+    page columns: chunk text, chunk ids and embeddings are untouched, so
+    nothing is re-embedded. Opens PDFs (OCR'd papers are paged from their
+    '## Page N' sections instead). Reports coverage and the papers whose
+    chunks could only be interpolated or not placed at all.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    require_papers_dir(ctx, cfg, use_json)
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .pages import backfill_pages
+
+    conn = get_connection(cfg.db_path)
+    progress_bar = None
+    task = None
+    if not use_json:
+        progress_bar = Progress(
+            BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=err_console,
+        )
+        task = progress_bar.add_task("Paging", total=None)
+        progress_bar.start()
+
+    def on_progress(current, total):
+        if progress_bar is not None:
+            progress_bar.update(task, completed=current, total=total)
+
+    try:
+        report = backfill_pages(conn, cfg.papers_dir, paper_ids=paper_ids,
+                                dry_run=dry_run, force=force, limit=limit,
+                                progress_callback=on_progress)
+    finally:
+        if progress_bar is not None:
+            progress_bar.stop()
+        conn.close()
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        cov = report["coverage"]
+        cov_s = f"{cov * 100:.1f}%" if cov is not None else "n/a"
+        click.echo(
+            f"{prefix}{report['papers']} papers, {report['chunks']:,} chunks: "
+            f"{report['assigned']:,} paged ({cov_s}), {report['updated']:,} written"
+        )
+        bs = report["by_status"]
+        click.echo("  " + ", ".join(f"{k} {v:,}" for k, v in bs.items()))
+        if report["ambiguous_papers"]:
+            click.echo(f"  {report['ambiguous_papers']} papers with interpolated/unplaced chunks"
+                       " (worst first):")
+            for a in report["ambiguous"][:10]:
+                click.echo(f"    [{a['doc_id']}] {a['filename']}: {a['unlocated']} unplaced, "
+                           f"{a['interpolated']} interpolated of {a['chunks']}")
+        for e in report["errors"]:
+            click.echo(f"  error [{e['doc_id']}] {e['filename']}: {e['error']}", err=True)
+
+    if report["errors"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
 # --- vault ---
 
 @cli.group()

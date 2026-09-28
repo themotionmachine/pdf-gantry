@@ -80,10 +80,12 @@ def words(s: str | None) -> set[str]:
 
 def pdf_page_texts(pdf_path: Path | str) -> list[str]:
     """Per-page plain text from PyMuPDF (the same call process.py uses for raw_text)."""
-    import fitz
+    # `import pymupdf`, not `import fitz`: on PyMuPDF >= 1.26 the fitz alias
+    # prints a deprecation line to stdout, which corrupts --json output.
+    import pymupdf
 
-    fitz.TOOLS.mupdf_display_errors(False)
-    doc = fitz.open(str(pdf_path))
+    pymupdf.TOOLS.mupdf_display_errors(False)
+    doc = pymupdf.open(str(pdf_path))
     try:
         return [page.get_text() for page in doc]
     finally:
@@ -321,3 +323,122 @@ def map_chunks_to_pages(pages_raw: list[str], chunks: list[str]) -> list[PageSpa
         row.status, row.method = INTERPOLATED, "neighbors"
 
     return rows
+
+
+# --- backfill ---------------------------------------------------------------
+
+AMBIGUOUS_LIMIT = 50  # per-paper ambiguity rows returned in the report
+
+
+def _paper_spans(conn, paper, chunk_rows, papers_dir: Path) -> list[PageSpan]:
+    """Page spans for one paper's existing chunks (in chunk_index order)."""
+    if paper["text_method"] == "surya":
+        # OCR markdown: "## Page N" sections. The scan has no text layer to
+        # probe, and doesn't need one.
+        spans = []
+        for c in chunk_rows:
+            page = page_from_ocr_header(c["section_header"])
+            spans.append(PageSpan(page, page, LOCATED if page else UNLOCATED, "ocr_header"))
+        return spans
+    page_texts = pdf_page_texts(Path(papers_dir) / paper["path"])
+    return map_chunks_to_pages(page_texts, [c["text"] for c in chunk_rows])
+
+
+def backfill_pages(
+    conn,
+    papers_dir: Path,
+    paper_ids: list[int] | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+    limit: int | None = None,
+    progress_callback=None,
+) -> dict:
+    """Compute page_start/page_end for chunks that already exist.
+
+    Only the two page columns are written: chunk text, chunk ids, chunk_vec
+    rows and has_chunk_embeddings are untouched, so nothing needs
+    re-embedding. Opens the PDFs (write path only).
+
+    By default only papers with at least one chunk lacking page_start are
+    selected; ``force`` re-maps every selected paper.
+
+    Returns a report dict: papers, chunks, assigned, updated, coverage,
+    by_status, ambiguous (papers with unlocated/interpolated chunks, worst
+    first), errors (papers that could not be mapped), dry_run.
+    """
+    where = ["EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = p.id)"]
+    params: list = []
+    if not force:
+        where.append(
+            "EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = p.id AND c.page_start IS NULL)"
+        )
+    if paper_ids is not None:
+        where.append(f"p.id IN ({','.join('?' * len(paper_ids))})")
+        params.extend(paper_ids)
+    sql = (
+        "SELECT p.id, p.path, p.filename, p.text_method FROM papers p WHERE "
+        + " AND ".join(where) + " ORDER BY p.id"
+    )
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    papers = conn.execute(sql, params).fetchall()
+
+    by_status = {s: 0 for s in (LOCATED, PARTIAL, INTERPOLATED, UNLOCATED, NO_TEXT)}
+    report = {
+        "dry_run": dry_run, "papers": len(papers), "chunks": 0, "assigned": 0,
+        "updated": 0, "coverage": None, "by_status": by_status,
+        "ambiguous": [], "errors": [],
+    }
+    ambiguous = []
+
+    for i, paper in enumerate(papers, 1):
+        chunk_rows = conn.execute(
+            "SELECT chunk_id, section_header, text FROM chunks "
+            "WHERE doc_id = ? ORDER BY chunk_index",
+            (paper["id"],),
+        ).fetchall()
+        try:
+            spans = _paper_spans(conn, paper, chunk_rows, papers_dir)
+        except Exception as e:  # missing/damaged PDF: record and keep going
+            report["errors"].append({
+                "doc_id": paper["id"], "filename": paper["filename"],
+                "error": f"{type(e).__name__}: {e}"[:300],
+            })
+            report["chunks"] += len(chunk_rows)
+            if progress_callback:
+                progress_callback(i, len(papers))
+            continue
+
+        counts = {s: 0 for s in by_status}
+        updates = []
+        for c, span in zip(chunk_rows, spans):
+            counts[span.status] += 1
+            if span.page_start is not None:
+                updates.append((span.page_start, span.page_end, c["chunk_id"]))
+        for s, n in counts.items():
+            by_status[s] += n
+        report["chunks"] += len(chunk_rows)
+        report["assigned"] += len(updates)
+        doubtful = counts[UNLOCATED] + counts[INTERPOLATED] + counts[NO_TEXT]
+        if doubtful:
+            ambiguous.append({
+                "doc_id": paper["id"], "filename": paper["filename"],
+                "chunks": len(chunk_rows), "unlocated": counts[UNLOCATED],
+                "interpolated": counts[INTERPOLATED], "no_text": counts[NO_TEXT],
+            })
+        if not dry_run:
+            conn.executemany(
+                "UPDATE chunks SET page_start = ?, page_end = ? WHERE chunk_id = ?",
+                updates,
+            )
+            conn.commit()
+            report["updated"] += len(updates)
+        if progress_callback:
+            progress_callback(i, len(papers))
+
+    ambiguous.sort(key=lambda a: -(a["unlocated"] + a["interpolated"] + a["no_text"]) / a["chunks"])
+    report["ambiguous_papers"] = len(ambiguous)
+    report["ambiguous"] = ambiguous[:AMBIGUOUS_LIMIT]
+    if report["chunks"]:
+        report["coverage"] = round(report["assigned"] / report["chunks"], 4)
+    return report

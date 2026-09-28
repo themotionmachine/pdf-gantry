@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # not `import fitz`: that alias prints a deprecation line to stdout
 import pymupdf4llm
 
 from .models import ProcessStats
