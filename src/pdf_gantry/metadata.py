@@ -7,6 +7,13 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from .queue import (
+    MISS_SOURCE_PREFIX,
+    enriched_condition,
+    manual_condition,
+    miss_condition,
+    never_enriched_condition,
+)
 from .utils import now_iso
 
 DOI_PATTERN = re.compile(r'10\.\d{4,}/[^\s]+')
@@ -93,6 +100,10 @@ def field_completeness(
     _check_fields(fields)
 
     total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    miss = miss_condition()
+    enrich_misses = conn.execute(
+        f"SELECT COUNT(*) FROM papers WHERE {miss}"
+    ).fetchone()[0]
     field_stats = {}
     for field in fields:
         empty = _FIELD_EMPTY_SQL[field]
@@ -102,7 +113,8 @@ def field_completeness(
                 SUM(CASE WHEN {empty} AND metadata_enriched_at IS NULL
                     THEN 1 ELSE 0 END),
                 SUM(CASE WHEN {empty} AND metadata_enriched_at IS NOT NULL
-                    THEN 1 ELSE 0 END)
+                    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {empty} AND {miss} THEN 1 ELSE 0 END)
             FROM papers"""
         ).fetchone()
         missing = row[0] or 0
@@ -112,9 +124,12 @@ def field_completeness(
             "missing": missing,
             "never_attempted": never_attempted,
             "attempted_incomplete": attempted_incomplete,
+            # Subset of attempted_incomplete where the provider matched
+            # nothing at all (retry with `enrich --retry-misses`).
+            "provider_miss": row[3] or 0,
             "complete": total - missing,
         }
-    return {"total": total, "fields": field_stats}
+    return {"total": total, "enrich_misses": enrich_misses, "fields": field_stats}
 
 
 def gap_ids(
@@ -145,6 +160,8 @@ class EnrichStats:
     no_match: int = 0
     api_errors: int = 0
     suspect: int = 0
+    skipped_manual: int = 0
+    matched: int = 0
     elapsed_seconds: float = 0.0
 
 
@@ -453,6 +470,7 @@ def _semantic_scholar_provider(rate_limit: float) -> dict:
         "by_title": lambda title: _normalize_semantic_scholar(
             _fetch_by_title(title, rate_limit)
         ),
+        "name": "semantic_scholar",
         "doi_source": "semantic_scholar",
         "filename_source": "semantic_scholar_filename",
         "title_source": "semantic_scholar_title",
@@ -473,6 +491,7 @@ def _openalex_provider(rate_limit: float, mailto: str | None) -> dict:
         "by_title": lambda title: openalex.fetch_by_title(
             title, mailto=mailto, rate_limit=rate_limit
         ),
+        "name": "openalex",
         "doi_source": "openalex",
         "filename_source": "openalex_filename",
         "title_source": "openalex_title",
@@ -486,6 +505,15 @@ def _get_provider(provider: str, rate_limit: float, mailto: str | None) -> dict:
     return _openalex_provider(rate_limit, mailto)
 
 
+def default_enrich_ids(conn: sqlite3.Connection, retry_misses: bool = False) -> list[int]:
+    """IDs default ``enrich`` picks up: never attempted (and not hand-set),
+    plus earlier provider misses when ``retry_misses``."""
+    where = never_enriched_condition()
+    if retry_misses:
+        where = f"({where} OR {miss_condition()})"
+    return [r[0] for r in conn.execute(f"SELECT id FROM papers WHERE {where} ORDER BY id")]
+
+
 def enrich_documents(
     conn: sqlite3.Connection,
     paper_ids: list[int] | None = None,
@@ -494,28 +522,46 @@ def enrich_documents(
     progress_callback=None,
     provider: str = "openalex",
     mailto: str | None = None,
+    retry_misses: bool = False,
 ) -> EnrichStats:
-    """Fetch metadata for documents from the chosen provider (OpenAlex default)."""
+    """Fetch metadata for documents from the chosen provider (OpenAlex default).
+
+    Default selection (``paper_ids=None``) is papers never attempted; with
+    ``retry_misses`` it also re-attempts earlier provider misses. Hand-set
+    metadata (``meta set`` / legacy hand SQL) is never overwritten, even when
+    named in ``paper_ids`` -- clear it with ``meta clear`` first.
+
+    A miss writes ``metadata_source='none:<provider>'``. A lookup that raised
+    (network or API error) with no match leaves the paper unstamped so the
+    next run retries it.
+    """
     stats = EnrichStats()
     start = time.time()
     prov = _get_provider(provider, rate_limit, mailto)
 
+    select = """SELECT p.id, p.filename, p.doi, pt.raw_text,
+            CASE WHEN p.metadata_source IS NOT NULL AND {manual}
+                 THEN 1 ELSE 0 END AS is_manual
+        FROM papers p
+        LEFT JOIN paper_text pt ON pt.paper_id = p.id""".format(
+        manual=manual_condition().replace("metadata_source", "p.metadata_source")
+    )
     if paper_ids is not None:
         placeholders = ",".join("?" * len(paper_ids))
         rows = conn.execute(
-            f"""SELECT p.id, p.filename, p.doi, pt.raw_text
-            FROM papers p
-            LEFT JOIN paper_text pt ON pt.paper_id = p.id
-            WHERE p.id IN ({placeholders})""",
+            f"{select} WHERE p.id IN ({placeholders}) ORDER BY p.id",
             paper_ids,
         ).fetchall()
     else:
+        ids = default_enrich_ids(conn, retry_misses=retry_misses)
+        placeholders = ",".join("?" * len(ids))
         rows = conn.execute(
-            """SELECT p.id, p.filename, p.doi, pt.raw_text
-            FROM papers p
-            LEFT JOIN paper_text pt ON pt.paper_id = p.id
-            WHERE p.metadata_enriched_at IS NULL"""
-        ).fetchall()
+            f"{select} WHERE p.id IN ({placeholders}) ORDER BY p.id", ids
+        ).fetchall() if ids else []
+
+    manual_rows = [r for r in rows if r["is_manual"]]
+    stats.skipped_manual = len(manual_rows)
+    rows = [r for r in rows if not r["is_manual"]]
 
     if limit:
         rows = rows[:limit]
@@ -532,6 +578,7 @@ def enrich_documents(
 
         metadata = None
         source = None
+        errors_before = stats.api_errors
 
         # Try DOI first. A scraped doi is a hypothesis, not a fact: it is only
         # written back below, once a provider lookup on it actually resolved.
@@ -625,16 +672,22 @@ def enrich_documents(
                     now, suspect, round(verify_score, 3), now, now, paper_id,
                 ),
             )
+            stats.matched += 1
             if suspect:
                 stats.suspect += 1
+        elif stats.api_errors > errors_before:
+            # A lookup raised: the provider never answered, so this is not
+            # evidence of a miss. Leave it unstamped for the next run.
+            pass
         else:
-            if not (doi and stats.api_errors > 0):
-                stats.no_match += 1
-            # Still mark as checked
+            stats.no_match += 1
+            # Record the miss explicitly, so "tried and found nothing" is
+            # distinguishable from "never tried" and from a real match.
             now = now_iso()
             conn.execute(
-                "UPDATE papers SET metadata_enriched_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, paper_id),
+                "UPDATE papers SET metadata_source = ?, metadata_enriched_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (MISS_SOURCE_PREFIX + prov["name"], now, now, paper_id),
             )
 
         completed += 1
@@ -722,7 +775,9 @@ def verify_documents(
     query = """SELECT p.id, p.filename, p.title, pt.raw_text
         FROM papers p
         LEFT JOIN paper_text pt ON pt.paper_id = p.id
-        WHERE p.metadata_source IS NOT NULL"""
+        WHERE {enriched}""".format(
+        enriched=enriched_condition().replace("metadata_source", "p.metadata_source")
+    )
     params: list = []
 
     if paper_ids is not None:

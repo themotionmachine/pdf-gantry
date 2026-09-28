@@ -100,7 +100,7 @@ def filter_options(f):
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice([
                       "scanned", "digital", "suspicious", "broken", "metadata-suspect",
-                      "encrypted",
+                      "encrypted", "enrich-miss", "manual-metadata",
                   ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
@@ -1409,12 +1409,24 @@ def embed(
               help="Metadata provider")
 @click.option("--mailto", default=None,
               help="OpenAlex polite-pool email (overrides config openalex_mailto)")
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to enrich (overrides filters). "
+                   "Hand-set (manual) metadata is still never overwritten.")
+@click.option("--retry-misses", is_flag=True,
+              help="Also re-attempt papers where an earlier enrich found no match "
+                   "(metadata_source 'none:<provider>'); see `queue --is enrich-miss`")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
-           limit, dry_run, json_output):
-    """Fetch metadata from OpenAlex (default) or Semantic Scholar."""
+           ids, retry_misses, limit, dry_run, json_output):
+    """Fetch metadata from OpenAlex (default) or Semantic Scholar.
+
+    With no filters, enriches papers never attempted. A provider miss is
+    recorded as metadata_source 'none:<provider>' and is not retried unless
+    --retry-misses is given. Metadata set with `gantry meta set` is never
+    overwritten; `gantry meta clear` releases it.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
@@ -1436,28 +1448,40 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         ctx.exit(EXIT_ERROR)
         return
 
+    requested_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
     conn = get_connection(cfg.db_path)
-    from .metadata import enrich_documents
-    from .queue import build_filter_query
+    from .metadata import default_enrich_ids, enrich_documents
+    from .queue import build_filter_query, miss_condition
 
-    if not needs and not has_prop and not is_prop:
-        needs = ("metadata",)
-
-    where, params = build_filter_query(
-        needs=list(needs) if needs else None,
-        has=list(has_prop) if has_prop else None,
-        is_prop=list(is_prop) if is_prop else None,
-    )
-
-    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
-    paper_ids = [r["id"] for r in rows]
+    not_found: list[int] = []
+    if requested_ids is not None:
+        paper_ids, not_found = resolve_ids(conn, requested_ids)
+    elif not needs and not has_prop and not is_prop:
+        paper_ids = default_enrich_ids(conn, retry_misses=retry_misses)
+    else:
+        where, params = build_filter_query(
+            needs=list(needs) if needs else None,
+            has=list(has_prop) if has_prop else None,
+            is_prop=list(is_prop) if is_prop else None,
+        )
+        rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+        paper_ids = [r["id"] for r in rows]
+        if retry_misses:
+            miss_ids = {r[0] for r in conn.execute(
+                f"SELECT id FROM papers WHERE {miss_condition()}"
+            )}
+            paper_ids = sorted(set(paper_ids) | miss_ids)
 
     if limit:
         paper_ids = paper_ids[:limit]
 
     if dry_run:
         if use_json:
-            click.echo(json.dumps({"would_enrich": len(paper_ids)}))
+            payload = {"would_enrich": len(paper_ids)}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(f"Would enrich {format_count(len(paper_ids))} documents")
         conn.close()
@@ -1465,7 +1489,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
 
     if not paper_ids:
         if use_json:
-            click.echo(json.dumps({"total": 0, "message": "Nothing to enrich"}))
+            payload = {"total": 0, "message": "Nothing to enrich"}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo("Nothing to enrich")
         conn.close()
@@ -1508,6 +1535,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             "matched_by_title": stats.matched_by_title,
             "no_match": stats.no_match,
             "api_errors": stats.api_errors,
+            "matched": stats.matched,
+            "suspect": stats.suspect,
+            "skipped_manual": stats.skipped_manual,
+            "not_found": not_found,
             "elapsed_seconds": stats.elapsed_seconds,
         }, indent=2))
     else:
@@ -1518,6 +1549,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         click.echo(f"  DOI found in text: {format_count(stats.doi_found)}")
         click.echo(f"  Matched via title: {format_count(stats.matched_by_title)}")
         click.echo(f"  No match found: {format_count(stats.no_match)}")
+        if stats.skipped_manual:
+            click.echo(f"  Skipped (manual metadata): {format_count(stats.skipped_manual)}")
+        if not_found:
+            click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
         if stats.api_errors:
             click.echo(f"  API errors: {format_count(stats.api_errors)}")
 

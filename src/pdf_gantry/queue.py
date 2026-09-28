@@ -38,6 +38,48 @@ def suspicious_extraction_condition() -> str:
     )
 
 
+# --- metadata provenance -----------------------------------------------------
+#
+# `metadata_source` has three kinds of value beyond a provider name:
+#   - 'none:<provider>' -- enrichment ran and the provider had no match. Before
+#     2026-09 a miss stamped `metadata_enriched_at` only, so legacy misses are
+#     rows with the stamp but no source and no title; both count as misses.
+#   - 'manual:<who>' -- set by `gantry meta set`. Legacy hand-SQL writes used
+#     free-form names containing "manual" (e.g. 'brev-manual-from-text').
+#     Manual metadata is never overwritten by enrich.
+#   - NULL with no stamp -- never attempted.
+MISS_SOURCE_PREFIX = "none:"
+MANUAL_SOURCE_PREFIX = "manual:"
+
+
+def miss_condition() -> str:
+    """SQL predicate (against papers) for an enrichment attempt that found nothing."""
+    return (
+        "(metadata_source LIKE 'none:%' OR (metadata_source IS NULL "
+        "AND metadata_enriched_at IS NOT NULL "
+        "AND (title IS NULL OR title = '')))"
+    )
+
+
+def manual_condition() -> str:
+    """SQL predicate for hand-set metadata (``meta set`` or legacy hand SQL)."""
+    return "(metadata_source LIKE 'manual:%' OR metadata_source LIKE '%manual%')"
+
+
+def enriched_condition() -> str:
+    """SQL predicate for metadata that actually came from somewhere (not a miss)."""
+    return "(metadata_source IS NOT NULL AND metadata_source NOT LIKE 'none:%')"
+
+
+def never_enriched_condition() -> str:
+    """SQL predicate for papers default `enrich` should pick up: never
+    attempted, and not hand-set."""
+    return (
+        "(metadata_enriched_at IS NULL "
+        "AND (metadata_source IS NULL OR NOT " + manual_condition() + "))"
+    )
+
+
 def build_filter_query(
     needs: list[str] | None = None,
     has: list[str] | None = None,
@@ -102,6 +144,10 @@ def build_filter_query(
                 conditions.append("metadata_suspect = 1")
             elif p == "encrypted":
                 conditions.append("is_encrypted = 1")
+            elif p == "enrich-miss":
+                conditions.append(miss_condition())
+            elif p == "manual-metadata":
+                conditions.append(manual_condition())
 
     if has_errors:
         conditions.append("error_count > 0")
