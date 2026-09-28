@@ -183,3 +183,69 @@ def parse_authors(value) -> list[str]:
             continue
         out.extend(_split_author_string(str(item)))
     return out
+
+
+def resolve_identifier(conn: sqlite3.Connection, identifier: str) -> int | None:
+    """Resolve one paper identifier to a paper ID, or ``None``.
+
+    Accepted forms, tried in order:
+
+    1. an integer paper ID (``"53"``);
+    2. an exact filename (``"smith2020.pdf"``);
+    3. a citekey, with or without a leading ``@`` (exact, then case-insensitive);
+    4. a filename, case-insensitive.
+
+    Shared by ``read`` and ``info`` so both commands accept the same forms.
+    """
+    ident = identifier.strip()
+    if not ident:
+        return None
+    try:
+        pid = int(ident)
+    except ValueError:
+        pid = None
+    if pid is not None:
+        row = conn.execute("SELECT id FROM papers WHERE id = ?", (pid,)).fetchone()
+        return row["id"] if row else None
+
+    ck = ident[1:] if ident.startswith("@") else ident
+    for sql, arg in (
+        ("SELECT id FROM papers WHERE filename = ? ORDER BY id LIMIT 1", ident),
+        ("SELECT id FROM papers WHERE citekey = ? ORDER BY id LIMIT 1", ck),
+        ("SELECT id FROM papers WHERE citekey = ? COLLATE NOCASE ORDER BY id LIMIT 1", ck),
+        ("SELECT id FROM papers WHERE filename = ? COLLATE NOCASE ORDER BY id LIMIT 1", ident),
+    ):
+        row = conn.execute(sql, (arg,)).fetchone()
+        if row:
+            return row["id"]
+    return None
+
+
+def resolve_identifiers(
+    conn: sqlite3.Connection, identifiers: Iterable[str]
+) -> tuple[list[int], list[int | str]]:
+    """Resolve many identifiers (each may be a comma list) to paper IDs.
+
+    Returns ``(found, not_found)``. ``found`` is deduplicated in order of first
+    appearance. ``not_found`` holds unresolved identifiers: as ints when they
+    were numeric IDs (matching ``info --ids`` output), otherwise as the
+    original strings.
+    """
+    found: list[int] = []
+    not_found: list[int | str] = []
+    for raw in identifiers:
+        for token in (t.strip() for t in raw.split(",")):
+            if not token:
+                continue
+            pid = resolve_identifier(conn, token)
+            if pid is not None:
+                if pid not in found:
+                    found.append(pid)
+                continue
+            try:
+                miss: int | str = int(token)
+            except ValueError:
+                miss = token
+            if miss not in not_found:
+                not_found.append(miss)
+    return found, not_found

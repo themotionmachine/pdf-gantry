@@ -135,13 +135,28 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | 0 | success |
   | 1 | error |
   | 2 | ran fine, no results |
-  | 3 | partial failure (some documents succeeded) |
+  | 3 | partial failure (some documents succeeded, or some requested IDs/indices were missing) |
   | 4 | database error |
+  | 64 | usage error: unknown option or command, bad choice, missing argument |
 
-  An agent can branch on "no results" without parsing anything.
+  An agent can branch on "no results" without parsing anything. A typo is never exit 2: usage errors exit 64, and when `--json` appears anywhere on the command line they print `{"error": "...", "usage": "...", "exit_code": 64}` on stdout.
+- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`. Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
+
+  | Command | Envelope |
+  |---------|----------|
+  | `search`, `semantic` | `{query, total, mode (search only), results: [{id, filename, score, snippet, citekey, …}], not_found}` |
+  | `find` | `{fragment, count, results: [{id, filename, title, year, citekey, page_count, has_text, matched_fields}]}` |
+  | `info` | `{count, papers: [{id, title, authors, year, doi, citekey, …, top_chunk?, chunks?}], not_found}` |
+  | `read ID` | `{id, paper_id, filename, title, text}` |
+  | `read ID --chunks` | `{id, paper_id, filename, chunks: [{chunk_id, chunk_index, section_header, text_length}]}` |
+  | `read ID --index A-B` | `{id, paper_id, filename, title, total_chunks, chunks: [{chunk_id, chunk_index, section_header, char_offset, char_end, page_start, text}], missing_indices}` |
+  | `read ID --chunk C` | `{id, paper_id, doc_id, chunk_id, chunk_index, section_header, page_start, filename, title, text}`; with `--context` adds `context`, `total_chunks` and names the chunk text `chunk_text` |
+  | `queue` | `{count, documents: [...]}` |
+  | `errors` | `{count, errors: [...]}` |
+  | `schema` | `{schema_version, database, tables, views, relationships, common_joins}` |
 - **State is queryable.** Processing status lives in boolean columns (`has_text`, `has_embeddings`, `needs_ocr`), so `gantry queue --needs embeddings` answers "what work is left?" in one call.
 
-If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, and `gantry read <id> --chunk <chunk_id> --context 2000` to expand. Exit code 2 means no results."*
+If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, `gantry find "<title or author>"` for a known paper, and `gantry read <id> --index <a-b>` (or `--chunk <chunk_id> --context 2000`) to read passages. Exit code 2 means no results; 64 means the command itself was malformed."*
 
 ## Why not Zotero, or a RAG framework?
 
@@ -155,10 +170,11 @@ Zotero manages references; it does not give an agent chunk-level retrieval over 
 |---------|-------------|
 | `gantry ingest` | Scan the papers folder, register new and changed PDFs |
 | `gantry process` | Extract text and markdown |
-| `gantry embed` | Generate chunk-level embeddings |
+| `gantry embed` | Generate chunk-level embeddings; `--ids <ids> --force` re-embeds specific papers (deletes their old vectors and resets the flag) |
 | `gantry ocr` | OCR scanned PDFs with Surya |
 | `gantry enrich` | Fetch metadata (title, authors, year, DOI, abstract) from OpenAlex or Semantic Scholar |
-| `gantry pipeline` | Run the full chain: ingest → process → embed |
+| `gantry pipeline [FILE...]` | Run the full chain: ingest → process → embed. `--enrich` adds metadata lookup before embedding. Positional files (or `--file`) scope it to those PDFs: `gantry pipeline paper.pdf --enrich --json` adds one paper end to end and reports its `ids` |
+| `gantry meta set\|clear\|normalize` | Hand metadata edits in code rather than raw SQL (see below) |
 
 #### Enriching metadata
 
@@ -175,7 +191,24 @@ gantry enrich                  # the whole library
 
 For each paper it tries, in order: exact DOI lookup (from the `doi` column, else a DOI found in the first page of text), then an author+year search derived from the filename, then a title search. DOI matches are reliable; title-search fallbacks on opaque filenames are worth a skeptical pass.
 
-Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers missing metadata; pass `--has`/`--needs`/`--is` filters or `--limit` to scope it.
+Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers it has never tried; pass `--ids`, `--has`/`--needs`/`--is` filters or `--limit` to scope it.
+
+A paper the provider can't match is recorded as `metadata_source = 'none:<provider>'`, so "tried and missed" is distinguishable from "never tried". Misses aren't retried by default; `gantry enrich --retry-misses` re-attempts them, and `gantry queue --is enrich-miss` lists them. A lookup that fails on a network or API error leaves the paper untouched, so the next run tries it again.
+
+`gantry pipeline --enrich` runs enrichment after text extraction and before embedding, because each chunk is embedded with its paper's title prepended. Its JSON reports `enriched`, an `enrich` block of counts, and `titled_after_embed`: papers that were already embedded before they got a title, ready for `gantry embed --chunk --ids … --force`.
+
+#### Editing metadata by hand
+
+When a provider gets a paper wrong, or has nothing, set the metadata with `gantry meta` rather than SQL:
+
+```bash
+gantry meta set --id 53 --title "Mind Games" --authors "Ann Author; Ben Author" \
+    --year 2021 --citekey author2021mind --by ryan
+gantry meta clear --ids 861,862          # null a wrong match so enrich retries it
+gantry meta normalize --dry-run --json   # report repairs to hand-written rows
+```
+
+`meta set` writes only the fields you pass, stores authors as a JSON list (`"A; B"` or a JSON list both work), stamps ISO timestamps, and records `metadata_source = 'manual:<by>'`. `enrich` never overwrites manual metadata, even with `--ids`; `gantry queue --is manual-metadata` lists it. `meta clear` nulls title, authors, year, DOI and abstract, resets the enrich and verify state, and leaves the citekey alone unless you pass `--citekey`. `meta normalize` is idempotent: it converts `;`-separated authors to JSON lists, converts `YYYY-MM-DD HH:MM:SS` timestamps to ISO, clears abstracts left on untitled `metadata_suspect` papers (it only reports other untitled papers with abstracts unless you pass `--all-orphans`), and tags pre-2026-09 misses as `none:legacy`. All three take `--dry-run` and `--json`.
 
 ### Search and retrieval
 
@@ -183,15 +216,20 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 |---------|-------------|
 | `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--queries-file PATH\|-` runs many queries with one model load |
 | `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only`, `--format oneline`, `--restrict-to-ids` and `--queries-file` |
-| `gantry find <fragment>` | Fuzzy filename lookup |
-| `gantry read <id>` | Read a document's text, list its chunks, or expand one chunk with `--context` |
-| `gantry info --ids <ids>` | Metadata for specific papers; `--query` attaches each paper's best-matching chunk |
+| `gantry find <words>` | Known-item lookup over title, authors, year, citekey, DOI and filename: `find "Mind games"`, `find "Zhang 2022"`, `find "Flew & Martin"`. Every word must match some field; title matches rank first; each result reports `matched_fields`. `--ids-only` for piping |
+| `gantry read <id>` | Read a document's text, list its chunks (`--chunks`), read chunks by per-paper position (`--index 28-41`), or read one chunk by `chunk_id` (`--chunk`, which must belong to that paper) and expand it with `--context` |
+| `gantry info <ids…>` | Metadata for specific papers; takes IDs (`info 12 13`, `info 12,13`), filenames or citekeys (`info @smith2020`), or `--ids`. `--query` attaches each paper's best-matching chunk |
+| `gantry schema` | Tables, columns, relationships and common joins, for raw-SQL callers |
+
+`<id>` in `read` and `info` accepts a paper ID, a filename, or a citekey (with or without `@`).
+
+**Raw SQL.** If you query `~/.gantry/index.db` directly, use the views `v_papers` and `v_chunks`. Both are keyed by `paper_id` (the underlying `chunks` table calls it `doc_id`, and a chunk's key is `chunk_id`, not `id`). `v_chunks` exposes `paper_id, chunk_id, chunk_index, section_header, page_start, text, char_offset`. Full text lives in `paper_text.raw_text` / `paper_text.markdown`. `gantry schema` prints all of this.
 
 ### Index management
 
 | Command | Description |
 |---------|-------------|
-| `gantry status` | Coverage and database stats |
+| `gantry status` | Coverage and database stats, plus pending-work counts (`needs_text`, `needs_embeddings`, `needs_chunk_embeddings`, `needs_enrich`, `enrich_misses`, `metadata_suspect`, `manual_metadata`) matching what the next default run would pick up |
 | `gantry queue` | Documents matching a filter (`--needs`, `--has`, `--is`) |
 | `gantry errors` / `gantry retry` | Inspect and re-run failures |
 | `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |

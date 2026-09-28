@@ -1,10 +1,12 @@
 """Full-text search (FTS5), semantic search, hybrid search, and chunk-level search."""
 
+import json
 import re
 import sqlite3
 from collections import defaultdict
 
 from .models import ChunkResult, SearchResult
+from .utils import parse_authors
 
 _FTS_OPERATORS = {"AND", "OR", "NOT"}
 # A balanced double-quoted phrase, or a run of non-space characters.
@@ -471,22 +473,125 @@ def cascade_search(
     return results
 
 
+_FIND_FIELDS = ("title", "authors", "citekey", "year", "doi", "filename")
+_FIND_STOPWORDS = {"&", "and", "et", "al", "etal", "+"}
+_EDGE_PUNCT = " \t.,;:()[]{}\"'`?!"
+_DOI_PREFIXES = ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+                 "http://dx.doi.org/", "doi.org/", "doi:")
+
+
+def _fold(text: str) -> str:
+    """Case- and accent-insensitive form for matching ("Ondřej" -> "ondrej")."""
+    import unicodedata
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+def _find_tokens(query: str) -> list[str]:
+    """Split a find query into folded tokens, dropping author-list glue
+    ("&", "and", "et al.") and edge punctuation, and unwrapping DOI URLs."""
+    tokens = []
+    for raw in query.split():
+        tok = raw
+        low = tok.lower()
+        for prefix in _DOI_PREFIXES:
+            if low.startswith(prefix):
+                tok = tok[len(prefix):]
+                break
+        tok = tok.strip(_EDGE_PUNCT)
+        if tok.startswith("@"):
+            tok = tok[1:]
+        tok = _fold(tok)
+        if tok:
+            tokens.append(tok)
+    content = [t for t in tokens if t not in _FIND_STOPWORDS]
+    return content or tokens
+
+
+def _authors_text(authors) -> str:
+    """Authors column as searchable text: JSON lists are decoded (so \\u
+    escapes become real characters); anything else is used verbatim."""
+    if not authors:
+        return ""
+    try:
+        parsed = json.loads(authors)
+    except (ValueError, TypeError):
+        return str(authors)
+    if isinstance(parsed, list):
+        return "; ".join(str(a) for a in parsed)
+    return str(parsed)
+
+
 def find_papers(
     conn: sqlite3.Connection,
     fragment: str,
     limit: int = 20,
 ) -> list[dict]:
-    """Fuzzy filename lookup using LIKE matching (case-insensitive)."""
+    """Known-item lookup over filename, title, authors, citekey, DOI and year.
+
+    Case- and accent-insensitive. The query is split into tokens and every
+    token must match at least one field (a 4-digit token also matches
+    ``year`` exactly), so "Zhang 2022", "Flew & Martin" and "Mind games"
+    all work. Connective tokens ("&", "and", "et al.") are ignored.
+
+    Ranking: exact/phrase title matches first, then all tokens in the title,
+    then all tokens in bibliographic fields (authors/citekey/year), then
+    matches that needed the filename or DOI. Each result carries
+    ``matched_fields``, the fields at least one token matched, in the order
+    title, authors, citekey, year, doi, filename.
+
+    Pure-DB and done in Python over the papers table (a few thousand short
+    rows), which gives Unicode-aware folding that SQLite's LIKE lacks.
+    """
+    tokens = _find_tokens(fragment)
+    if not tokens:
+        return []
+    phrase = " ".join(_fold(fragment).split())
+
     rows = conn.execute(
-        """SELECT id, filename, path, title, authors, page_count, has_text, has_markdown,
-                  has_embeddings, has_chunk_embeddings, is_scanned, citekey
-        FROM papers
-        WHERE filename LIKE ?
-        ORDER BY filename
-        LIMIT ?""",
-        (f"%{fragment}%", limit),
+        """SELECT id, filename, path, title, authors, year, doi, page_count,
+                  has_text, has_markdown, has_embeddings, has_chunk_embeddings,
+                  is_scanned, citekey
+        FROM papers"""
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    scored = []
+    for r in rows:
+        fields = {
+            "title": _fold(r["title"] or ""),
+            "authors": _fold(_authors_text(r["authors"])),
+            "citekey": _fold(r["citekey"] or ""),
+            "doi": _fold(r["doi"] or ""),
+            "filename": _fold(r["filename"] or ""),
+        }
+        year = str(r["year"]) if r["year"] is not None else ""
+        matched: set[str] = set()
+        per_token: list[set[str]] = []
+        for tok in tokens:
+            hit = {name for name, val in fields.items() if tok in val}
+            if year and tok == year:
+                hit.add("year")
+            if not hit:
+                break
+            per_token.append(hit)
+            matched |= hit
+        else:
+            title = fields["title"]
+            if title and (title == phrase or phrase in title):
+                tier = 0
+            elif all("title" in h for h in per_token):
+                tier = 1
+            elif all(h & {"title", "authors", "citekey", "year"} for h in per_token):
+                tier = 2
+            else:
+                tier = 3
+            d = dict(r)
+            d["authors"] = parse_authors(r["authors"])
+            d["matched_fields"] = [f for f in _FIND_FIELDS if f in matched]
+            scored.append((tier, r["filename"] or "", r["id"], d))
+
+    scored.sort(key=lambda x: x[:3])
+    return [d for *_, d in scored[:limit]]
 
 
 def get_chunk_context(

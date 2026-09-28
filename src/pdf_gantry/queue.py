@@ -38,6 +38,48 @@ def suspicious_extraction_condition() -> str:
     )
 
 
+# --- metadata provenance -----------------------------------------------------
+#
+# `metadata_source` has three kinds of value beyond a provider name:
+#   - 'none:<provider>' -- enrichment ran and the provider had no match. Before
+#     2026-09 a miss stamped `metadata_enriched_at` only, so legacy misses are
+#     rows with the stamp but no source and no title; both count as misses.
+#   - 'manual:<who>' -- set by `gantry meta set`. Legacy hand-SQL writes used
+#     free-form names containing "manual" (e.g. 'brev-manual-from-text').
+#     Manual metadata is never overwritten by enrich.
+#   - NULL with no stamp -- never attempted.
+MISS_SOURCE_PREFIX = "none:"
+MANUAL_SOURCE_PREFIX = "manual:"
+
+
+def miss_condition() -> str:
+    """SQL predicate (against papers) for an enrichment attempt that found nothing."""
+    return (
+        "(metadata_source LIKE 'none:%' OR (metadata_source IS NULL "
+        "AND metadata_enriched_at IS NOT NULL "
+        "AND (title IS NULL OR title = '')))"
+    )
+
+
+def manual_condition() -> str:
+    """SQL predicate for hand-set metadata (``meta set`` or legacy hand SQL)."""
+    return "(metadata_source LIKE 'manual:%' OR metadata_source LIKE '%manual%')"
+
+
+def enriched_condition() -> str:
+    """SQL predicate for metadata that actually came from somewhere (not a miss)."""
+    return "(metadata_source IS NOT NULL AND metadata_source NOT LIKE 'none:%')"
+
+
+def never_enriched_condition() -> str:
+    """SQL predicate for papers default `enrich` should pick up: never
+    attempted, and not hand-set."""
+    return (
+        "(metadata_enriched_at IS NULL "
+        "AND (metadata_source IS NULL OR NOT " + manual_condition() + "))"
+    )
+
+
 def build_filter_query(
     needs: list[str] | None = None,
     has: list[str] | None = None,
@@ -102,6 +144,10 @@ def build_filter_query(
                 conditions.append("metadata_suspect = 1")
             elif p == "encrypted":
                 conditions.append("is_encrypted = 1")
+            elif p == "enrich-miss":
+                conditions.append(miss_condition())
+            elif p == "manual-metadata":
+                conditions.append(manual_condition())
 
     if has_errors:
         conditions.append("error_count > 0")
@@ -168,3 +214,29 @@ def queue_count(
     )
     row = conn.execute(f"SELECT COUNT(*) FROM papers {where}", params).fetchone()
     return row[0]
+
+
+def pending_counts(
+    conn: sqlite3.Connection, max_retries: int = DEFAULT_MAX_RETRIES
+) -> dict[str, int]:
+    """Counts of outstanding work, as the next default run would select it.
+
+    ``needs_*`` mirror the default selections of process/embed/enrich
+    (quarantined and encrypted papers excluded where those commands skip
+    them), so a poller can ask "is there work left?" without SQL.
+    """
+    ok = not_quarantined_condition(max_retries)
+    predicates = {
+        "needs_text": f"has_text = 0 AND is_encrypted = 0 AND {ok}",
+        "needs_embeddings": f"has_text = 1 AND has_embeddings = 0 AND {ok}",
+        "needs_chunk_embeddings": f"has_text = 1 AND has_chunk_embeddings = 0 AND {ok}",
+        "needs_enrich": never_enriched_condition(),
+        "enrich_misses": miss_condition(),
+        "metadata_suspect": "metadata_suspect = 1",
+        "manual_metadata": manual_condition(),
+    }
+    select = ", ".join(
+        f"COALESCE(SUM(CASE WHEN {p} THEN 1 ELSE 0 END), 0)" for p in predicates.values()
+    )
+    row = conn.execute(f"SELECT {select} FROM papers").fetchone()
+    return dict(zip(predicates, row))

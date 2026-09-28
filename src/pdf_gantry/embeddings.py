@@ -330,3 +330,37 @@ def embed_query(model_name: str, query: str) -> bytes:
     model = _query_model(model_name)
     vector = model.encode(f"search_query: {query}", show_progress_bar=False)
     return _serialize_vector(vector)
+
+
+def reset_embeddings(
+    conn: sqlite3.Connection, paper_ids: list[int], chunk: bool = True
+) -> None:
+    """Delete papers' stored vectors and clear the matching done-flag.
+
+    The flag and the vectors must move together: deleting vectors alone
+    leaves ``has_chunk_embeddings=1`` and every default embed run skips the
+    paper. Chunk mode drops ``chunk_vec`` rows for the papers' chunks and
+    resets ``has_chunk_embeddings``; doc mode drops ``paper_embeddings`` and
+    resets ``has_embeddings``.
+    """
+    if not paper_ids:
+        return
+    placeholders = ",".join("?" * len(paper_ids))
+    if chunk:
+        chunk_ids = [r[0] for r in conn.execute(
+            f"SELECT chunk_id FROM chunks WHERE doc_id IN ({placeholders})", paper_ids
+        )]
+        conn.executemany(
+            "DELETE FROM chunk_vec WHERE chunk_id = ?", [(c,) for c in chunk_ids]
+        )
+        flag = "has_chunk_embeddings"
+    else:
+        conn.executemany(
+            "DELETE FROM paper_embeddings WHERE paper_id = ?", [(p,) for p in paper_ids]
+        )
+        flag = "has_embeddings"
+    conn.execute(
+        f"UPDATE papers SET {flag} = 0, updated_at = ? WHERE id IN ({placeholders})",
+        [now_iso(), *paper_ids],
+    )
+    conn.commit()

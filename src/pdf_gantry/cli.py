@@ -13,6 +13,7 @@ from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
 from .retrieval import TOTAL_HELP
+from .usage import EXIT_USAGE, GantryGroup  # noqa: F401  (EXIT_USAGE re-exported)
 from .utils import (
     format_count,
     format_duration,
@@ -21,6 +22,8 @@ from .utils import (
     missing_ids,
     parse_authors,
     parse_ids,
+    resolve_identifier,
+    resolve_identifiers,
     resolve_ids,
 )
 
@@ -30,6 +33,9 @@ EXIT_ERROR = 1
 EXIT_NO_RESULTS = 2
 EXIT_PARTIAL = 3
 EXIT_DB_ERROR = 4
+# EXIT_USAGE = 64 (sysexits EX_USAGE) is defined in usage.py: bad flags,
+# unknown commands and bad choices. Distinct from EXIT_NO_RESULTS so a typo
+# can never read as "not in library".
 
 err_console = Console(stderr=True)
 
@@ -102,7 +108,7 @@ def filter_options(f):
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice([
                       "scanned", "digital", "suspicious", "broken", "metadata-suspect",
-                      "encrypted",
+                      "encrypted", "enrich-miss", "manual-metadata",
                   ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
@@ -115,7 +121,7 @@ def filter_options(f):
     return wrapper
 
 
-@click.group()
+@click.group(cls=GantryGroup)
 @click.version_option(version=__version__)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -342,6 +348,8 @@ def status(ctx, json_output):
         f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
     ).fetchone()[0]
     info.db_size_bytes = cfg.db_path.stat().st_size
+    from .queue import pending_counts
+    pending = pending_counts(conn, cfg.processing.max_retries)
 
     conn.close()
 
@@ -365,6 +373,7 @@ def status(ctx, json_output):
             "pct_chunk_embeddings": (
                 round(info.with_chunk_embeddings / info.total * 100, 1) if info.total else 0
             ),
+            **pending,
         }, indent=2))
     else:
         click.echo(f"pdf_gantry index: {info.db_path}")
@@ -398,6 +407,18 @@ def status(ctx, json_output):
             click.echo(f"  Suspicious extraction: {format_count(info.suspicious_extraction)} "
                        f"({format_pct(info.suspicious_extraction, info.total)}) "
                        f"— run 'gantry queue --is suspicious'")
+        click.echo()
+        click.echo("Pending work:")
+        click.echo(f"  Needs text:             {format_count(pending['needs_text'])}")
+        click.echo(f"  Needs embeddings:       {format_count(pending['needs_embeddings'])}")
+        click.echo(
+            f"  Needs chunk embeddings: {format_count(pending['needs_chunk_embeddings'])}"
+        )
+        click.echo(f"  Needs enrich:           {format_count(pending['needs_enrich'])}")
+        click.echo(f"  Enrich misses:          {format_count(pending['enrich_misses'])}"
+                   " (retry: gantry enrich --retry-misses)")
+        click.echo(f"  Metadata suspect:       {format_count(pending['metadata_suspect'])}")
+        click.echo(f"  Manual metadata:        {format_count(pending['manual_metadata'])}")
         click.echo()
         click.echo(f"Database size: {format_size(info.db_size_bytes)}")
 
@@ -1309,14 +1330,24 @@ def semantic(ctx, query, queries_file, limit, doc_only, field_list, restrict_to_
 @filter_options
 @click.option("--chunk", "chunk_mode", is_flag=True, help="Generate chunk-level embeddings")
 @click.option("--batch-size", type=int, default=None, help="Batch size for encoding")
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to embed (overrides filters); "
+                   "papers already embedded are skipped unless --force")
+@click.option("--force", is_flag=True,
+              help="With --ids: delete the papers' existing vectors, reset their "
+                   "flag, and re-embed them")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def embed(
     ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, batch_size,
-    dry_run, json_output,
+    ids, force, dry_run, json_output,
 ):
-    """Generate embeddings for documents with text."""
+    """Generate embeddings for documents with text.
+
+    `embed --chunk --ids 12,40 --force` re-embeds specific papers, e.g. after
+    their chunk vectors were deleted or their title changed.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
@@ -1329,8 +1360,18 @@ def embed(
         ctx.exit(EXIT_ERROR)
         return
 
+    if force and ids is None:
+        msg = "--force requires --ids (re-embedding is scoped to named papers)"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    requested_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
     conn = get_connection(cfg.db_path)
-    from .embeddings import embed_chunks, embed_documents
+    from .embeddings import embed_chunks, embed_documents, reset_embeddings
     from .queue import build_filter_query
 
     if batch_size is None:
@@ -1357,15 +1398,34 @@ def embed(
         max_retries=cfg.processing.max_retries,
     )
 
-    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
-    paper_ids = [r["id"] for r in rows]
+    not_found: list[int] = []
+    already_done = 0
+    if requested_ids is not None:
+        found, not_found = resolve_ids(conn, requested_ids)
+        flag = "has_chunk_embeddings" if chunk_mode else "has_embeddings"
+        placeholders = ",".join("?" * len(found))
+        rows = conn.execute(
+            f"SELECT id, {flag} AS done FROM papers "
+            f"WHERE id IN ({placeholders}) AND has_text = 1",
+            found,
+        ).fetchall() if found else []
+        order = {pid: i for i, pid in enumerate(found)}
+        rows = sorted(rows, key=lambda r: order[r["id"]])
+        paper_ids = [r["id"] for r in rows if force or not r["done"]]
+        already_done = sum(1 for r in rows if r["done"]) if not force else 0
+    else:
+        rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+        paper_ids = [r["id"] for r in rows]
 
     if limit:
         paper_ids = paper_ids[:limit]
 
     if dry_run:
         if use_json:
-            click.echo(json.dumps({"would_embed": len(paper_ids), "model": cfg.embedding.model}))
+            payload = {"would_embed": len(paper_ids), "model": cfg.embedding.model}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(
                 f"Would embed {format_count(len(paper_ids))} documents with {cfg.embedding.model}"
@@ -1374,13 +1434,24 @@ def embed(
         return
 
     if not paper_ids:
+        message = "Nothing to embed"
+        if already_done:
+            message += (f" ({already_done} already embedded; "
+                        "pass --force to re-embed)")
         if use_json:
-            click.echo(json.dumps({"total": 0, "message": "Nothing to embed"}))
+            payload = {"total": 0, "message": message}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
-            click.echo("Nothing to embed")
+            click.echo(message)
+            _print_not_found("Not in index", not_found, ids_only=False)
         conn.close()
         ctx.exit(EXIT_NO_RESULTS)
         return
+
+    if force:
+        reset_embeddings(conn, paper_ids, chunk=chunk_mode)
 
     progress_bar = None
     task = None
@@ -1435,6 +1506,7 @@ def embed(
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
             "model": cfg.embedding.model,
+            **({"not_found": not_found} if requested_ids is not None else {}),
         }, indent=2))
     else:
         click.echo(
@@ -1443,8 +1515,9 @@ def embed(
         )
         if stats.failed > 0:
             click.echo(f"  Failed: {format_count(stats.failed)}")
+        _print_not_found("Not in index", not_found, ids_only=False)
 
-    if stats.failed > 0 and stats.succeeded > 0:
+    if (stats.failed > 0 and stats.succeeded > 0) or (not_found and stats.succeeded > 0):
         ctx.exit(EXIT_PARTIAL)
     elif stats.failed > 0 and stats.succeeded == 0:
         ctx.exit(EXIT_ERROR)
@@ -1459,12 +1532,24 @@ def embed(
               help="Metadata provider")
 @click.option("--mailto", default=None,
               help="OpenAlex polite-pool email (overrides config openalex_mailto)")
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to enrich (overrides filters). "
+                   "Hand-set (manual) metadata is still never overwritten.")
+@click.option("--retry-misses", is_flag=True,
+              help="Also re-attempt papers where an earlier enrich found no match "
+                   "(metadata_source 'none:<provider>'); see `queue --is enrich-miss`")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
-           limit, dry_run, json_output):
-    """Fetch metadata from OpenAlex (default) or Semantic Scholar."""
+           ids, retry_misses, limit, dry_run, json_output):
+    """Fetch metadata from OpenAlex (default) or Semantic Scholar.
+
+    With no filters, enriches papers never attempted. A provider miss is
+    recorded as metadata_source 'none:<provider>' and is not retried unless
+    --retry-misses is given. Metadata set with `gantry meta set` is never
+    overwritten; `gantry meta clear` releases it.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
@@ -1486,28 +1571,40 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         ctx.exit(EXIT_ERROR)
         return
 
+    requested_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
     conn = get_connection(cfg.db_path)
-    from .metadata import enrich_documents
-    from .queue import build_filter_query
+    from .metadata import default_enrich_ids, enrich_documents
+    from .queue import build_filter_query, miss_condition
 
-    if not needs and not has_prop and not is_prop:
-        needs = ("metadata",)
-
-    where, params = build_filter_query(
-        needs=list(needs) if needs else None,
-        has=list(has_prop) if has_prop else None,
-        is_prop=list(is_prop) if is_prop else None,
-    )
-
-    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
-    paper_ids = [r["id"] for r in rows]
+    not_found: list[int] = []
+    if requested_ids is not None:
+        paper_ids, not_found = resolve_ids(conn, requested_ids)
+    elif not needs and not has_prop and not is_prop:
+        paper_ids = default_enrich_ids(conn, retry_misses=retry_misses)
+    else:
+        where, params = build_filter_query(
+            needs=list(needs) if needs else None,
+            has=list(has_prop) if has_prop else None,
+            is_prop=list(is_prop) if is_prop else None,
+        )
+        rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+        paper_ids = [r["id"] for r in rows]
+        if retry_misses:
+            miss_ids = {r[0] for r in conn.execute(
+                f"SELECT id FROM papers WHERE {miss_condition()}"
+            )}
+            paper_ids = sorted(set(paper_ids) | miss_ids)
 
     if limit:
         paper_ids = paper_ids[:limit]
 
     if dry_run:
         if use_json:
-            click.echo(json.dumps({"would_enrich": len(paper_ids)}))
+            payload = {"would_enrich": len(paper_ids)}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(f"Would enrich {format_count(len(paper_ids))} documents")
         conn.close()
@@ -1515,7 +1612,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
 
     if not paper_ids:
         if use_json:
-            click.echo(json.dumps({"total": 0, "message": "Nothing to enrich"}))
+            payload = {"total": 0, "message": "Nothing to enrich"}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo("Nothing to enrich")
         conn.close()
@@ -1558,6 +1658,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             "matched_by_title": stats.matched_by_title,
             "no_match": stats.no_match,
             "api_errors": stats.api_errors,
+            "matched": stats.matched,
+            "suspect": stats.suspect,
+            "skipped_manual": stats.skipped_manual,
+            "not_found": not_found,
             "elapsed_seconds": stats.elapsed_seconds,
         }, indent=2))
     else:
@@ -1568,6 +1672,10 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         click.echo(f"  DOI found in text: {format_count(stats.doi_found)}")
         click.echo(f"  Matched via title: {format_count(stats.matched_by_title)}")
         click.echo(f"  No match found: {format_count(stats.no_match)}")
+        if stats.skipped_manual:
+            click.echo(f"  Skipped (manual metadata): {format_count(stats.skipped_manual)}")
+        if not_found:
+            click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
         if stats.api_errors:
             click.echo(f"  API errors: {format_count(stats.api_errors)}")
 
@@ -1689,6 +1797,164 @@ def verify(ctx, ids, threshold, limit, ids_only, json_output):
 
     if suspects or not_found or skipped_ineligible:
         ctx.exit(EXIT_PARTIAL)
+
+
+# --- meta ---
+
+@cli.group()
+def meta():
+    """Set, clear or repair paper metadata by hand (instead of raw SQL).
+
+    Hand-set metadata is recorded as metadata_source 'manual:<by>' and is
+    never overwritten by `gantry enrich`.
+    """
+
+
+def _no_db(ctx, use_json):
+    msg = "No database found. Run 'gantry ingest' first."
+    if use_json:
+        click.echo(json.dumps({"error": msg}))
+    else:
+        click.echo(msg, err=True)
+    ctx.exit(EXIT_ERROR)
+
+
+@meta.command("set")
+@click.option("--id", "paper_id", type=int, required=True, help="Paper ID to edit")
+@click.option("--title", default=None)
+@click.option("--authors", default=None,
+              help='Authors as "A; B" or a JSON list \'["A", "B"]\' (stored as a JSON list)')
+@click.option("--year", type=int, default=None)
+@click.option("--citekey", default=None)
+@click.option("--doi", default=None, help="DOI (a doi.org URL prefix is stripped)")
+@click.option("--abstract", default=None)
+@click.option("--by", default="cli", show_default=True,
+              help="Who set it; recorded as metadata_source 'manual:<by>'")
+@click.option("--dry-run", is_flag=True, help="Show the changes without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_set(ctx, paper_id, title, authors, year, citekey, doi, abstract, by,
+             dry_run, json_output):
+    """Set metadata fields on one paper. Only the fields given are written."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+
+    from .meta import set_metadata
+
+    conn = get_connection(cfg.db_path)
+    try:
+        result = set_metadata(
+            conn, paper_id, title=title, authors=authors, year=year, doi=doi,
+            abstract=abstract, citekey=citekey, by=by, dry_run=dry_run,
+        )
+    except ValueError as e:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({"error": str(e)}))
+        else:
+            click.echo(str(e), err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    except LookupError:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({"error": f"Paper {paper_id} not in index",
+                                   "not_found": [paper_id]}))
+        else:
+            click.echo(f"Paper {paper_id} not in index", err=True)
+        ctx.exit(EXIT_NO_RESULTS)
+        return
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        click.echo(f"{prefix}Paper {paper_id} ({result['metadata_source']}):")
+        for field, change in result["changes"].items():
+            click.echo(f"  {field}: {change['old']!r} -> {change['new']!r}")
+
+
+@meta.command("clear")
+@click.option("--ids", required=True, help="Comma-separated paper IDs")
+@click.option("--citekey", "clear_citekey", is_flag=True,
+              help="Also clear citekey (left alone by default)")
+@click.option("--dry-run", is_flag=True, help="Report what would be cleared")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_clear(ctx, ids, clear_citekey, dry_run, json_output):
+    """Null title/authors/year/doi/abstract and reset enrich/verify state.
+
+    The papers become eligible for the next default `gantry enrich`.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .meta import clear_metadata
+
+    conn = get_connection(cfg.db_path)
+    result = clear_metadata(conn, paper_ids, citekey=clear_citekey, dry_run=dry_run)
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        verb = "Would clear" if dry_run else "Cleared"
+        click.echo(f"{verb} {len(result['cleared'])} paper(s): "
+                   f"{', '.join(result['fields'])}")
+        _print_not_found("Not in index", result["not_found"], ids_only=False)
+
+    if not result["cleared"]:
+        ctx.exit(EXIT_NO_RESULTS)
+    elif result["not_found"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
+@meta.command("normalize")
+@click.option("--all-orphans", is_flag=True,
+              help="Also clear abstracts on untitled papers not flagged metadata_suspect")
+@click.option("--dry-run", is_flag=True, help="Report counts without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def meta_normalize(ctx, all_orphans, dry_run, json_output):
+    """Repair hand-written metadata. Idempotent.
+
+    Converts non-JSON authors to JSON lists, 'YYYY-MM-DD HH:MM:SS' timestamps
+    to ISO, clears orphaned abstracts (untitled + metadata_suspect), and tags
+    legacy provider misses as metadata_source 'none:legacy'.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+
+    from .meta import normalize_metadata
+
+    conn = get_connection(cfg.db_path)
+    report = normalize_metadata(conn, dry_run=dry_run, all_orphans=all_orphans)
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+    prefix = "[DRY RUN] " if dry_run else ""
+    click.echo(f"{prefix}Authors converted to JSON lists: {report['authors_normalized']}")
+    for col, n in report["timestamps_normalized"].items():
+        click.echo(f"{prefix}Timestamps converted to ISO ({col}): {n}")
+    click.echo(f"{prefix}Orphaned abstracts cleared: {report['orphan_abstracts_cleared']}")
+    others = report["other_orphan_abstract_ids"]
+    if others:
+        click.echo(f"  Other untitled papers with an abstract (kept; --all-orphans "
+                   f"to clear): {len(others)}")
+    click.echo(f"{prefix}Legacy misses tagged none:legacy: {report['legacy_misses_tagged']}")
 
 
 # --- retry ---
@@ -1821,29 +2087,63 @@ def retry(ctx, max_attempts, ids, json_output):
 # --- pipeline ---
 
 @cli.command()
-@click.option("--file", "filename", type=str, default=None, help="Process a single file by name")
+@click.argument("files", nargs=-1, type=str)
+@click.option("--file", "filename", type=str, default=None,
+              help="Process a single file by name (same as a positional FILE)")
 @click.option("--limit", type=int, default=None, help="Max papers to process end-to-end")
 @click.option("--workers", type=int, default=None, help="Number of concurrent workers")
+@click.option("--enrich", "do_enrich", is_flag=True,
+              help="Fetch metadata for never-enriched papers after extraction and "
+                   "before embedding, so titles reach the chunk embeddings")
+@click.option("--provider", type=click.Choice(["openalex", "semantic-scholar"]),
+              default="openalex", show_default=True,
+              help="Metadata provider for --enrich")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def pipeline(ctx, filename, limit, workers, dry_run, json_output):
-    """Run full ingestion pipeline: ingest → process → embed."""
+def pipeline(ctx, files, filename, limit, workers, do_enrich, provider, dry_run,
+             json_output):
+    """Run full ingestion pipeline: ingest → process → [enrich →] embed.
+
+    FILES (or --file) limit the run to those PDFs, by name or by a path inside
+    the papers directory. `gantry pipeline paper.pdf --enrich` adds one paper
+    end to end, metadata included; the JSON `ids` field gives its paper ID.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
-    require_papers_dir(ctx, cfg, use_json)
-    if not cfg.papers_dir.is_dir():
-        msg = f"Papers directory not found: {cfg.papers_dir}"
+    def fail(msg):
         if use_json:
             click.echo(json.dumps({"error": msg}))
         else:
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
+
+    require_papers_dir(ctx, cfg, use_json)
+    if not cfg.papers_dir.is_dir():
+        fail(f"Papers directory not found: {cfg.papers_dir}")
         return
+
+    names: list[str] = []
+    papers_root = cfg.papers_dir.resolve()
+    for arg in ([filename] if filename else []) + list(files):
+        path = Path(arg)
+        if path.parent != Path("."):
+            if path.expanduser().resolve().parent != papers_root:
+                fail(f"{arg} is not in the papers directory ({cfg.papers_dir}); "
+                     "gantry indexes a flat folder, so move or copy it there first")
+                return
+        if path.name not in names:
+            names.append(path.name)
+    for name in names:
+        if not (cfg.papers_dir / name).exists():
+            fail(f"File not found in papers directory: {name}")
+            return
 
     if workers is None:
         workers = cfg.processing.workers
+
+    mailto = cfg.openalex_mailto if provider == "openalex" else None
 
     cfg.index_dir.mkdir(parents=True, exist_ok=True)
     conn = get_connection(cfg.db_path)
@@ -1851,18 +2151,42 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
     from .pipeline import run_pipeline
 
     if not use_json and not dry_run:
-        if filename:
-            err_console.print(f"Pipeline: {filename}")
+        if names:
+            err_console.print(f"Pipeline: {', '.join(names)}")
         else:
             err_console.print(f"Pipeline: scanning {cfg.papers_dir}")
 
-    stats = run_pipeline(
-        conn, cfg.papers_dir, cfg.db_path,
-        workers=workers, limit=limit, dry_run=dry_run,
-        filename=filename,
-        scan_threshold=cfg.processing.scan_threshold,
-        max_retries=cfg.processing.max_retries,
-    )
+    def run(name):
+        return run_pipeline(
+            conn, cfg.papers_dir, cfg.db_path,
+            workers=workers, limit=limit, dry_run=dry_run,
+            filename=name,
+            scan_threshold=cfg.processing.scan_threshold,
+            max_retries=cfg.processing.max_retries,
+            enrich=do_enrich, provider=provider, mailto=mailto,
+        )
+
+    if len(names) <= 1:
+        stats = run(names[0] if names else None)
+    else:
+        per_file = [{"file": n, **run(n)} for n in names]
+        stats = {"ingested": 0, "processed": 0, "enriched": 0, "embedded": 0,
+                 "errors": 0, "new_files": [], "ids": []}
+        for fs in per_file:
+            for key in ("ingested", "processed", "enriched", "embedded", "errors"):
+                stats[key] += fs.get(key, 0)
+            stats["new_files"] += fs.get("new_files", [])
+            stats["ids"] += fs.get("ids", [])
+        if do_enrich:
+            stats["enrich"] = {
+                key: sum(fs.get("enrich", {}).get(key, 0) for fs in per_file)
+                for key in ("total", "matched", "no_match", "api_errors",
+                            "suspect", "skipped_manual")
+            }
+            stats["titled_after_embed"] = sorted(
+                i for fs in per_file for i in fs.get("titled_after_embed", [])
+            )
+        stats["files"] = per_file
 
     if not dry_run:
         from .queue import suspicious_extraction_condition
@@ -1877,8 +2201,16 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
         prefix = "[DRY RUN] " if dry_run else ""
         click.echo(f"{prefix}Ingested: {stats['ingested']}, "
                     f"Processed: {stats['processed']}, "
-                    f"Embedded: {stats['embedded']}, "
+                    + (f"Enriched: {stats['enriched']}, " if do_enrich else "")
+                    + f"Embedded: {stats['embedded']}, "
                     f"Errors: {stats['errors']}")
+        if stats.get("ids"):
+            click.echo(f"  Paper IDs: {', '.join(str(i) for i in stats['ids'])}")
+        if stats.get("titled_after_embed"):
+            ids_str = ",".join(str(i) for i in stats["titled_after_embed"])
+            click.echo(f"  {len(stats['titled_after_embed'])} paper(s) gained a title "
+                       f"after being embedded; re-embed with "
+                       f"'gantry embed --chunk --ids {ids_str} --force'")
         if stats.get("suspicious", 0) > 0:
             click.echo(f"  Warning: {stats['suspicious']} paper(s) have suspiciously thin "
                        f"text for their page count — likely bitmap-rendered. "
@@ -1938,12 +2270,26 @@ def prune(ctx, dry_run, json_output):
 @cli.command()
 @click.argument("fragment")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Print only matching paper IDs, one per line (overrides --json)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def find(ctx, fragment, limit, json_output):
-    """Fuzzy filename lookup. FRAGMENT matches anywhere in the filename."""
+def find(ctx, fragment, limit, ids_only, json_output):
+    """Known-item lookup by title, author, year, citekey, DOI or filename.
+
+    Case- and accent-insensitive; every word of FRAGMENT must match some
+    field ("&", "and", "et al." are ignored). Title matches rank first. Each
+    result reports matched_fields.
+
+    \b
+    Examples:
+      gantry find "Mind games"
+      gantry find "Zhang 2022" --ids-only
+      gantry find "Flew & Martin" --json
+      gantry find @flew2022digital
+    """
     cfg = ctx.obj["config"]
-    use_json = json_output or ctx.obj["json"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -1959,6 +2305,13 @@ def find(ctx, fragment, limit, json_output):
 
     results = find_papers(conn, fragment, limit=limit)
     conn.close()
+
+    if ids_only:
+        for r in results:
+            click.echo(r["id"])
+        if not results:
+            ctx.exit(EXIT_NO_RESULTS)
+        return
 
     if not results:
         if use_json:
@@ -1981,6 +2334,8 @@ def find(ctx, fragment, limit, json_output):
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
                     "citekey": r.get("citekey"),
+                    "year": r.get("year"),
+                    "matched_fields": r["matched_fields"],
                 }
                 for r in results
             ],
@@ -1992,13 +2347,17 @@ def find(ctx, fragment, limit, json_output):
             ck = r.get("citekey")
             ck_str = f" @{ck}" if ck else ""
             extra = f" — {r['title']}" if r["title"] else ""
-            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}")
+            yr = f" ({r['year']})" if r.get("year") else ""
+            via = ",".join(r["matched_fields"])
+            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}{yr}  [{via}]")
 
 
 # --- info ---
 
 @cli.command()
-@click.option("--ids", type=str, required=True, help="Comma-separated paper IDs")
+@click.argument("identifiers", nargs=-1)
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (alternative to positional IDENTIFIERS)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include")
 @click.option("--chunks", "include_chunks", is_flag=True,
@@ -2009,10 +2368,26 @@ def find(ctx, fragment, limit, json_output):
               help="Expand each top chunk with N chars of surrounding context (requires --query)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output):
-    """Fetch metadata for specific papers by ID."""
+def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars, json_output):
+    """Fetch metadata for specific papers.
+
+    IDENTIFIERS are paper IDs (space- or comma-separated), filenames, or
+    citekeys (optionally prefixed with @). They combine with --ids.
+
+    \b
+    Examples:
+      gantry info 12 13 --json
+      gantry info 12,13 --fields id,title,year
+      gantry info @smith2020 --query "platform governance"
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    if not identifiers and ids is None:
+        raise click.UsageError(
+            "Give one or more paper identifiers (IDs, filenames, citekeys) or --ids.",
+            ctx=ctx,
+        )
 
     if not cfg.db_path.exists():
         msg = "No database found."
@@ -2023,15 +2398,22 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         ctx.exit(EXIT_ERROR)
         return
 
-    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids") or []
     from .retrieval import INFO_FIELDS, split_fields
     info_fields, unknown_fields = split_fields(field_list, INFO_FIELDS)
     _warn_unknown_fields(unknown_fields, INFO_FIELDS)
 
     conn = get_connection(cfg.db_path)
 
+    # Positional identifiers: resolved up front. Unresolvable ones (a
+    # mistyped citekey, a pruned ID) join not_found below.
+    unresolved: list = []
+    if identifiers:
+        pos_ids, unresolved = resolve_identifiers(conn, identifiers)
+        paper_ids = list(dict.fromkeys(paper_ids + pos_ids))
+
     placeholders = ",".join("?" * len(paper_ids))
-    rows = conn.execute(
+    rows = [] if not paper_ids else conn.execute(
         f"""SELECT p.id, p.filename, p.path, p.title, p.authors, p.year, p.doi,
                    p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
                    p.has_chunk_embeddings, p.page_count, p.is_scanned,
@@ -2051,6 +2433,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
     # to diff input against output itself to notice a drop.
     found_ids = {r["id"] for r in rows}
     not_found = missing_ids(paper_ids, found_ids)
+    not_found += [u for u in unresolved if u not in not_found]
 
     if not rows:
         if use_json:
@@ -2192,27 +2575,81 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
 
 @cli.command()
 @click.argument("identifier")
-@click.option("--chunk", "chunk_id", type=int, default=None, help="Read a specific chunk by ID")
+@click.option("--chunk", "chunk_id", type=int, default=None,
+              help="Read a specific chunk by its global chunk_id (must belong to IDENTIFIER)")
+@click.option("--index", "index_range", type=str, default=None,
+              help="Read chunks by per-paper chunk_index: N or A-B (inclusive)")
 @click.option("--chunks", "list_chunks", is_flag=True, help="List all chunks for a document")
 @click.option("--context", "context_chars", type=int, default=None,
               help="Expand chunk with surrounding context (chars). Use with --chunk")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
-    """Read document text or chunks. IDENTIFIER is a paper ID or filename."""
+def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, json_output):
+    """Read document text or chunks.
+
+    IDENTIFIER is a paper ID, filename, or citekey (optionally @-prefixed).
+
+    \b
+    Examples:
+      gantry read 53                      # full markdown
+      gantry read 53 --chunks             # chunk list with sizes
+      gantry read 53 --index 28-41 --json # chunks by per-paper index
+      gantry read 53 --chunk 9120 --context 2000
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
-    if not cfg.db_path.exists():
-        msg = "No database found."
+    if index_range is not None and chunk_id is not None:
+        raise click.UsageError("--index and --chunk are mutually exclusive.", ctx=ctx)
+    index_bounds = None
+    if index_range is not None:
+        from .reader import parse_index_range
+        try:
+            index_bounds = parse_index_range(index_range)
+        except ValueError as e:
+            raise click.BadParameter(str(e), ctx=ctx, param_hint="--index") from e
+
+    def fail(msg):
         if use_json:
             click.echo(json.dumps({"error": msg}))
         else:
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
+
+    if not cfg.db_path.exists():
+        fail("No database found.")
         return
 
     conn = get_connection(cfg.db_path)
+
+    # Resolve identifier to paper (ID, filename, or citekey). Every mode
+    # needs it: --chunk used to ignore it and could return another paper's
+    # text (B2).
+    paper_id = resolve_identifier(conn, identifier)
+    paper = None
+    if paper_id is not None:
+        paper = conn.execute(
+            "SELECT id, filename, title, authors FROM papers WHERE id = ?", (paper_id,)
+        ).fetchone()
+    if not paper:
+        conn.close()
+        fail(f"Paper not found: {identifier}")
+        return
+
+    if chunk_id is not None:
+        owner = conn.execute(
+            "SELECT doc_id FROM chunks WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()
+        if not owner:
+            conn.close()
+            fail(f"Chunk {chunk_id} not found")
+            return
+        if owner["doc_id"] != paper["id"]:
+            conn.close()
+            fail(f"Chunk {chunk_id} belongs to paper {owner['doc_id']}, not paper "
+                 f"{paper['id']} ({paper['filename']}). For a per-paper position "
+                 f"use --index.")
+            return
 
     if chunk_id is not None and context_chars is not None:
         # Scoped context window around a chunk
@@ -2220,13 +2657,10 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         result = get_chunk_context(conn, chunk_id, max_chars=context_chars)
         conn.close()
         if not result:
-            msg = f"Chunk {chunk_id} not found"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
+            fail(f"Chunk {chunk_id} not found")
             return
+        result["paper_id"] = result["doc_id"]
+        result["id"] = result["doc_id"]
         if use_json:
             click.echo(json.dumps(result, indent=2))
         else:
@@ -2248,22 +2682,17 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             (chunk_id,),
         ).fetchone()
         conn.close()
-        if not row:
-            msg = f"Chunk {chunk_id} not found"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
         if use_json:
             click.echo(json.dumps({
                 "chunk_id": row["chunk_id"],
                 "doc_id": row["doc_id"],
+                "paper_id": row["doc_id"],
+                "id": row["doc_id"],
                 "filename": row["filename"],
                 "title": row["title"],
                 "chunk_index": row["chunk_index"],
                 "section_header": row["section_header"],
+                "page_start": row["page_start"],
                 "text": row["text"],
             }, indent=2))
         else:
@@ -2274,25 +2703,40 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             click.echo(row["text"])
         return
 
-    # Resolve identifier to paper
-    try:
-        paper_id = int(identifier)
-        paper = conn.execute(
-            "SELECT id, filename, title, authors FROM papers WHERE id = ?", (paper_id,)
-        ).fetchone()
-    except ValueError:
-        paper = conn.execute(
-            "SELECT id, filename, title, authors FROM papers WHERE filename = ?", (identifier,)
-        ).fetchone()
-
-    if not paper:
-        msg = f"Paper not found: {identifier}"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
+    if index_bounds is not None:
+        from .reader import chunk_count, chunks_by_index
+        lo, hi = index_bounds
+        total = chunk_count(conn, paper["id"])
+        rows = chunks_by_index(conn, paper["id"], lo, hi)
         conn.close()
-        ctx.exit(EXIT_ERROR)
+        if not rows:
+            fail(f"No chunks with index {index_range} in {paper['filename']} "
+                 f"(paper {paper['id']} has {total} chunks, indexed 0-{max(total - 1, 0)}).")
+            return
+        got = {r["chunk_index"] for r in rows}
+        missing = [i for i in range(lo, hi + 1) if i not in got]
+        if use_json:
+            click.echo(json.dumps({
+                "id": paper["id"],
+                "paper_id": paper["id"],
+                "filename": paper["filename"],
+                "title": paper["title"],
+                "total_chunks": total,
+                "chunks": rows,
+                "missing_indices": missing,
+            }, indent=2))
+        else:
+            for r in rows:
+                header = f" [{r['section_header']}]" if r["section_header"] else ""
+                page = f" p.{r['page_start']}" if r.get("page_start") is not None else ""
+                click.echo(f"--- {paper['filename']} chunk {r['chunk_index']} "
+                           f"(id={r['chunk_id']}){page}{header}")
+                click.echo(r["text"])
+                click.echo()
+            if missing:
+                click.echo(f"Missing indices: {', '.join(map(str, missing))}", err=True)
+        if missing:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if list_chunks:
@@ -2304,6 +2748,7 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         conn.close()
         if use_json:
             click.echo(json.dumps({
+                "id": paper["id"],
                 "paper_id": paper["id"],
                 "filename": paper["filename"],
                 "chunks": [
@@ -2344,6 +2789,7 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
     content = text["markdown"] or text["raw_text"]
     if use_json:
         click.echo(json.dumps({
+            "id": paper["id"],
             "paper_id": paper["id"],
             "filename": paper["filename"],
             "title": paper["title"],
@@ -2352,6 +2798,62 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         }, indent=2))
     else:
         click.echo(content)
+
+
+# --- schema ---
+
+@cli.command()
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def schema(ctx, json_output):
+    """Print the index's tables, columns, views and common joins.
+
+    For callers querying ~/.gantry/index.db with raw SQL. The views v_papers
+    and v_chunks are the stable read surface: both are keyed by paper_id.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .db import describe_schema
+    conn = get_connection(cfg.db_path)
+    info = describe_schema(conn)
+    conn.close()
+    info["database"] = str(cfg.db_path)
+
+    if use_json:
+        click.echo(json.dumps(info, indent=2))
+        return
+
+    click.echo(f"{info['database']} (schema v{info['schema_version']})")
+    click.echo()
+    click.echo("Views (stable; prefer these):")
+    for v in info["views"]:
+        click.echo(f"  {v['name']}({', '.join(c['name'] for c in v['columns'])})")
+    click.echo()
+    click.echo("Tables:")
+    for t in info["tables"]:
+        kind = " [virtual]" if t["kind"] == "virtual" else ""
+        cols = ", ".join(
+            c["name"] + (" PK" if c["pk"] else "") for c in t["columns"]
+        )
+        click.echo(f"  {t['name']}{kind}({cols})")
+    click.echo()
+    click.echo("Relationships:")
+    for r in info["relationships"]:
+        click.echo(f"  {r['from']} -> {r['to']}  ({r['note']})")
+    click.echo()
+    click.echo("Common joins:")
+    for note in info["common_joins"]:
+        click.echo(f"  - {note}")
 
 
 # --- vault ---
