@@ -6,6 +6,8 @@ from pathlib import Path
 
 import sqlite_vec
 
+from .fts import table_ddl as _fts_table_ddl
+
 SCHEMA_VERSION = 7
 
 # ---------------------------------------------------------------------------
@@ -43,6 +45,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
 # without recreating the view. Created with IF NOT EXISTS on every connect;
 # they are not a schema-version change.
 # ---------------------------------------------------------------------------
+
+_FTS_DDL = _fts_table_ddl(if_not_exists=True)
 
 VIEWS_SQL = """\
 CREATE VIEW IF NOT EXISTS v_papers AS
@@ -137,16 +141,8 @@ CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_citekey ON papers(citekey);
 CREATE INDEX IF NOT EXISTS idx_papers_metadata_suspect ON papers(metadata_suspect);
 
--- Full-text search virtual table
-CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
-    filename,
-    title,
-    authors,
-    abstract,
-    text_content,
-    content='',
-    tokenize='porter unicode61'
-);
+-- Full-text search virtual table (contentless, delete-by-rowid; see fts.py)
+{_FTS_DDL};
 
 -- Extracted text storage
 CREATE TABLE IF NOT EXISTS paper_text (

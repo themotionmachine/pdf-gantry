@@ -348,6 +348,8 @@ def status(ctx, json_output):
         f"SELECT COUNT(*) FROM papers WHERE {suspicious_extraction_condition()}"
     ).fetchone()[0]
     info.db_size_bytes = cfg.db_path.stat().st_size
+    from .fts import has_contentless_delete
+    fts_contentless_delete = has_contentless_delete(conn)
     from .queue import pending_counts
     pending = pending_counts(conn, cfg.processing.max_retries)
 
@@ -374,6 +376,7 @@ def status(ctx, json_output):
                 round(info.with_chunk_embeddings / info.total * 100, 1) if info.total else 0
             ),
             **pending,
+            "fts_contentless_delete": fts_contentless_delete,
         }, indent=2))
     else:
         click.echo(f"pdf_gantry index: {info.db_path}")
@@ -419,6 +422,9 @@ def status(ctx, json_output):
                    " (retry: gantry enrich --retry-misses)")
         click.echo(f"  Metadata suspect:       {format_count(pending['metadata_suspect'])}")
         click.echo(f"  Manual metadata:        {format_count(pending['manual_metadata'])}")
+        if not fts_contentless_delete:
+            click.echo("  Keyword index:          legacy; metadata edits don't reach it"
+                       " (fix: gantry fts rebuild)")
         click.echo()
         click.echo(f"Database size: {format_size(info.db_size_bytes)}")
 
@@ -1955,6 +1961,66 @@ def meta_normalize(ctx, all_orphans, dry_run, json_output):
         click.echo(f"  Other untitled papers with an abstract (kept; --all-orphans "
                    f"to clear): {len(others)}")
     click.echo(f"{prefix}Legacy misses tagged none:legacy: {report['legacy_misses_tagged']}")
+
+
+# --- fts ---
+
+@cli.group()
+def fts():
+    """Maintain the keyword (FTS5) index."""
+
+
+@fts.command("rebuild")
+@click.option("--dry-run", is_flag=True, help="Report row counts without writing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def fts_rebuild(ctx, dry_run, json_output):
+    """Rebuild the keyword index from current metadata and extracted text.
+
+    Indexes every paper with text: filename, title, authors, abstract and
+    text. The new table is built under a temporary name and swapped in within
+    one transaction, so search keeps working until the swap. It is created
+    with contentless_delete=1, after which metadata edits (enrich, meta
+    set/clear/normalize) reach keyword search. Idempotent. Takes a write lock
+    for its duration.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+
+    import sqlite3
+
+    from .fts import rebuild
+
+    conn = get_connection(cfg.db_path)
+    try:
+        report = rebuild(conn, dry_run=dry_run)
+    except sqlite3.Error as e:
+        conn.close()
+        if use_json:
+            click.echo(json.dumps({"error": str(e)}))
+        else:
+            click.echo(f"FTS rebuild failed: {e}", err=True)
+        ctx.exit(EXIT_DB_ERROR)
+        return
+    conn.close()
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    elif dry_run:
+        click.echo(
+            f"[DRY RUN] Would index {format_count(report['rows'])} papers "
+            f"(currently {format_count(report['previous_rows'])} rows, "
+            f"contentless_delete={report['previous_contentless_delete']})"
+        )
+    else:
+        click.echo(
+            f"Rebuilt keyword index: {format_count(report['rows'])} papers "
+            f"(was {format_count(report['previous_rows'])}) "
+            f"in {report['elapsed_seconds']}s"
+        )
 
 
 # --- retry ---

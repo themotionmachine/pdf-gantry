@@ -267,6 +267,7 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 | `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |
 | `gantry retry --ids <ids>` | Clear a quarantined paper's error count and re-process it |
 | `gantry prune` | Drop entries for files no longer on disk |
+| `gantry fts rebuild` | Rebuild the keyword index from current metadata and text, swapping it in atomically (search keeps working until the swap). Run it once on an index created before 2026-09-27 so metadata edits reach keyword search; `status --json` reports `fts_contentless_delete: true` afterwards. About 4 s for 1,800 papers. `--dry-run`, `--json` |
 | `gantry chunks backfill-pages` | Set `page_start`/`page_end` on chunks indexed before pages were recorded, from the PDFs, without re-chunking or re-embedding. `--ids`, `--limit`, `--force`, `--dry-run`; reports coverage and papers with unplaced chunks |
 
 ### Bibliography and vault
@@ -291,7 +292,7 @@ Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables overri
 
 - **Change detection:** PDFs are SHA-256 hashed at ingest; only new or changed files are reprocessed.
 - **Extraction:** PyMuPDF4LLM by default, Marker as an optional higher-quality backend.
-- **Search:** contentless FTS5 for keywords, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable, and to vector-only if FTS5 rejects a raw `--fts-syntax` query. Each result's `snippet` is the passage that matched: the best vector chunk, else the chunk containing the most query terms, else a window of text around the first term. It is not the first 200 characters of the file, which are usually a masthead.
+- **Search:** contentless FTS5 (`contentless_delete=1`) for keywords, over filename, title, authors, abstract and text, refreshed whenever `process`, `ocr`, `enrich` or `meta` changes any of them, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable, and to vector-only if FTS5 rejects a raw `--fts-syntax` query. Each result's `snippet` is the passage that matched: the best vector chunk, else the chunk containing the most query terms, else a window of text around the first term. It is not the first 200 characters of the file, which are usually a masthead.
 - **Chunks:** documents are split into addressable chunks with per-chunk embeddings, so retrieval can land on a passage instead of a paper.
 - **Chunk pages:** each chunk records the physical PDF pages it came from (`page_start`/`page_end`, 1-based). The markdown has no page breaks, so `process` locates each chunk's text in PyMuPDF's per-page text (head/tail probes, then word overlap, then interpolation between neighbours); OCR chunks take the page from their `## Page N` section. On a 150k-chunk corpus this places 99.9% of chunks, 97.6% by direct text match. Pages appear in `grep`, `info --query`, `info --chunks` and `read --chunk(s)`.
 - **Scanned PDFs:** classified at ingest and routed to the OCR queue.
