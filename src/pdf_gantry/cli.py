@@ -1274,14 +1274,24 @@ def semantic(ctx, query, limit, doc_only, field_list, restrict_to_ids, ids_only,
 @filter_options
 @click.option("--chunk", "chunk_mode", is_flag=True, help="Generate chunk-level embeddings")
 @click.option("--batch-size", type=int, default=None, help="Batch size for encoding")
+@click.option("--ids", default=None,
+              help="Comma-separated paper IDs to embed (overrides filters); "
+                   "papers already embedded are skipped unless --force")
+@click.option("--force", is_flag=True,
+              help="With --ids: delete the papers' existing vectors, reset their "
+                   "flag, and re-embed them")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def embed(
     ctx, needs, has_prop, is_prop, stale_embeddings, limit, chunk_mode, batch_size,
-    dry_run, json_output,
+    ids, force, dry_run, json_output,
 ):
-    """Generate embeddings for documents with text."""
+    """Generate embeddings for documents with text.
+
+    `embed --chunk --ids 12,40 --force` re-embeds specific papers, e.g. after
+    their chunk vectors were deleted or their title changed.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
@@ -1294,8 +1304,18 @@ def embed(
         ctx.exit(EXIT_ERROR)
         return
 
+    if force and ids is None:
+        msg = "--force requires --ids (re-embedding is scoped to named papers)"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    requested_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
     conn = get_connection(cfg.db_path)
-    from .embeddings import embed_chunks, embed_documents
+    from .embeddings import embed_chunks, embed_documents, reset_embeddings
     from .queue import build_filter_query
 
     if batch_size is None:
@@ -1322,15 +1342,34 @@ def embed(
         max_retries=cfg.processing.max_retries,
     )
 
-    rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
-    paper_ids = [r["id"] for r in rows]
+    not_found: list[int] = []
+    already_done = 0
+    if requested_ids is not None:
+        found, not_found = resolve_ids(conn, requested_ids)
+        flag = "has_chunk_embeddings" if chunk_mode else "has_embeddings"
+        placeholders = ",".join("?" * len(found))
+        rows = conn.execute(
+            f"SELECT id, {flag} AS done FROM papers "
+            f"WHERE id IN ({placeholders}) AND has_text = 1",
+            found,
+        ).fetchall() if found else []
+        order = {pid: i for i, pid in enumerate(found)}
+        rows = sorted(rows, key=lambda r: order[r["id"]])
+        paper_ids = [r["id"] for r in rows if force or not r["done"]]
+        already_done = sum(1 for r in rows if r["done"]) if not force else 0
+    else:
+        rows = conn.execute(f"SELECT id FROM papers {where}", params).fetchall()
+        paper_ids = [r["id"] for r in rows]
 
     if limit:
         paper_ids = paper_ids[:limit]
 
     if dry_run:
         if use_json:
-            click.echo(json.dumps({"would_embed": len(paper_ids), "model": cfg.embedding.model}))
+            payload = {"would_embed": len(paper_ids), "model": cfg.embedding.model}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
             click.echo(
                 f"Would embed {format_count(len(paper_ids))} documents with {cfg.embedding.model}"
@@ -1339,13 +1378,24 @@ def embed(
         return
 
     if not paper_ids:
+        message = "Nothing to embed"
+        if already_done:
+            message += (f" ({already_done} already embedded; "
+                        "pass --force to re-embed)")
         if use_json:
-            click.echo(json.dumps({"total": 0, "message": "Nothing to embed"}))
+            payload = {"total": 0, "message": message}
+            if requested_ids is not None:
+                payload["not_found"] = not_found
+            click.echo(json.dumps(payload))
         else:
-            click.echo("Nothing to embed")
+            click.echo(message)
+            _print_not_found("Not in index", not_found, ids_only=False)
         conn.close()
         ctx.exit(EXIT_NO_RESULTS)
         return
+
+    if force:
+        reset_embeddings(conn, paper_ids, chunk=chunk_mode)
 
     progress_bar = None
     task = None
@@ -1400,6 +1450,7 @@ def embed(
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
             "model": cfg.embedding.model,
+            **({"not_found": not_found} if requested_ids is not None else {}),
         }, indent=2))
     else:
         click.echo(
@@ -1408,8 +1459,9 @@ def embed(
         )
         if stats.failed > 0:
             click.echo(f"  Failed: {format_count(stats.failed)}")
+        _print_not_found("Not in index", not_found, ids_only=False)
 
-    if stats.failed > 0 and stats.succeeded > 0:
+    if (stats.failed > 0 and stats.succeeded > 0) or (not_found and stats.succeeded > 0):
         ctx.exit(EXIT_PARTIAL)
     elif stats.failed > 0 and stats.succeeded == 0:
         ctx.exit(EXIT_ERROR)
