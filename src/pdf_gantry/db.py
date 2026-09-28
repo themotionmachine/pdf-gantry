@@ -34,6 +34,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
 )\
 """
 
+# ---------------------------------------------------------------------------
+# Stable read views for raw-SQL callers (E11). Both are keyed by ``paper_id``
+# so a caller never has to remember that chunks use ``doc_id`` and papers use
+# ``id``. ``c.*`` / ``p.*`` are expanded by SQLite each time the view is
+# used, so columns added by later migrations (e.g. chunks.page_end) appear
+# without recreating the view. Created with IF NOT EXISTS on every connect;
+# they are not a schema-version change.
+# ---------------------------------------------------------------------------
+
+VIEWS_SQL = """\
+CREATE VIEW IF NOT EXISTS v_papers AS
+    SELECT p.id AS paper_id, p.* FROM papers p;
+CREATE VIEW IF NOT EXISTS v_chunks AS
+    SELECT c.doc_id AS paper_id, c.* FROM chunks c;
+"""
+
 SCHEMA_SQL = f"""
 -- Core papers table
 CREATE TABLE IF NOT EXISTS papers (
@@ -202,6 +218,18 @@ def get_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def ensure_views(conn: sqlite3.Connection) -> None:
+    """Create the stable read views if missing (idempotent)."""
+    exists = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' "
+        "AND name IN ('v_papers', 'v_chunks')"
+    ).fetchone()[0]
+    if exists == 2:
+        return
+    conn.executescript(VIEWS_SQL)
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all tables, indices, and virtual tables."""
     conn.executescript(SCHEMA_SQL)
@@ -211,6 +239,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         (SCHEMA_VERSION, now_iso()),
     )
     conn.commit()
+    ensure_views(conn)
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -303,3 +332,88 @@ def migrate(conn: sqlite3.Connection) -> None:
             (6, now_iso()),
         )
         conn.commit()
+
+    ensure_views(conn)
+
+
+# Relationships that aren't declared as FOREIGN KEYs (virtual tables can't
+# carry them) but that every join relies on.
+_IMPLICIT_RELATIONSHIPS = [
+    ("papers_fts.rowid", "papers.id", "FTS5 row per paper (contentless: no text stored)"),
+    ("paper_embeddings.paper_id", "papers.id", "doc-level 768-d vector"),
+    ("chunk_vec.chunk_id", "chunks.chunk_id", "chunk-level 768-d vector"),
+]
+
+COMMON_JOINS = [
+    "chunks use doc_id, not paper_id: chunks.doc_id = papers.id "
+    "(or use v_chunks, which exposes paper_id).",
+    "A chunk's primary key is chunk_id (there is no chunks.id); chunk_index is its "
+    "0-based position within the paper.",
+    "Full text is paper_text.raw_text / paper_text.markdown (there is no "
+    "paper_text.text): JOIN paper_text pt ON pt.paper_id = papers.id.",
+    "papers.authors is a JSON array string; year is INTEGER.",
+    "Title/author lookup: prefer `gantry find`. Chunks of a paper by position: "
+    "`gantry read ID --index A-B`.",
+    "SELECT p.title, c.chunk_index, c.page_start, c.text FROM v_papers p "
+    "JOIN v_chunks c ON c.paper_id = p.paper_id WHERE p.paper_id = ?",
+]
+
+
+def describe_schema(conn: sqlite3.Connection) -> dict:
+    """Tables, columns, views and key relationships, for ``gantry schema``.
+
+    Shadow tables behind FTS5/vec0 virtual tables are omitted: they are
+    implementation detail and querying them directly is never what a caller
+    wants.
+    """
+    objs = conn.execute(
+        "SELECT name, type, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    virtual = [o["name"] for o in objs
+               if o["type"] == "table" and (o["sql"] or "").upper().startswith("CREATE VIRTUAL")]
+
+    def is_shadow(name: str) -> bool:
+        return any(name.startswith(v + "_") for v in virtual)
+
+    def columns(name: str) -> list[dict]:
+        try:
+            rows = conn.execute(f'PRAGMA table_info("{name}")').fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            {"name": r["name"], "type": r["type"], "pk": bool(r["pk"]),
+             "notnull": bool(r["notnull"])}
+            for r in rows
+        ]
+
+    tables, views, relationships = [], [], []
+    for o in objs:
+        name = o["name"]
+        if o["type"] == "view":
+            views.append({"name": name, "columns": columns(name)})
+            continue
+        if is_shadow(name):
+            continue
+        tables.append({
+            "name": name,
+            "kind": "virtual" if name in virtual else "table",
+            "columns": columns(name),
+        })
+        if name not in virtual:
+            for fk in conn.execute(f'PRAGMA foreign_key_list("{name}")').fetchall():
+                relationships.append({
+                    "from": f"{name}.{fk['from']}",
+                    "to": f"{fk['table']}.{fk['to']}",
+                    "note": f"foreign key, ON DELETE {fk['on_delete']}",
+                })
+    for src, dst, note in _IMPLICIT_RELATIONSHIPS:
+        relationships.append({"from": src, "to": dst, "note": note})
+
+    return {
+        "schema_version": get_schema_version(conn),
+        "tables": tables,
+        "views": views,
+        "relationships": relationships,
+        "common_joins": COMMON_JOINS,
+    }

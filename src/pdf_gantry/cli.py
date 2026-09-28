@@ -12,6 +12,7 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
+from .usage import EXIT_USAGE, GantryGroup  # noqa: F401  (EXIT_USAGE re-exported)
 from .utils import (
     format_count,
     format_duration,
@@ -19,6 +20,8 @@ from .utils import (
     format_size,
     missing_ids,
     parse_ids,
+    resolve_identifier,
+    resolve_identifiers,
     resolve_ids,
 )
 
@@ -28,6 +31,9 @@ EXIT_ERROR = 1
 EXIT_NO_RESULTS = 2
 EXIT_PARTIAL = 3
 EXIT_DB_ERROR = 4
+# EXIT_USAGE = 64 (sysexits EX_USAGE) is defined in usage.py: bad flags,
+# unknown commands and bad choices. Distinct from EXIT_NO_RESULTS so a typo
+# can never read as "not in library".
 
 err_console = Console(stderr=True)
 
@@ -113,7 +119,7 @@ def filter_options(f):
     return wrapper
 
 
-@click.group()
+@click.group(cls=GantryGroup)
 @click.version_option(version=__version__)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -2214,12 +2220,26 @@ def prune(ctx, dry_run, json_output):
 @cli.command()
 @click.argument("fragment")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Print only matching paper IDs, one per line (overrides --json)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def find(ctx, fragment, limit, json_output):
-    """Fuzzy filename lookup. FRAGMENT matches anywhere in the filename."""
+def find(ctx, fragment, limit, ids_only, json_output):
+    """Known-item lookup by title, author, year, citekey, DOI or filename.
+
+    Case- and accent-insensitive; every word of FRAGMENT must match some
+    field ("&", "and", "et al." are ignored). Title matches rank first. Each
+    result reports matched_fields.
+
+    \b
+    Examples:
+      gantry find "Mind games"
+      gantry find "Zhang 2022" --ids-only
+      gantry find "Flew & Martin" --json
+      gantry find @flew2022digital
+    """
     cfg = ctx.obj["config"]
-    use_json = json_output or ctx.obj["json"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -2235,6 +2255,13 @@ def find(ctx, fragment, limit, json_output):
 
     results = find_papers(conn, fragment, limit=limit)
     conn.close()
+
+    if ids_only:
+        for r in results:
+            click.echo(r["id"])
+        if not results:
+            ctx.exit(EXIT_NO_RESULTS)
+        return
 
     if not results:
         if use_json:
@@ -2256,6 +2283,8 @@ def find(ctx, fragment, limit, json_output):
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
                     "citekey": r.get("citekey"),
+                    "year": r.get("year"),
+                    "matched_fields": r["matched_fields"],
                 }
                 for r in results
             ],
@@ -2267,13 +2296,17 @@ def find(ctx, fragment, limit, json_output):
             ck = r.get("citekey")
             ck_str = f" @{ck}" if ck else ""
             extra = f" — {r['title']}" if r["title"] else ""
-            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}")
+            yr = f" ({r['year']})" if r.get("year") else ""
+            via = ",".join(r["matched_fields"])
+            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}{yr}  [{via}]")
 
 
 # --- info ---
 
 @cli.command()
-@click.option("--ids", type=str, required=True, help="Comma-separated paper IDs")
+@click.argument("identifiers", nargs=-1)
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (alternative to positional IDENTIFIERS)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include")
 @click.option("--chunks", "include_chunks", is_flag=True,
@@ -2284,10 +2317,26 @@ def find(ctx, fragment, limit, json_output):
               help="Expand each top chunk with N chars of surrounding context (requires --query)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output):
-    """Fetch metadata for specific papers by ID."""
+def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars, json_output):
+    """Fetch metadata for specific papers.
+
+    IDENTIFIERS are paper IDs (space- or comma-separated), filenames, or
+    citekeys (optionally prefixed with @). They combine with --ids.
+
+    \b
+    Examples:
+      gantry info 12 13 --json
+      gantry info 12,13 --fields id,title,year
+      gantry info @smith2020 --query "platform governance"
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    if not identifiers and ids is None:
+        raise click.UsageError(
+            "Give one or more paper identifiers (IDs, filenames, citekeys) or --ids.",
+            ctx=ctx,
+        )
 
     if not cfg.db_path.exists():
         msg = "No database found."
@@ -2298,12 +2347,19 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         ctx.exit(EXIT_ERROR)
         return
 
-    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids") or []
 
     conn = get_connection(cfg.db_path)
 
+    # Positional identifiers: resolved up front. Unresolvable ones (a
+    # mistyped citekey, a pruned ID) join not_found below.
+    unresolved: list = []
+    if identifiers:
+        pos_ids, unresolved = resolve_identifiers(conn, identifiers)
+        paper_ids = list(dict.fromkeys(paper_ids + pos_ids))
+
     placeholders = ",".join("?" * len(paper_ids))
-    rows = conn.execute(
+    rows = [] if not paper_ids else conn.execute(
         f"""SELECT p.id, p.filename, p.path, p.title, p.authors, p.year, p.doi,
                    p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
                    p.has_chunk_embeddings, p.page_count, p.is_scanned,
@@ -2323,6 +2379,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
     # to diff input against output itself to notice a drop.
     found_ids = {r["id"] for r in rows}
     not_found = missing_ids(paper_ids, found_ids)
+    not_found += [u for u in unresolved if u not in not_found]
 
     if not rows:
         if use_json:
@@ -2465,27 +2522,81 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
 
 @cli.command()
 @click.argument("identifier")
-@click.option("--chunk", "chunk_id", type=int, default=None, help="Read a specific chunk by ID")
+@click.option("--chunk", "chunk_id", type=int, default=None,
+              help="Read a specific chunk by its global chunk_id (must belong to IDENTIFIER)")
+@click.option("--index", "index_range", type=str, default=None,
+              help="Read chunks by per-paper chunk_index: N or A-B (inclusive)")
 @click.option("--chunks", "list_chunks", is_flag=True, help="List all chunks for a document")
 @click.option("--context", "context_chars", type=int, default=None,
               help="Expand chunk with surrounding context (chars). Use with --chunk")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
-    """Read document text or chunks. IDENTIFIER is a paper ID or filename."""
+def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, json_output):
+    """Read document text or chunks.
+
+    IDENTIFIER is a paper ID, filename, or citekey (optionally @-prefixed).
+
+    \b
+    Examples:
+      gantry read 53                      # full markdown
+      gantry read 53 --chunks             # chunk list with sizes
+      gantry read 53 --index 28-41 --json # chunks by per-paper index
+      gantry read 53 --chunk 9120 --context 2000
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
-    if not cfg.db_path.exists():
-        msg = "No database found."
+    if index_range is not None and chunk_id is not None:
+        raise click.UsageError("--index and --chunk are mutually exclusive.", ctx=ctx)
+    index_bounds = None
+    if index_range is not None:
+        from .reader import parse_index_range
+        try:
+            index_bounds = parse_index_range(index_range)
+        except ValueError as e:
+            raise click.BadParameter(str(e), ctx=ctx, param_hint="--index") from e
+
+    def fail(msg):
         if use_json:
             click.echo(json.dumps({"error": msg}))
         else:
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
+
+    if not cfg.db_path.exists():
+        fail("No database found.")
         return
 
     conn = get_connection(cfg.db_path)
+
+    # Resolve identifier to paper (ID, filename, or citekey). Every mode
+    # needs it: --chunk used to ignore it and could return another paper's
+    # text (B2).
+    paper_id = resolve_identifier(conn, identifier)
+    paper = None
+    if paper_id is not None:
+        paper = conn.execute(
+            "SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)
+        ).fetchone()
+    if not paper:
+        conn.close()
+        fail(f"Paper not found: {identifier}")
+        return
+
+    if chunk_id is not None:
+        owner = conn.execute(
+            "SELECT doc_id FROM chunks WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()
+        if not owner:
+            conn.close()
+            fail(f"Chunk {chunk_id} not found")
+            return
+        if owner["doc_id"] != paper["id"]:
+            conn.close()
+            fail(f"Chunk {chunk_id} belongs to paper {owner['doc_id']}, not paper "
+                 f"{paper['id']} ({paper['filename']}). For a per-paper position "
+                 f"use --index.")
+            return
 
     if chunk_id is not None and context_chars is not None:
         # Scoped context window around a chunk
@@ -2493,13 +2604,10 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         result = get_chunk_context(conn, chunk_id, max_chars=context_chars)
         conn.close()
         if not result:
-            msg = f"Chunk {chunk_id} not found"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
+            fail(f"Chunk {chunk_id} not found")
             return
+        result["paper_id"] = result["doc_id"]
+        result["id"] = result["doc_id"]
         if use_json:
             click.echo(json.dumps(result, indent=2))
         else:
@@ -2521,22 +2629,17 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             (chunk_id,),
         ).fetchone()
         conn.close()
-        if not row:
-            msg = f"Chunk {chunk_id} not found"
-            if use_json:
-                click.echo(json.dumps({"error": msg}))
-            else:
-                click.echo(msg, err=True)
-            ctx.exit(EXIT_ERROR)
-            return
         if use_json:
             click.echo(json.dumps({
                 "chunk_id": row["chunk_id"],
                 "doc_id": row["doc_id"],
+                "paper_id": row["doc_id"],
+                "id": row["doc_id"],
                 "filename": row["filename"],
                 "title": row["title"],
                 "chunk_index": row["chunk_index"],
                 "section_header": row["section_header"],
+                "page_start": row["page_start"],
                 "text": row["text"],
             }, indent=2))
         else:
@@ -2547,25 +2650,40 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
             click.echo(row["text"])
         return
 
-    # Resolve identifier to paper
-    try:
-        paper_id = int(identifier)
-        paper = conn.execute(
-            "SELECT id, filename, title FROM papers WHERE id = ?", (paper_id,)
-        ).fetchone()
-    except ValueError:
-        paper = conn.execute(
-            "SELECT id, filename, title FROM papers WHERE filename = ?", (identifier,)
-        ).fetchone()
-
-    if not paper:
-        msg = f"Paper not found: {identifier}"
-        if use_json:
-            click.echo(json.dumps({"error": msg}))
-        else:
-            click.echo(msg, err=True)
+    if index_bounds is not None:
+        from .reader import chunk_count, chunks_by_index
+        lo, hi = index_bounds
+        total = chunk_count(conn, paper["id"])
+        rows = chunks_by_index(conn, paper["id"], lo, hi)
         conn.close()
-        ctx.exit(EXIT_ERROR)
+        if not rows:
+            fail(f"No chunks with index {index_range} in {paper['filename']} "
+                 f"(paper {paper['id']} has {total} chunks, indexed 0-{max(total - 1, 0)}).")
+            return
+        got = {r["chunk_index"] for r in rows}
+        missing = [i for i in range(lo, hi + 1) if i not in got]
+        if use_json:
+            click.echo(json.dumps({
+                "id": paper["id"],
+                "paper_id": paper["id"],
+                "filename": paper["filename"],
+                "title": paper["title"],
+                "total_chunks": total,
+                "chunks": rows,
+                "missing_indices": missing,
+            }, indent=2))
+        else:
+            for r in rows:
+                header = f" [{r['section_header']}]" if r["section_header"] else ""
+                page = f" p.{r['page_start']}" if r.get("page_start") is not None else ""
+                click.echo(f"--- {paper['filename']} chunk {r['chunk_index']} "
+                           f"(id={r['chunk_id']}){page}{header}")
+                click.echo(r["text"])
+                click.echo()
+            if missing:
+                click.echo(f"Missing indices: {', '.join(map(str, missing))}", err=True)
+        if missing:
+            ctx.exit(EXIT_PARTIAL)
         return
 
     if list_chunks:
@@ -2577,6 +2695,7 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         conn.close()
         if use_json:
             click.echo(json.dumps({
+                "id": paper["id"],
                 "paper_id": paper["id"],
                 "filename": paper["filename"],
                 "chunks": [
@@ -2617,6 +2736,7 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
     content = text["markdown"] or text["raw_text"]
     if use_json:
         click.echo(json.dumps({
+            "id": paper["id"],
             "paper_id": paper["id"],
             "filename": paper["filename"],
             "title": paper["title"],
@@ -2624,6 +2744,62 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         }, indent=2))
     else:
         click.echo(content)
+
+
+# --- schema ---
+
+@cli.command()
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def schema(ctx, json_output):
+    """Print the index's tables, columns, views and common joins.
+
+    For callers querying ~/.gantry/index.db with raw SQL. The views v_papers
+    and v_chunks are the stable read surface: both are keyed by paper_id.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found. Run 'gantry ingest' first."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .db import describe_schema
+    conn = get_connection(cfg.db_path)
+    info = describe_schema(conn)
+    conn.close()
+    info["database"] = str(cfg.db_path)
+
+    if use_json:
+        click.echo(json.dumps(info, indent=2))
+        return
+
+    click.echo(f"{info['database']} (schema v{info['schema_version']})")
+    click.echo()
+    click.echo("Views (stable; prefer these):")
+    for v in info["views"]:
+        click.echo(f"  {v['name']}({', '.join(c['name'] for c in v['columns'])})")
+    click.echo()
+    click.echo("Tables:")
+    for t in info["tables"]:
+        kind = " [virtual]" if t["kind"] == "virtual" else ""
+        cols = ", ".join(
+            c["name"] + (" PK" if c["pk"] else "") for c in t["columns"]
+        )
+        click.echo(f"  {t['name']}{kind}({cols})")
+    click.echo()
+    click.echo("Relationships:")
+    for r in info["relationships"]:
+        click.echo(f"  {r['from']} -> {r['to']}  ({r['note']})")
+    click.echo()
+    click.echo("Common joins:")
+    for note in info["common_joins"]:
+        click.echo(f"  - {note}")
 
 
 # --- vault ---
