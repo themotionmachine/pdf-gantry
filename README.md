@@ -67,6 +67,37 @@ Zoom in on a chunk with a fixed token budget instead of fetching the paper:
 $ gantry read 942 --chunk 76606 --context 2000
 ```
 
+Check that a quote is verbatim in a paper, and get its page for the citation:
+
+```bash
+$ gantry grep "the predicative self-identification" --ids 1902 --json
+{
+  "query": "the predicative self-identification",
+  "count": 2,
+  "truncated": false,
+  "hits": [
+    {
+      "doc_id": 1902,
+      "filename": "Habermas1987.pdf",
+      "chunk_id": 152773,
+      "chunk_index": 229,
+      "page_start": 92,
+      "page_end": 93,
+      "offset": 506,
+      "length": 34,
+      "matched_text": "the predicative selfidentification",
+      "match": "normalized",
+      "source": "chunks",
+      "context": "...I argue for the following thesis: the predicative selfidentification that a person undertakes is..."
+    },
+    ...
+  ],
+  "not_found": []
+}
+```
+
+`match` says whether the text was found as typed (`exact`) or only after normalising line breaks, line-end hyphenation, ligatures, markdown emphasis and curly quotes (`normalized`); `matched_text` is the span as it appears in the source. `--ids` takes `search --ids-only` output as is, or `-` to read it from stdin.
+
 Each step passes an address (a paper ID, a chunk ID). Payloads only move when the agent asks for them. The agent decides how deep to go, and shallow is cheap.
 
 ## Quickstart
@@ -157,6 +188,7 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 | `gantry find <fragment>` | Fuzzy filename lookup |
 | `gantry read <id>` | Read a document's text, list its chunks, or expand one chunk with `--context` |
 | `gantry info --ids <ids>` | Metadata for specific papers; `--query` attaches each paper's best-matching chunk |
+| `gantry grep "<text>"` | Find a literal string (a quote) in chunk text; each hit gives doc, chunk, `page_start`/`page_end`, offset and whether the match was exact or normalised. `--ids`, `-i/--ignore-case`, `--limit`, `--context`. Papers without chunks are searched in raw text |
 
 ### Index management
 
@@ -168,6 +200,7 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 | `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |
 | `gantry retry --ids <ids>` | Clear a quarantined paper's error count and re-process it |
 | `gantry prune` | Drop entries for files no longer on disk |
+| `gantry chunks backfill-pages` | Set `page_start`/`page_end` on chunks indexed before pages were recorded, from the PDFs, without re-chunking or re-embedding. `--ids`, `--limit`, `--force`, `--dry-run`; reports coverage and papers with unplaced chunks |
 
 ### Bibliography and vault
 
@@ -193,6 +226,7 @@ Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables overri
 - **Extraction:** PyMuPDF4LLM by default, Marker as an optional higher-quality backend.
 - **Search:** contentless FTS5 for keywords, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable.
 - **Chunks:** documents are split into addressable chunks with per-chunk embeddings, so retrieval can land on a passage instead of a paper.
+- **Chunk pages:** each chunk records the physical PDF pages it came from (`page_start`/`page_end`, 1-based). The markdown has no page breaks, so `process` locates each chunk's text in PyMuPDF's per-page text (head/tail probes, then word overlap, then interpolation between neighbours); OCR chunks take the page from their `## Page N` section. On a 150k-chunk corpus this places 99.9% of chunks, 97.6% by direct text match. Pages appear in `grep`, `info --query`, `info --chunks` and `read --chunk(s)`.
 - **Scanned PDFs:** classified at ingest and routed to the OCR queue.
 - **Quarantine:** a paper that fails processing/embedding `processing.max_retries` times (default 3) is skipped by default selection so a permanently-broken PDF isn't re-attempted on every run. Find them with `gantry queue --is broken`; un-quarantine a fixed file with `gantry retry --ids <ids>`.
 
