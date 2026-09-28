@@ -611,7 +611,7 @@ def _match_stem(term: str) -> str:
 def _trim_snippet(text: str, terms: list[str], width: int = SNIPPET_WIDTH) -> str:
     """Collapse whitespace and cut ``width`` chars around the first term hit.
 
-    Cuts snap to word boundaries; an ellipsis marks each truncated side.
+    Cuts snap to word boundaries; "..." marks each truncated side.
     """
     flat = " ".join(text.split())
     if len(flat) <= width:
@@ -628,7 +628,7 @@ def _trim_snippet(text: str, terms: list[str], width: int = SNIPPET_WIDTH) -> st
         space = flat.rfind(" ", start, end)
         end = space if space > start + width // 2 else end
     body = flat[start:end].strip()
-    return ("…" if start > 0 else "") + body + ("…" if end < len(flat) else "")
+    return ("..." if start > 0 else "") + body + ("..." if end < len(flat) else "")
 
 
 def _fts_best_chunks(
@@ -677,8 +677,8 @@ def _raw_text_snippets(
         ).fetchone()[0]
         if text:
             trimmed = _trim_snippet(text, terms, width)
-            if start > 1 and not trimmed.startswith("…"):
-                trimmed = "…" + trimmed
+            if start > 1 and not trimmed.startswith("..."):
+                trimmed = "..." + trimmed
             out[row["paper_id"]] = trimmed
     return out
 

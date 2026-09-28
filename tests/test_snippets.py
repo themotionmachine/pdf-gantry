@@ -75,8 +75,8 @@ def test_trim_snippet_centres_on_term_and_marks_truncation():
     text = "x " * 300 + "needle in the haystack " + "y " * 300
     s = _trim_snippet(text, ["needle"], width=120)
     assert "needle" in s
-    assert s.startswith("…") and s.endswith("…")
-    assert len(s) <= 125
+    assert s.startswith("...") and s.endswith("...")
+    assert len(s) <= 127
 
 
 def test_trim_snippet_short_text_unchanged():
