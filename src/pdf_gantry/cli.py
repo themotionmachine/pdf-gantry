@@ -12,6 +12,7 @@ from . import __version__
 from .config import Config, load_config, save_config, set_config_value
 from .db import get_connection
 from .models import StatusInfo
+from .usage import EXIT_USAGE, GantryGroup  # noqa: F401  (EXIT_USAGE re-exported)
 from .utils import (
     format_count,
     format_duration,
@@ -28,6 +29,9 @@ EXIT_ERROR = 1
 EXIT_NO_RESULTS = 2
 EXIT_PARTIAL = 3
 EXIT_DB_ERROR = 4
+# EXIT_USAGE = 64 (sysexits EX_USAGE) is defined in usage.py: bad flags,
+# unknown commands and bad choices. Distinct from EXIT_NO_RESULTS so a typo
+# can never read as "not in library".
 
 err_console = Console(stderr=True)
 
@@ -113,7 +117,7 @@ def filter_options(f):
     return wrapper
 
 
-@click.group()
+@click.group(cls=GantryGroup)
 @click.version_option(version=__version__)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
