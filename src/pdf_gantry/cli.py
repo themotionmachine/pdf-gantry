@@ -20,6 +20,8 @@ from .utils import (
     format_size,
     missing_ids,
     parse_ids,
+    resolve_identifier,
+    resolve_identifiers,
     resolve_ids,
 )
 
@@ -1951,7 +1953,9 @@ def find(ctx, fragment, limit, json_output):
 # --- info ---
 
 @cli.command()
-@click.option("--ids", type=str, required=True, help="Comma-separated paper IDs")
+@click.argument("identifiers", nargs=-1)
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (alternative to positional IDENTIFIERS)")
 @click.option("--fields", "field_list", type=str, default=None,
               help="Comma-separated fields to include")
 @click.option("--chunks", "include_chunks", is_flag=True,
@@ -1962,10 +1966,26 @@ def find(ctx, fragment, limit, json_output):
               help="Expand each top chunk with N chars of surrounding context (requires --query)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output):
-    """Fetch metadata for specific papers by ID."""
+def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars, json_output):
+    """Fetch metadata for specific papers.
+
+    IDENTIFIERS are paper IDs (space- or comma-separated), filenames, or
+    citekeys (optionally prefixed with @). They combine with --ids.
+
+    \b
+    Examples:
+      gantry info 12 13 --json
+      gantry info 12,13 --fields id,title,year
+      gantry info @smith2020 --query "platform governance"
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
+
+    if not identifiers and ids is None:
+        raise click.UsageError(
+            "Give one or more paper identifiers (IDs, filenames, citekeys) or --ids.",
+            ctx=ctx,
+        )
 
     if not cfg.db_path.exists():
         msg = "No database found."
@@ -1976,12 +1996,19 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
         ctx.exit(EXIT_ERROR)
         return
 
-    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids") or []
 
     conn = get_connection(cfg.db_path)
 
+    # Positional identifiers: resolved up front. Unresolvable ones (a
+    # mistyped citekey, a pruned ID) join not_found below.
+    unresolved: list = []
+    if identifiers:
+        pos_ids, unresolved = resolve_identifiers(conn, identifiers)
+        paper_ids = list(dict.fromkeys(paper_ids + pos_ids))
+
     placeholders = ",".join("?" * len(paper_ids))
-    rows = conn.execute(
+    rows = [] if not paper_ids else conn.execute(
         f"""SELECT p.id, p.filename, p.path, p.title, p.authors, p.year, p.doi,
                    p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
                    p.has_chunk_embeddings, p.page_count, p.is_scanned,
@@ -2001,6 +2028,7 @@ def info(ctx, ids, field_list, include_chunks, query, context_chars, json_output
     # to diff input against output itself to notice a drop.
     found_ids = {r["id"] for r in rows}
     not_found = missing_ids(paper_ids, found_ids)
+    not_found += [u for u in unresolved if u not in not_found]
 
     if not rows:
         if use_json:
