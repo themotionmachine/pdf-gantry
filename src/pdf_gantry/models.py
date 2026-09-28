@@ -72,6 +72,7 @@ class ChunkResult:
     filename: str
     path: str
     title: str | None = None
+    page_end: int | None = None
 
 
 @dataclass

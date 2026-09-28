@@ -7,7 +7,7 @@ import sqlite_vec
 
 from pdf_gantry.db import SCHEMA_VERSION, get_connection, get_schema_version
 
-assert SCHEMA_VERSION == 6, "Update tests if schema version changes"
+assert SCHEMA_VERSION == 7, "Update tests if schema version changes"
 
 
 # ---------------------------------------------------------------------------

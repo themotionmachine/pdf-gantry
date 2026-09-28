@@ -11,6 +11,7 @@ class RawChunk:
     section_header: str | None
     page_start: int | None
     char_offset: int
+    page_end: int | None = None
 
 
 # Sentence-ending patterns for splitting
@@ -159,6 +160,7 @@ def chunk_markdown(
     max_chars: int = 1800,
     overlap_chars: int = 200,
     min_chars: int = 512,
+    page_texts: list[str] | None = None,
 ) -> list[RawChunk]:
     """
     Split markdown into chunks preserving document structure.
@@ -176,6 +178,9 @@ def chunk_markdown(
         max_chars: Target maximum chunk size (~450 Nomic tokens)
         overlap_chars: Overlap between consecutive chunks (~50 tokens)
         min_chars: Minimum chunk size; smaller chunks merge with previous (~128 tokens)
+        page_texts: Per-page plain text of the source PDF. When given, each
+            chunk's page_start/page_end is located in it (see pages.py);
+            otherwise both stay None.
     """
     if not markdown or not markdown.strip():
         return []
@@ -200,9 +205,15 @@ def chunk_markdown(
             chunks.append(RawChunk(
                 text=text,
                 section_header=header,
-                page_start=None,  # Could be derived from page markers if present
+                page_start=None,
                 char_offset=offset,
             ))
+
+    if page_texts is not None and chunks:
+        from .pages import map_chunks_to_pages
+        spans = map_chunks_to_pages(page_texts, [c.text for c in chunks])
+        for chunk, span in zip(chunks, spans):
+            chunk.page_start, chunk.page_end = span.page_start, span.page_end
 
     return chunks
 

@@ -69,9 +69,12 @@ def parse_ids(s: str) -> list[int]:
         parse_ids("1,2,3")   -> [1, 2, 3]
         parse_ids("1,2,3,")  -> [1, 2, 3]   # trailing comma tolerated
         parse_ids(" 1 , 2 ") -> [1, 2]       # whitespace stripped
+        parse_ids("1\n2\n")  -> [1, 2]       # `--ids-only` output
         parse_ids("1,foo")   # raises ValueError
     """
-    parts = [x.strip() for x in s.split(",")]
+    # Commas and/or whitespace (incl. newlines) separate IDs, so the bare
+    # one-per-line output of `--ids-only` can be passed straight in.
+    parts = re.split(r"[,\s]+", s)
     return [int(p) for p in parts if p]
 
 

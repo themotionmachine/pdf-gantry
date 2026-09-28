@@ -6,7 +6,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # ---------------------------------------------------------------------------
 # Canonical DDL for tables that are created both by init_schema (fresh DB) and
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_index INTEGER NOT NULL,
     section_header TEXT,
     page_start INTEGER,
+    page_end INTEGER,
     text TEXT NOT NULL,
     char_offset INTEGER NOT NULL DEFAULT 0,
     UNIQUE(doc_id, chunk_index)
@@ -330,6 +331,20 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (6, now_iso()),
+        )
+        conn.commit()
+        version = 6
+
+    if version < 7:
+        # Chunk page provenance: page_start existed (always NULL) since v2;
+        # page_end completes the range. A DB that came through the v2 branch
+        # above already has it from _CHUNKS_TABLE_DDL, hence the check.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        if "page_end" not in cols:
+            conn.execute("ALTER TABLE chunks ADD COLUMN page_end INTEGER")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (7, now_iso()),
         )
         conn.commit()
 

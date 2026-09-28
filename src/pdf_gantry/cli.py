@@ -2471,7 +2471,8 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
         import collections
         chunks_by_doc = collections.defaultdict(list)
         chunk_rows = conn.execute(
-            f"""SELECT doc_id, chunk_id, chunk_index, section_header, text
+            f"""SELECT doc_id, chunk_id, chunk_index, section_header,
+                       page_start, page_end, text
                 FROM chunks
                 WHERE doc_id IN ({placeholders})
                 ORDER BY doc_id, chunk_index""",
@@ -2482,6 +2483,8 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
                 "chunk_id": c["chunk_id"],
                 "chunk_index": c["chunk_index"],
                 "section_header": c["section_header"],
+                "page_start": c["page_start"],
+                "page_end": c["page_end"],
                 "text": c["text"],
             })
 
@@ -2521,6 +2524,7 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
                     "chunk_index": tc.chunk_index,
                     "section_header": tc.section_header,
                     "page_start": tc.page_start,
+                    "page_end": tc.page_end,
                     "score": tc.score,
                     "text": tc.chunk_text,
                 }
@@ -2693,6 +2697,7 @@ def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, jso
                 "chunk_index": row["chunk_index"],
                 "section_header": row["section_header"],
                 "page_start": row["page_start"],
+                "page_end": row["page_end"],
                 "text": row["text"],
             }, indent=2))
         else:
@@ -2741,7 +2746,8 @@ def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, jso
 
     if list_chunks:
         chunks = conn.execute(
-            "SELECT chunk_id, chunk_index, section_header, LENGTH(text) as text_len "
+            "SELECT chunk_id, chunk_index, section_header, page_start, page_end, "
+            "LENGTH(text) as text_len "
             "FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
             (paper["id"],),
         ).fetchall()
@@ -2756,6 +2762,8 @@ def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, jso
                         "chunk_id": c["chunk_id"],
                         "chunk_index": c["chunk_index"],
                         "section_header": c["section_header"],
+                        "page_start": c["page_start"],
+                        "page_end": c["page_end"],
                         "text_length": c["text_len"],
                     }
                     for c in chunks
@@ -2798,6 +2806,177 @@ def read(ctx, identifier, chunk_id, index_range, list_chunks, context_chars, jso
         }, indent=2))
     else:
         click.echo(content)
+
+
+# --- grep ---
+
+@cli.command()
+@click.argument("text")
+@click.option("--ids", type=str, default=None,
+              help="Only these paper IDs: comma/newline separated (search --ids-only "
+                   "output works), or '-' to read them from stdin")
+@click.option("-i", "--ignore-case", is_flag=True, help="Case-insensitive match")
+@click.option("-n", "--limit", type=int, default=50, show_default=True, help="Max hits")
+@click.option("--context", "context_chars", type=int, default=80, show_default=True,
+              help="Chars of context either side of each hit")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def grep(ctx, text, ids, ignore_case, limit, context_chars, json_output):
+    """Find a literal string (a quote) in chunk text, with chunk and page.
+
+    Tries an exact match first, then a normalised one that tolerates line
+    breaks, line-end hyphenation, ligatures, markdown emphasis and curly
+    quotes; each hit says which ("match": exact|normalized) and gives the
+    verbatim source span. Papers without chunks are searched in their raw
+    text ("source": raw_text, no page). Exit 2 when nothing matches.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    if ids == "-":
+        ids = click.get_text_stream("stdin").read()
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    if not text.strip():
+        msg = "Empty search string"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .grep import grep as grep_text
+
+    conn = get_connection(cfg.db_path)
+    try:
+        result = grep_text(conn, text, doc_ids=paper_ids, ignore_case=ignore_case,
+                           limit=limit, context_chars=context_chars)
+    finally:
+        conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        for h in result["hits"]:
+            if h["page_start"] is None:
+                page = "p.?"
+            elif h["page_start"] == h["page_end"]:
+                page = f"p.{h['page_start']}"
+            else:
+                page = f"p.{h['page_start']}-{h['page_end']}"
+            where = (f"chunk {h['chunk_index']} (id {h['chunk_id']})"
+                     if h["source"] == "chunks" else "raw text")
+            click.echo(f"[{h['doc_id']}] {h['filename']}  {page}  {where}  {h['match']}")
+            click.echo(f"    {h['context']}")
+        more = " (truncated; raise --limit)" if result["truncated"] else ""
+        click.echo(f"{result['count']} hit(s){more}", err=True)
+        if result["not_found"]:
+            _print_not_found("Not in index", result["not_found"], False)
+
+    if not result["hits"]:
+        ctx.exit(EXIT_NO_RESULTS)
+    elif result["not_found"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
+# --- chunks ---
+
+@cli.group()
+def chunks():
+    """Chunk maintenance (write path)."""
+    pass
+
+
+@chunks.command("backfill-pages")
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (default: every paper with unpaged chunks)")
+@click.option("--force", is_flag=True, help="Re-map papers whose chunks already have pages")
+@click.option("--limit", type=int, default=None, help="Map at most N papers")
+@click.option("--dry-run", is_flag=True, help="Compute and report; write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def chunks_backfill_pages(ctx, ids, force, limit, dry_run, json_output):
+    """Set page_start/page_end on existing chunks from their PDFs.
+
+    Locates each chunk's text in the PDF's per-page text. Writes only the two
+    page columns: chunk text, chunk ids and embeddings are untouched, so
+    nothing is re-embedded. Opens PDFs (OCR'd papers are paged from their
+    '## Page N' sections instead). Reports coverage and the papers whose
+    chunks could only be interpolated or not placed at all.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    require_papers_dir(ctx, cfg, use_json)
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .pages import backfill_pages
+
+    conn = get_connection(cfg.db_path)
+    progress_bar = None
+    task = None
+    if not use_json:
+        progress_bar = Progress(
+            BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=err_console,
+        )
+        task = progress_bar.add_task("Paging", total=None)
+        progress_bar.start()
+
+    def on_progress(current, total):
+        if progress_bar is not None:
+            progress_bar.update(task, completed=current, total=total)
+
+    try:
+        report = backfill_pages(conn, cfg.papers_dir, paper_ids=paper_ids,
+                                dry_run=dry_run, force=force, limit=limit,
+                                progress_callback=on_progress)
+    finally:
+        if progress_bar is not None:
+            progress_bar.stop()
+        conn.close()
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        cov = report["coverage"]
+        cov_s = f"{cov * 100:.1f}%" if cov is not None else "n/a"
+        click.echo(
+            f"{prefix}{report['papers']} papers, {report['chunks']:,} chunks: "
+            f"{report['assigned']:,} paged ({cov_s}), {report['updated']:,} written"
+        )
+        bs = report["by_status"]
+        click.echo("  " + ", ".join(f"{k} {v:,}" for k, v in bs.items()))
+        if report["ambiguous_papers"]:
+            click.echo(f"  {report['ambiguous_papers']} papers with interpolated/unplaced chunks"
+                       " (worst first):")
+            for a in report["ambiguous"][:10]:
+                click.echo(f"    [{a['doc_id']}] {a['filename']}: {a['unlocated']} unplaced, "
+                           f"{a['interpolated']} interpolated of {a['chunks']}")
+        for e in report["errors"]:
+            click.echo(f"  error [{e['doc_id']}] {e['filename']}: {e['error']}", err=True)
+
+    if report["errors"]:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- schema ---

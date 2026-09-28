@@ -61,13 +61,15 @@ def test_views_return_rows_keyed_by_paper_id(tmp_db):
 
 
 def test_views_pick_up_later_page_columns(tmp_db):
-    """A later migration adding e.g. chunks.page_end shows up in v_chunks."""
-    tmp_db.execute("ALTER TABLE chunks ADD COLUMN page_end INTEGER")
-    assert "page_end" in _cols(tmp_db, "v_chunks")
+    """Columns added by migrations show up in v_chunks without recreating it."""
+    assert "page_end" in _cols(tmp_db, "v_chunks")  # added by the v7 migration
+    tmp_db.execute("ALTER TABLE chunks ADD COLUMN page_label TEXT")
+    assert "page_label" in _cols(tmp_db, "v_chunks")
 
 
 def test_views_do_not_bump_schema_version(tmp_db):
-    assert get_schema_version(tmp_db) == SCHEMA_VERSION == 6
+    # Views are created idempotently, not by a migration of their own.
+    assert get_schema_version(tmp_db) == SCHEMA_VERSION
 
 
 def test_reopen_is_idempotent(tmp_path):
