@@ -2300,6 +2300,85 @@ def read(ctx, identifier, chunk_id, list_chunks, context_chars, json_output):
         click.echo(content)
 
 
+# --- grep ---
+
+@cli.command()
+@click.argument("text")
+@click.option("--ids", type=str, default=None,
+              help="Only these paper IDs: comma/newline separated (search --ids-only "
+                   "output works), or '-' to read them from stdin")
+@click.option("-i", "--ignore-case", is_flag=True, help="Case-insensitive match")
+@click.option("-n", "--limit", type=int, default=50, show_default=True, help="Max hits")
+@click.option("--context", "context_chars", type=int, default=80, show_default=True,
+              help="Chars of context either side of each hit")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def grep(ctx, text, ids, ignore_case, limit, context_chars, json_output):
+    """Find a literal string (a quote) in chunk text, with chunk and page.
+
+    Tries an exact match first, then a normalised one that tolerates line
+    breaks, line-end hyphenation, ligatures, markdown emphasis and curly
+    quotes; each hit says which ("match": exact|normalized) and gives the
+    verbatim source span. Papers without chunks are searched in their raw
+    text ("source": raw_text, no page). Exit 2 when nothing matches.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+
+    if not cfg.db_path.exists():
+        msg = "No database found."
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+    if ids == "-":
+        ids = click.get_text_stream("stdin").read()
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    if not text.strip():
+        msg = "Empty search string"
+        if use_json:
+            click.echo(json.dumps({"error": msg}))
+        else:
+            click.echo(msg, err=True)
+        ctx.exit(EXIT_ERROR)
+        return
+
+    from .grep import grep as grep_text
+
+    conn = get_connection(cfg.db_path)
+    try:
+        result = grep_text(conn, text, doc_ids=paper_ids, ignore_case=ignore_case,
+                           limit=limit, context_chars=context_chars)
+    finally:
+        conn.close()
+
+    if use_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        for h in result["hits"]:
+            if h["page_start"] is None:
+                page = "p.?"
+            elif h["page_start"] == h["page_end"]:
+                page = f"p.{h['page_start']}"
+            else:
+                page = f"p.{h['page_start']}-{h['page_end']}"
+            where = (f"chunk {h['chunk_index']} (id {h['chunk_id']})"
+                     if h["source"] == "chunks" else "raw text")
+            click.echo(f"[{h['doc_id']}] {h['filename']}  {page}  {where}  {h['match']}")
+            click.echo(f"    {h['context']}")
+        more = " (truncated; raise --limit)" if result["truncated"] else ""
+        click.echo(f"{result['count']} hit(s){more}", err=True)
+        if result["not_found"]:
+            _print_not_found("Not in index", result["not_found"], False)
+
+    if not result["hits"]:
+        ctx.exit(EXIT_NO_RESULTS)
+    elif result["not_found"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
 # --- chunks ---
 
 @cli.group()
