@@ -1894,12 +1894,26 @@ def prune(ctx, dry_run, json_output):
 @cli.command()
 @click.argument("fragment")
 @click.option("-n", "--limit", type=int, default=20, help="Max results")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Print only matching paper IDs, one per line (overrides --json)")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def find(ctx, fragment, limit, json_output):
-    """Fuzzy filename lookup. FRAGMENT matches anywhere in the filename."""
+def find(ctx, fragment, limit, ids_only, json_output):
+    """Known-item lookup by title, author, year, citekey, DOI or filename.
+
+    Case- and accent-insensitive; every word of FRAGMENT must match some
+    field ("&", "and", "et al." are ignored). Title matches rank first. Each
+    result reports matched_fields.
+
+    \b
+    Examples:
+      gantry find "Mind games"
+      gantry find "Zhang 2022" --ids-only
+      gantry find "Flew & Martin" --json
+      gantry find @flew2022digital
+    """
     cfg = ctx.obj["config"]
-    use_json = json_output or ctx.obj["json"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
 
     if not cfg.db_path.exists():
         msg = "No database found. Run 'gantry ingest' first."
@@ -1915,6 +1929,13 @@ def find(ctx, fragment, limit, json_output):
 
     results = find_papers(conn, fragment, limit=limit)
     conn.close()
+
+    if ids_only:
+        for r in results:
+            click.echo(r["id"])
+        if not results:
+            ctx.exit(EXIT_NO_RESULTS)
+        return
 
     if not results:
         if use_json:
@@ -1936,6 +1957,8 @@ def find(ctx, fragment, limit, json_output):
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
                     "citekey": r.get("citekey"),
+                    "year": r.get("year"),
+                    "matched_fields": r["matched_fields"],
                 }
                 for r in results
             ],
@@ -1947,7 +1970,9 @@ def find(ctx, fragment, limit, json_output):
             ck = r.get("citekey")
             ck_str = f" @{ck}" if ck else ""
             extra = f" — {r['title']}" if r["title"] else ""
-            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}")
+            yr = f" ({r['year']})" if r.get("year") else ""
+            via = ",".join(r["matched_fields"])
+            click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}{yr}  [{via}]")
 
 
 # --- info ---
