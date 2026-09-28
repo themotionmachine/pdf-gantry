@@ -3,6 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+from .fts import delete_row
+
 
 def prune_missing(
     conn: sqlite3.Connection,
@@ -43,30 +45,8 @@ def prune_missing(
                 (paper_id,),
             )
 
-            # FTS5 contentless — need to provide old content for delete
-            fts_row = conn.execute(
-                "SELECT rowid FROM papers_fts WHERE rowid = ?", (paper_id,)
-            ).fetchone()
-            if fts_row:
-                paper_data = conn.execute(
-                    "SELECT filename, title, authors, abstract FROM papers WHERE id = ?",
-                    (paper_id,),
-                ).fetchone()
-                text_data = conn.execute(
-                    "SELECT raw_text FROM paper_text WHERE paper_id = ?",
-                    (paper_id,),
-                ).fetchone()
-                conn.execute(
-                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
-                    "abstract, text_content) "
-                    "VALUES('delete', ?, ?, ?, ?, ?, ?)",
-                    (paper_id,
-                     paper_data["filename"] or "" if paper_data else "",
-                     paper_data["title"] or "" if paper_data else "",
-                     paper_data["authors"] or "" if paper_data else "",
-                     paper_data["abstract"] or "" if paper_data else "",
-                     text_data["raw_text"] or "" if text_data else ""),
-                )
+            # FTS5 contentless: no CASCADE; delete before the papers row goes.
+            delete_row(conn, paper_id)
 
             # Regular tables — CASCADE handles chunks and paper_text
             conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))

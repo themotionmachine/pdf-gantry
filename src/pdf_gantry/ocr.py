@@ -135,8 +135,8 @@ def process_ocr_documents(
                 (paper_id,),
             ).fetchone()
 
-            # Read the prior text BEFORE overwriting — needed to delete stale
-            # postings from the contentless FTS5 index.
+            # Read the prior text BEFORE overwriting — a legacy contentless
+            # FTS5 table needs it to delete stale postings.
             old_row = conn.execute(
                 "SELECT raw_text FROM paper_text WHERE paper_id = ?", (paper_id,)
             ).fetchone()
@@ -149,24 +149,9 @@ def process_ocr_documents(
                 (paper_id, raw_text, markdown, len(raw_text), len(markdown)),
             )
 
-            # Update FTS (contentless: delete old postings before inserting new).
-            existing_fts = conn.execute(
-                "SELECT rowid FROM papers_fts WHERE rowid = ?", (paper_id,)
-            ).fetchone()
-            if existing_fts:
-                conn.execute(
-                    "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
-                    "abstract, text_content) "
-                    "VALUES('delete', ?, ?, ?, ?, ?, ?)",
-                    (paper_id, paper["filename"] or "", paper["title"] or "",
-                     paper["authors"] or "", paper["abstract"] or "", old_text or ""),
-                )
-            conn.execute(
-                "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (paper_id, paper["filename"] or "", paper["title"] or "",
-                 paper["authors"] or "", paper["abstract"] or "", raw_text),
-            )
+            # Update FTS. old_text only matters on a legacy table (fts.py).
+            from .fts import refresh_row
+            refresh_row(conn, paper_id, old_text=old_text or "")
 
             # Re-derive chunks from the OCR markdown — otherwise chunks (and their
             # embeddings) keep answering with the pre-OCR garbage extraction.

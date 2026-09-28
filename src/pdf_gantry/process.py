@@ -107,10 +107,8 @@ def _process_single(
             (paper_id,),
         ).fetchone()
 
-        # Read the prior text BEFORE overwriting paper_text — a contentless FTS5
-        # delete needs the OLD content to drop stale postings. Reading after the
-        # INSERT OR REPLACE below would hand the new text to 'delete', leaving the
-        # old terms to keep matching on re-extraction.
+        # Read the prior text BEFORE overwriting paper_text — a legacy
+        # contentless FTS5 table needs the OLD content to drop stale postings.
         old_row = conn.execute(
             "SELECT raw_text FROM paper_text WHERE paper_id = ?", (paper_id,)
         ).fetchone()
@@ -124,25 +122,10 @@ def _process_single(
             (paper_id, raw_text, markdown, len(raw_text), len(markdown)),
         )
 
-        # Update FTS index
-        # For contentless FTS5, check if row exists before trying to delete
-        existing_fts = conn.execute(
-            "SELECT rowid FROM papers_fts WHERE rowid = ?", (paper_id,)
-        ).fetchone()
-        if existing_fts:
-            conn.execute(
-                "INSERT INTO papers_fts(papers_fts, rowid, filename, title, authors, "
-                "abstract, text_content) "
-                "VALUES('delete', ?, ?, ?, ?, ?, ?)",
-                (paper_id, row["filename"] or "", row["title"] or "",
-                 row["authors"] or "", row["abstract"] or "", old_content or ""),
-            )
-        conn.execute(
-            "INSERT INTO papers_fts(rowid, filename, title, authors, abstract, text_content) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (paper_id, row["filename"] or "", row["title"] or "",
-             row["authors"] or "", row["abstract"] or "", raw_text),
-        )
+        # Update FTS index. old_content only matters on a legacy (pre
+        # contentless_delete) table; see fts.refresh_row.
+        from .fts import refresh_row
+        refresh_row(conn, paper_id, old_text=old_content or "")
 
         # Generate and store chunks
         from .chunking import chunk_markdown

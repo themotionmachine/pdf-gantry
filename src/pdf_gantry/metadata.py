@@ -7,6 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from .fts import refresh_row
 from .queue import (
     MISS_SOURCE_PREFIX,
     enriched_condition,
@@ -672,6 +673,8 @@ def enrich_documents(
                     now, suspect, round(verify_score, 3), now, now, paper_id,
                 ),
             )
+            # Title/authors/abstract are indexed: keep keyword search current.
+            refresh_row(conn, paper_id)
             stats.matched += 1
             if suspect:
                 stats.suspect += 1

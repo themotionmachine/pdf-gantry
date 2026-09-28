@@ -17,6 +17,7 @@ import json
 import re
 import sqlite3
 
+from .fts import refresh_row, refresh_rows
 from .queue import MANUAL_SOURCE_PREFIX, MISS_SOURCE_PREFIX
 from .utils import now_iso, resolve_ids
 
@@ -162,6 +163,7 @@ def set_metadata(
         f"UPDATE papers SET {sets} WHERE id = ?",
         [*assignments.values(), paper_id],
     )
+    refresh_row(conn, paper_id)
     conn.commit()
     return result
 
@@ -209,6 +211,7 @@ def clear_metadata(
         f"UPDATE papers SET {sets}, updated_at = ? WHERE id IN ({placeholders})",
         [*assignments.values(), now_iso(), *found],
     )
+    refresh_rows(conn, found)
     conn.commit()
     return result
 
@@ -304,5 +307,7 @@ def normalize_metadata(
         "UPDATE papers SET updated_at = ? WHERE id = ?",
         [(now, i) for i in sorted(content_changed)],
     )
+    # Authors and abstracts are indexed; the legacy-miss tag is not.
+    refresh_rows(conn, sorted({pid for _, pid in author_fixes} | set(to_clear)))
     conn.commit()
     return report
