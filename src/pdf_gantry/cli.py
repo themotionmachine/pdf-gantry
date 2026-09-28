@@ -2031,29 +2031,63 @@ def retry(ctx, max_attempts, ids, json_output):
 # --- pipeline ---
 
 @cli.command()
-@click.option("--file", "filename", type=str, default=None, help="Process a single file by name")
+@click.argument("files", nargs=-1, type=str)
+@click.option("--file", "filename", type=str, default=None,
+              help="Process a single file by name (same as a positional FILE)")
 @click.option("--limit", type=int, default=None, help="Max papers to process end-to-end")
 @click.option("--workers", type=int, default=None, help="Number of concurrent workers")
+@click.option("--enrich", "do_enrich", is_flag=True,
+              help="Fetch metadata for never-enriched papers after extraction and "
+                   "before embedding, so titles reach the chunk embeddings")
+@click.option("--provider", type=click.Choice(["openalex", "semantic-scholar"]),
+              default="openalex", show_default=True,
+              help="Metadata provider for --enrich")
 @click.option("--dry-run", is_flag=True, help="Report what would happen")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
-def pipeline(ctx, filename, limit, workers, dry_run, json_output):
-    """Run full ingestion pipeline: ingest → process → embed."""
+def pipeline(ctx, files, filename, limit, workers, do_enrich, provider, dry_run,
+             json_output):
+    """Run full ingestion pipeline: ingest → process → [enrich →] embed.
+
+    FILES (or --file) limit the run to those PDFs, by name or by a path inside
+    the papers directory. `gantry pipeline paper.pdf --enrich` adds one paper
+    end to end, metadata included; the JSON `ids` field gives its paper ID.
+    """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
 
-    require_papers_dir(ctx, cfg, use_json)
-    if not cfg.papers_dir.is_dir():
-        msg = f"Papers directory not found: {cfg.papers_dir}"
+    def fail(msg):
         if use_json:
             click.echo(json.dumps({"error": msg}))
         else:
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
+
+    require_papers_dir(ctx, cfg, use_json)
+    if not cfg.papers_dir.is_dir():
+        fail(f"Papers directory not found: {cfg.papers_dir}")
         return
+
+    names: list[str] = []
+    papers_root = cfg.papers_dir.resolve()
+    for arg in ([filename] if filename else []) + list(files):
+        path = Path(arg)
+        if path.parent != Path("."):
+            if path.expanduser().resolve().parent != papers_root:
+                fail(f"{arg} is not in the papers directory ({cfg.papers_dir}); "
+                     "gantry indexes a flat folder, so move or copy it there first")
+                return
+        if path.name not in names:
+            names.append(path.name)
+    for name in names:
+        if not (cfg.papers_dir / name).exists():
+            fail(f"File not found in papers directory: {name}")
+            return
 
     if workers is None:
         workers = cfg.processing.workers
+
+    mailto = cfg.openalex_mailto if provider == "openalex" else None
 
     cfg.index_dir.mkdir(parents=True, exist_ok=True)
     conn = get_connection(cfg.db_path)
@@ -2061,18 +2095,42 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
     from .pipeline import run_pipeline
 
     if not use_json and not dry_run:
-        if filename:
-            err_console.print(f"Pipeline: {filename}")
+        if names:
+            err_console.print(f"Pipeline: {', '.join(names)}")
         else:
             err_console.print(f"Pipeline: scanning {cfg.papers_dir}")
 
-    stats = run_pipeline(
-        conn, cfg.papers_dir, cfg.db_path,
-        workers=workers, limit=limit, dry_run=dry_run,
-        filename=filename,
-        scan_threshold=cfg.processing.scan_threshold,
-        max_retries=cfg.processing.max_retries,
-    )
+    def run(name):
+        return run_pipeline(
+            conn, cfg.papers_dir, cfg.db_path,
+            workers=workers, limit=limit, dry_run=dry_run,
+            filename=name,
+            scan_threshold=cfg.processing.scan_threshold,
+            max_retries=cfg.processing.max_retries,
+            enrich=do_enrich, provider=provider, mailto=mailto,
+        )
+
+    if len(names) <= 1:
+        stats = run(names[0] if names else None)
+    else:
+        per_file = [{"file": n, **run(n)} for n in names]
+        stats = {"ingested": 0, "processed": 0, "enriched": 0, "embedded": 0,
+                 "errors": 0, "new_files": [], "ids": []}
+        for fs in per_file:
+            for key in ("ingested", "processed", "enriched", "embedded", "errors"):
+                stats[key] += fs.get(key, 0)
+            stats["new_files"] += fs.get("new_files", [])
+            stats["ids"] += fs.get("ids", [])
+        if do_enrich:
+            stats["enrich"] = {
+                key: sum(fs.get("enrich", {}).get(key, 0) for fs in per_file)
+                for key in ("total", "matched", "no_match", "api_errors",
+                            "suspect", "skipped_manual")
+            }
+            stats["titled_after_embed"] = sorted(
+                i for fs in per_file for i in fs.get("titled_after_embed", [])
+            )
+        stats["files"] = per_file
 
     if not dry_run:
         from .queue import suspicious_extraction_condition
@@ -2087,8 +2145,16 @@ def pipeline(ctx, filename, limit, workers, dry_run, json_output):
         prefix = "[DRY RUN] " if dry_run else ""
         click.echo(f"{prefix}Ingested: {stats['ingested']}, "
                     f"Processed: {stats['processed']}, "
-                    f"Embedded: {stats['embedded']}, "
+                    + (f"Enriched: {stats['enriched']}, " if do_enrich else "")
+                    + f"Embedded: {stats['embedded']}, "
                     f"Errors: {stats['errors']}")
+        if stats.get("ids"):
+            click.echo(f"  Paper IDs: {', '.join(str(i) for i in stats['ids'])}")
+        if stats.get("titled_after_embed"):
+            ids_str = ",".join(str(i) for i in stats["titled_after_embed"])
+            click.echo(f"  {len(stats['titled_after_embed'])} paper(s) gained a title "
+                       f"after being embedded; re-embed with "
+                       f"'gantry embed --chunk --ids {ids_str} --force'")
         if stats.get("suspicious", 0) > 0:
             click.echo(f"  Warning: {stats['suspicious']} paper(s) have suspiciously thin "
                        f"text for their page count — likely bitmap-rendered. "
