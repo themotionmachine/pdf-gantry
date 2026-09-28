@@ -106,13 +106,28 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | 0 | success |
   | 1 | error |
   | 2 | ran fine, no results |
-  | 3 | partial failure (some documents succeeded) |
+  | 3 | partial failure (some documents succeeded, or some requested IDs/indices were missing) |
   | 4 | database error |
+  | 64 | usage error: unknown option or command, bad choice, missing argument |
 
-  An agent can branch on "no results" without parsing anything.
+  An agent can branch on "no results" without parsing anything. A typo is never exit 2: usage errors exit 64, and when `--json` appears anywhere on the command line they print `{"error": "...", "usage": "...", "exit_code": 64}` on stdout.
+- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`. Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
+
+  | Command | Envelope |
+  |---------|----------|
+  | `search`, `semantic` | `{query, total, mode (search only), results: [{id, filename, score, snippet, citekey, …}], not_found}` |
+  | `find` | `{fragment, count, results: [{id, filename, title, year, citekey, page_count, has_text, matched_fields}]}` |
+  | `info` | `{count, papers: [{id, title, authors, year, doi, citekey, …, top_chunk?, chunks?}], not_found}` |
+  | `read ID` | `{id, paper_id, filename, title, text}` |
+  | `read ID --chunks` | `{id, paper_id, filename, chunks: [{chunk_id, chunk_index, section_header, text_length}]}` |
+  | `read ID --index A-B` | `{id, paper_id, filename, title, total_chunks, chunks: [{chunk_id, chunk_index, section_header, char_offset, char_end, page_start, text}], missing_indices}` |
+  | `read ID --chunk C` | `{id, paper_id, doc_id, chunk_id, chunk_index, section_header, page_start, filename, title, text}`; with `--context` adds `context`, `total_chunks` and names the chunk text `chunk_text` |
+  | `queue` | `{count, documents: [...]}` |
+  | `errors` | `{count, errors: [...]}` |
+  | `schema` | `{schema_version, database, tables, views, relationships, common_joins}` |
 - **State is queryable.** Processing status lives in boolean columns (`has_text`, `has_embeddings`, `needs_ocr`), so `gantry queue --needs embeddings` answers "what work is left?" in one call.
 
-If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, and `gantry read <id> --chunk <chunk_id> --context 2000` to expand. Exit code 2 means no results."*
+If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, `gantry find "<title or author>"` for a known paper, and `gantry read <id> --index <a-b>` (or `--chunk <chunk_id> --context 2000`) to read passages. Exit code 2 means no results; 64 means the command itself was malformed."*
 
 ## Why not Zotero, or a RAG framework?
 
@@ -154,9 +169,14 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 |---------|-------------|
 | `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only. `--ids-only` emits bare ranked IDs for piping; `--restrict-to-ids` scopes the search to a candidate set |
 | `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only` and `--restrict-to-ids` |
-| `gantry find <fragment>` | Fuzzy filename lookup |
-| `gantry read <id>` | Read a document's text, list its chunks, or expand one chunk with `--context` |
-| `gantry info --ids <ids>` | Metadata for specific papers; `--query` attaches each paper's best-matching chunk |
+| `gantry find <words>` | Known-item lookup over title, authors, year, citekey, DOI and filename: `find "Mind games"`, `find "Zhang 2022"`, `find "Flew & Martin"`. Every word must match some field; title matches rank first; each result reports `matched_fields`. `--ids-only` for piping |
+| `gantry read <id>` | Read a document's text, list its chunks (`--chunks`), read chunks by per-paper position (`--index 28-41`), or read one chunk by `chunk_id` (`--chunk`, which must belong to that paper) and expand it with `--context` |
+| `gantry info <ids…>` | Metadata for specific papers; takes IDs (`info 12 13`, `info 12,13`), filenames or citekeys (`info @smith2020`), or `--ids`. `--query` attaches each paper's best-matching chunk |
+| `gantry schema` | Tables, columns, relationships and common joins, for raw-SQL callers |
+
+`<id>` in `read` and `info` accepts a paper ID, a filename, or a citekey (with or without `@`).
+
+**Raw SQL.** If you query `~/.gantry/index.db` directly, use the views `v_papers` and `v_chunks`. Both are keyed by `paper_id` (the underlying `chunks` table calls it `doc_id`, and a chunk's key is `chunk_id`, not `id`). `v_chunks` exposes `paper_id, chunk_id, chunk_index, section_header, page_start, text, char_offset`. Full text lives in `paper_text.raw_text` / `paper_text.markdown`. `gantry schema` prints all of this.
 
 ### Index management
 
