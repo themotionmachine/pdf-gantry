@@ -116,3 +116,49 @@ def test_status_json_includes_chunk_embeddings(tmp_path, monkeypatch):
         "pct_text / pct_markdown / pct_embeddings already present in the output"
     )
     assert data["pct_chunk_embeddings"] == 100.0
+
+
+# --- pending-work counts (E13) ------------------------------------------------
+
+
+def test_status_json_pending_work_counts(tmp_path, monkeypatch):
+    """Pollers read pending work from status instead of raw SQL counts."""
+    db_path = tmp_path / "index.db"
+    conn = get_connection(str(db_path))
+
+    def add(pid, **cols):
+        base = {"id": pid, "path": f"p{pid}.pdf", "filename": f"p{pid}.pdf",
+                "file_hash": f"h{pid}", "file_size": 1, "file_modified": "2026-01-01",
+                "indexed_at": "2026-01-01", "updated_at": "2026-01-01"}
+        base.update(cols)
+        conn.execute(
+            f"INSERT INTO papers ({', '.join(base)}) VALUES ({', '.join('?' * len(base))})",
+            list(base.values()),
+        )
+
+    add(1)                                                   # needs text, never enriched
+    add(2, has_text=1)                                       # needs both embeddings
+    add(3, has_text=1, has_embeddings=1, has_chunk_embeddings=1,
+        metadata_source="none:openalex", metadata_enriched_at="2026-09-10")
+    add(4, has_text=1, has_embeddings=1, has_chunk_embeddings=1,
+        metadata_source="manual:ryan", metadata_enriched_at="2026-09-10", title="T")
+    add(5, has_text=1, has_embeddings=1, has_chunk_embeddings=1,
+        metadata_source="openalex", metadata_enriched_at="2026-09-10", title="T",
+        metadata_suspect=1)
+    add(6, is_encrypted=1, metadata_enriched_at="2026-09-10")  # legacy miss, can't extract
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("GANTRY_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("GANTRY_PAPERS_DIR", str(tmp_path))
+
+    data = json.loads(CliRunner().invoke(cli, ["status", "--json"]).output)
+
+    assert data["needs_text"] == 1
+    assert data["needs_embeddings"] == 1
+    assert data["needs_chunk_embeddings"] == 1
+    assert data["needs_enrich"] == 2
+    assert data["enrich_misses"] == 2
+    assert data["metadata_suspect"] == 1
+    assert data["manual_metadata"] == 1
+    # existing keys are untouched
+    assert data["total"] == 6 and "with_text" in data

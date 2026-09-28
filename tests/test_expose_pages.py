@@ -76,12 +76,12 @@ def test_read_chunks_list_has_pages(paged_db):
 
 
 def test_read_single_chunk_has_pages(paged_db):
-    _, ids = paged_db
-    d = _run(["read", "x", "--chunk", str(ids[1]), "--json"])
+    doc, ids = paged_db
+    d = _run(["read", str(doc), "--chunk", str(ids[1]), "--json"])
     assert (d["page_start"], d["page_end"]) == (4, 5)
 
 
 def test_read_chunk_context_has_pages(paged_db):
-    _, ids = paged_db
-    d = _run(["read", "x", "--chunk", str(ids[1]), "--context", "500", "--json"])
+    doc, ids = paged_db
+    d = _run(["read", str(doc), "--chunk", str(ids[1]), "--context", "500", "--json"])
     assert (d["page_start"], d["page_end"]) == (4, 5)

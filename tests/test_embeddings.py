@@ -146,3 +146,31 @@ def test_embed_documents_propagates_import_error(tmp_path, monkeypatch):
     with pytest.raises(ImportError, match="sentence-transformers"):
         emb_module.embed_documents(conn, db_path)
     conn.close()
+
+
+def test_megablocks_warning_suppressed_other_warnings_kept(monkeypatch):
+    """Loading the model must not print Nomic's megablocks UserWarning (E13),
+    but unrelated warnings from the load still surface."""
+    import sys
+    import types
+    import warnings
+
+    from pdf_gantry import embeddings as emb
+
+    class FakeST:
+        def __init__(self, name, trust_remote_code=False):
+            warnings.warn("Install Nomic's megablocks fork for better speed: "
+                          "`pip install git+https://github.com/nomic-ai/megablocks.git`")
+            warnings.warn("something else entirely")
+
+    fake = types.ModuleType("sentence_transformers")
+    fake.SentenceTransformer = FakeST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = emb._load_sentence_transformer("m")
+    assert isinstance(model, FakeST)
+    messages = [str(w.message) for w in caught]
+    assert not any("megablocks" in m for m in messages)
+    assert "something else entirely" in messages

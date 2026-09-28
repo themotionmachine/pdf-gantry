@@ -1,4 +1,4 @@
-"""Single-command pipeline: ingest → process → embed."""
+"""Single-command pipeline: ingest → process → [enrich →] embed."""
 
 import sqlite3
 from pathlib import Path
@@ -19,17 +19,29 @@ def run_pipeline(
     scan_threshold: float = 0.05,
     progress_callback=None,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    enrich: bool = False,
+    provider: str = "openalex",
+    mailto: str | None = None,
 ) -> dict:
     """
-    Run the full ingestion pipeline: ingest → process → embed (chunks).
+    Run the full ingestion pipeline: ingest → process → [enrich →] embed (chunks).
 
     If filename is given, only that file is processed end-to-end.
     Limit applies to total pipeline throughput, not per-stage.
+
+    With ``enrich``, metadata is fetched for never-enriched papers after
+    extraction (enrich needs the text) and BEFORE embedding: chunk text is
+    prefixed with the paper title (chunking.prepare_chunk_text), so a paper
+    embedded before enrichment carries no title in its vectors. Papers that
+    gain a title here but were already chunk-embedded are listed in
+    ``titled_after_embed`` for ``embed --chunk --ids ... --force``.
+
     Returns stats dict with counts per stage.
     """
     stats = {
         "ingested": 0,
         "processed": 0,
+        "enriched": 0,
         "embedded": 0,
         "errors": 0,
         "new_files": [],
@@ -67,6 +79,7 @@ def run_pipeline(
         if not row:
             return stats
         target_ids = [row["id"]]
+        stats["ids"] = target_ids
     else:
         ingest_stats = ingest_directory(
             conn, papers_dir,
@@ -87,14 +100,9 @@ def run_pipeline(
         row = conn.execute(
             "SELECT has_text FROM papers WHERE id = ?", (target_ids[0],)
         ).fetchone()
-        if row and row["has_text"]:
-            # Already processed — check if it needs re-processing (changed file)
-            if ingest_stats.changed == 0:
-                target_ids_to_process = []
-            else:
-                target_ids_to_process = target_ids
-        else:
-            target_ids_to_process = target_ids
+        # A changed file is reset to has_text=0 by ingest, so has_text alone
+        # decides whether this paper needs (re-)processing.
+        target_ids_to_process = [] if row and row["has_text"] else target_ids
 
         if target_ids_to_process:
             proc_stats = process_documents(
@@ -131,6 +139,11 @@ def run_pipeline(
             stats["processed"] = proc_stats.succeeded
             stats["errors"] += proc_stats.failed
 
+    # --- Stage 2b: Enrich (before embed, so titles reach the vectors) ---
+    if enrich:
+        _enrich_stage(conn, stats, target_ids if filename else None,
+                      limit=limit, provider=provider, mailto=mailto)
+
     # --- Stage 3: Embed chunks ---
     # Skip embedding if sentence-transformers isn't installed
     try:
@@ -162,3 +175,53 @@ def run_pipeline(
             pass  # sentence-transformers not installed
 
     return stats
+
+
+def _enrich_stage(
+    conn: sqlite3.Connection,
+    stats: dict,
+    target_ids: list[int] | None,
+    limit: int | None,
+    provider: str,
+    mailto: str | None,
+) -> None:
+    """Enrich never-attempted papers (the target file only, in file mode)."""
+    from .metadata import default_enrich_ids, enrich_documents
+
+    eligible = default_enrich_ids(conn)
+    if target_ids is not None:
+        wanted = set(target_ids)
+        eligible = [i for i in eligible if i in wanted]
+    if limit:
+        eligible = eligible[:limit]
+
+    untitled_embedded: set[int] = set()
+    if eligible:
+        placeholders = ",".join("?" * len(eligible))
+        untitled_embedded = {r[0] for r in conn.execute(
+            f"SELECT id FROM papers WHERE id IN ({placeholders}) "
+            "AND (title IS NULL OR title = '') AND has_chunk_embeddings = 1",
+            eligible,
+        )}
+
+    es = enrich_documents(conn, paper_ids=eligible, provider=provider, mailto=mailto) \
+        if eligible else None
+    stats["enriched"] = es.matched if es else 0
+    stats["enrich"] = {
+        "total": es.total if es else 0,
+        "matched": es.matched if es else 0,
+        "no_match": es.no_match if es else 0,
+        "api_errors": es.api_errors if es else 0,
+        "suspect": es.suspect if es else 0,
+        "skipped_manual": es.skipped_manual if es else 0,
+    }
+
+    titled: list[int] = []
+    if untitled_embedded:
+        placeholders = ",".join("?" * len(untitled_embedded))
+        titled = sorted(r[0] for r in conn.execute(
+            f"SELECT id FROM papers WHERE id IN ({placeholders}) "
+            "AND title IS NOT NULL AND title != ''",
+            sorted(untitled_embedded),
+        ))
+    stats["titled_after_embed"] = titled
