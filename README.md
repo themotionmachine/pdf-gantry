@@ -141,10 +141,11 @@ Zotero manages references; it does not give an agent chunk-level retrieval over 
 |---------|-------------|
 | `gantry ingest` | Scan the papers folder, register new and changed PDFs |
 | `gantry process` | Extract text and markdown |
-| `gantry embed` | Generate chunk-level embeddings |
+| `gantry embed` | Generate chunk-level embeddings; `--ids <ids> --force` re-embeds specific papers (deletes their old vectors and resets the flag) |
 | `gantry ocr` | OCR scanned PDFs with Surya |
 | `gantry enrich` | Fetch metadata (title, authors, year, DOI, abstract) from OpenAlex or Semantic Scholar |
-| `gantry pipeline` | Run the full chain: ingest → process → embed |
+| `gantry pipeline [FILE...]` | Run the full chain: ingest → process → embed. `--enrich` adds metadata lookup before embedding. Positional files (or `--file`) scope it to those PDFs: `gantry pipeline paper.pdf --enrich --json` adds one paper end to end and reports its `ids` |
+| `gantry meta set\|clear\|normalize` | Hand metadata edits in code rather than raw SQL (see below) |
 
 #### Enriching metadata
 
@@ -161,7 +162,24 @@ gantry enrich                  # the whole library
 
 For each paper it tries, in order: exact DOI lookup (from the `doi` column, else a DOI found in the first page of text), then an author+year search derived from the filename, then a title search. DOI matches are reliable; title-search fallbacks on opaque filenames are worth a skeptical pass.
 
-Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers missing metadata; pass `--has`/`--needs`/`--is` filters or `--limit` to scope it.
+Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers it has never tried; pass `--ids`, `--has`/`--needs`/`--is` filters or `--limit` to scope it.
+
+A paper the provider can't match is recorded as `metadata_source = 'none:<provider>'`, so "tried and missed" is distinguishable from "never tried". Misses aren't retried by default; `gantry enrich --retry-misses` re-attempts them, and `gantry queue --is enrich-miss` lists them. A lookup that fails on a network or API error leaves the paper untouched, so the next run tries it again.
+
+`gantry pipeline --enrich` runs enrichment after text extraction and before embedding, because each chunk is embedded with its paper's title prepended. Its JSON reports `enriched`, an `enrich` block of counts, and `titled_after_embed`: papers that were already embedded before they got a title, ready for `gantry embed --chunk --ids … --force`.
+
+#### Editing metadata by hand
+
+When a provider gets a paper wrong, or has nothing, set the metadata with `gantry meta` rather than SQL:
+
+```bash
+gantry meta set --id 53 --title "Mind Games" --authors "Ann Author; Ben Author" \
+    --year 2021 --citekey author2021mind --by ryan
+gantry meta clear --ids 861,862          # null a wrong match so enrich retries it
+gantry meta normalize --dry-run --json   # report repairs to hand-written rows
+```
+
+`meta set` writes only the fields you pass, stores authors as a JSON list (`"A; B"` or a JSON list both work), stamps ISO timestamps, and records `metadata_source = 'manual:<by>'`. `enrich` never overwrites manual metadata, even with `--ids`; `gantry queue --is manual-metadata` lists it. `meta clear` nulls title, authors, year, DOI and abstract, resets the enrich and verify state, and leaves the citekey alone unless you pass `--citekey`. `meta normalize` is idempotent: it converts `;`-separated authors to JSON lists, converts `YYYY-MM-DD HH:MM:SS` timestamps to ISO, clears abstracts left on untitled `metadata_suspect` papers (it only reports other untitled papers with abstracts unless you pass `--all-orphans`), and tags pre-2026-09 misses as `none:legacy`. All three take `--dry-run` and `--json`.
 
 ### Search and retrieval
 
@@ -182,7 +200,7 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 
 | Command | Description |
 |---------|-------------|
-| `gantry status` | Coverage and database stats |
+| `gantry status` | Coverage and database stats, plus pending-work counts (`needs_text`, `needs_embeddings`, `needs_chunk_embeddings`, `needs_enrich`, `enrich_misses`, `metadata_suspect`, `manual_metadata`) matching what the next default run would pick up |
 | `gantry queue` | Documents matching a filter (`--needs`, `--has`, `--is`) |
 | `gantry errors` / `gantry retry` | Inspect and re-run failures |
 | `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |

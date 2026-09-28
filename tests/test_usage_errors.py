@@ -59,7 +59,9 @@ def test_bad_choice_exits_64(env):
 
 
 def test_unexpected_extra_argument_exits_64(env):
-    result = CliRunner().invoke(cli, ["pipeline", "Nonexistent.pdf"])
+    # `status` takes no positional arguments. (`pipeline FILE` became legal
+    # in the metadata-ops strand, so it can no longer serve as the example.)
+    result = CliRunner().invoke(cli, ["status", "unexpected"])
     assert result.exit_code == 64
 
 
