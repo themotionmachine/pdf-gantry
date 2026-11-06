@@ -99,9 +99,11 @@ def test_small_caps_spans_join_without_inserted_spaces(tmp_path):
     assert extract_layout_title(path).title == "ECONOMICS OF TRUST"
 
 
-def test_letterspaced_title_collapses(tmp_path):
-    r = _title(tmp_path, [(120, 20, "T R U S T  I N  C I T I E S  T O D A Y")])
-    assert r.title == "TRUST IN CITIES TODAY"
+def test_letterspaced_title_collapses():
+    from pdf_gantry.layout import clean_title
+    assert clean_title("T R U S T  I N  C I T I E S") == "TRUST IN CITIES"
+    assert clean_title("A R T I C L E") == "ARTICLE"
+    assert clean_title("Plan B for a Y2K Bug") == "Plan B for a Y2K Bug"
 
 
 # --- class 1: wrapped across sizes or gaps ----------------------------------
@@ -223,8 +225,8 @@ def test_copyright_and_email_lines_are_rejected(tmp_path, line):
     "������ ab",
 ])
 def test_garbled_text_is_not_title_like(text):
-    from pdf_gantry.layout import clean_title, looks_garbled
-    assert looks_garbled(clean_title(text))
+    from pdf_gantry.layout import looks_garbled
+    assert looks_garbled(text)
 
 
 @pytest.mark.parametrize("text", [
@@ -238,6 +240,110 @@ def test_real_titles_are_not_garbled(text):
     assert not looks_garbled(text)
 
 
+def test_replacement_character_share_marks_a_broken_page():
+    from pdf_gantry.layout import broken_encoding
+    assert broken_encoding("ab\ufffd\ufffd cd\ufffd" * 20)
+    assert not broken_encoding("An ordinary page of text with one \ufffd in it. " * 20)
+
+
+def test_title_starting_with_an_institution_word_survives(tmp_path):
+    r = _title(tmp_path, [(120, 20, "University Governance After Austerity")])
+    assert r.title == "University Governance After Austerity"
+
+
 def test_garbled_page_returns_null_rather_than_garbage(tmp_path):
     r = _title(tmp_path, [(120, 20, "Xq7z Wkrtp Bvczx Mnpqr Tzzkx")])
     assert r.title is None
+
+
+# --- bylines, mastheads and citation lines ----------------------------------
+
+
+def test_title_case_title_with_and_is_not_a_byline(tmp_path):
+    r = _title(tmp_path, [(120, 20, "Cross-Platform Disinformation Campaigns: Lessons"),
+                          (145, 20, "Learned and Next Steps")])
+    assert r.title == "Cross-Platform Disinformation Campaigns: Lessons Learned and Next Steps"
+
+
+def test_two_noun_phrase_title_is_kept(tmp_path):
+    r = _title(tmp_path, [(120, 20, "Political Parties and Social Movements")])
+    assert r.title == "Political Parties and Social Movements"
+
+
+def test_comma_title_is_kept(tmp_path):
+    r = _title(tmp_path, [(120, 20, "Power, Politics, and Reform")])
+    assert r.title == "Power, Politics, and Reform"
+
+
+@pytest.mark.parametrize("line", [
+    "Marlene Kammerer a,b,*, Karin Ingold a,b,c",
+    "Jane Q. Public, John Doe",
+])
+def test_oversized_byline_yields_to_the_title(tmp_path, line):
+    r = _title(tmp_path, [(60, 24, line), (120, 18, "Measuring Civic Trust in Cities")])
+    assert r.title == "Measuring Civic Trust in Cities"
+
+
+@pytest.mark.parametrize("line", [
+    "Journal of Comparative Policy Analysis, 2022",
+    "World Politics, Volume 62, Number 1, January 2010, pp. 120-147",
+    "content analysis; network analysis; policy debate; coalitions",
+    "network analysis, policy coalitions, media framing, trust",
+    "Author(s): Jane Public",
+    "NBER WORKING PAPER SERIES",
+    "Emory Law Scholarly Commons",
+])
+def test_non_title_lines_are_rejected(tmp_path, line):
+    r = _title(tmp_path, [(60, 24, line), (120, 18, "Measuring Civic Trust in Cities")])
+    assert r.title == "Measuring Civic Trust in Cities"
+
+
+def test_everything_above_journal_homepage_line_is_masthead(tmp_path):
+    r = _title(tmp_path, [(50, 9, "Contents lists available at ScienceDirect"),
+                          (70, 22, "Global Environmental Change"),
+                          (90, 9, "journal homepage: www.example.com/gec"),
+                          (140, 16, "Measuring Civic Trust in Cities")])
+    assert r.title == "Measuring Civic Trust in Cities"
+
+
+def test_small_sidebar_lines_interleaved_with_the_title_are_skipped(tmp_path):
+    r = _title(tmp_path, [(100, 16, "Protesting iconic megaprojects. A"),
+                          (108, 7, "Urban Studies Journal Limited"),
+                          (118, 16, "discourse network analysis of the"),
+                          (126, 7, "journals.example.com/home"),
+                          (136, 16, "evolution of the conflict")])
+    assert r.title == ("Protesting iconic megaprojects. A discourse network "
+                       "analysis of the evolution of the conflict")
+
+
+def test_jstor_style_cover_keeps_its_title(tmp_path):
+    cover = [(120, 12, "Measurement Validity: A Shared Standard"),
+             (163, 12, "Robert Adcock; David Collier"),
+             (190, 12, "The American Political Science Review, Vol. 95, No. 3"),
+             (330, 10, "Your use of the JSTOR archive indicates your acceptance."),
+             (345, 10, "Each copy of any part of a JSTOR transmission must contain this.")]
+    filler = [(360 + i * 12, 10, BODY[i % 4]) for i in range(12)]
+    r = extract_layout_title(_pdf(tmp_path, [cover + filler]))
+    assert r.title == "Measurement Validity: A Shared Standard"
+
+
+def test_dagger_after_a_name_is_a_byline_mark():
+    # Base-14 fonts cannot draw a dagger, so this is checked on the line text.
+    from pdf_gantry.layout import _is_byline
+    assert _is_byline("Kim Lane Scheppele†")
+
+
+def test_footnote_marks_and_private_use_glyphs_are_stripped():
+    from pdf_gantry.layout import clean_title
+    assert clean_title("A Title Worth Noting*") == "A Title Worth Noting"
+    assert clean_title("A Title Worth Noting ") == "A Title Worth Noting"
+
+
+def test_doubled_title_collapses():
+    from pdf_gantry.layout import clean_title
+    assert clean_title("Civic Trust Today Civic Trust Today") == "Civic Trust Today"
+
+
+def test_dangling_title_is_low_confidence(tmp_path):
+    r = _title(tmp_path, [(120, 20, "Measuring Civic Trust in Cities of the")])
+    assert r.confidence == "low"

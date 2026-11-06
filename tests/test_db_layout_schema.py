@@ -4,7 +4,6 @@ import sqlite3
 
 from pdf_gantry.db import SCHEMA_VERSION, get_connection, get_schema_version
 
-
 LAYOUT_COLUMNS = ("title_from_layout", "title_layout_confidence", "title_layout_at")
 
 

@@ -80,6 +80,11 @@ def never_enriched_condition() -> str:
     )
 
 
+def layout_pending_condition() -> str:
+    """SQL predicate for papers ``titles backfill`` would pick up by default."""
+    return "(title_layout_at IS NULL AND is_encrypted = 0)"
+
+
 def build_filter_query(
     needs: list[str] | None = None,
     has: list[str] | None = None,
@@ -234,6 +239,11 @@ def pending_counts(
         "enrich_misses": miss_condition(),
         "metadata_suspect": "metadata_suspect = 1",
         "manual_metadata": manual_condition(),
+        "needs_layout_title": layout_pending_condition(),
+        "layout_titled": "(title_from_layout IS NOT NULL AND title_from_layout != '')",
+        # Nothing to show but the filename.
+        "display_untitled": "((title IS NULL OR title = '') AND "
+                            "(title_from_layout IS NULL OR title_from_layout = ''))",
     }
     select = ", ".join(
         f"COALESCE(SUM(CASE WHEN {p} THEN 1 ELSE 0 END), 0)" for p in predicates.values()

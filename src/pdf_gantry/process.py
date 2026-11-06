@@ -1,5 +1,6 @@
 """Text extraction and markdown conversion from PDFs."""
 
+import logging
 import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -11,6 +12,8 @@ import pymupdf4llm
 from .models import ProcessStats
 from .queue import DEFAULT_MAX_RETRIES, not_quarantined_condition
 from .utils import now_iso
+
+logger = logging.getLogger(__name__)
 
 
 def extract_text_pymupdf(pdf_path: Path) -> tuple[str, str]:
@@ -237,6 +240,7 @@ def process_documents(
         return stats
 
     completed = 0
+    succeeded_ids: list[int] = []
 
     # Use workers=1 to run in-process for simplicity with small batches
     if workers <= 1:
@@ -246,6 +250,7 @@ def process_documents(
             )
             if success:
                 stats.succeeded += 1
+                succeeded_ids.append(pid)
             else:
                 stats.failed += 1
             completed += 1
@@ -264,14 +269,33 @@ def process_documents(
                 pid, success, error = future.result()
                 if success:
                     stats.succeeded += 1
+                    succeeded_ids.append(pid)
                 else:
                     stats.failed += 1
                 completed += 1
                 if progress_callback:
                     progress_callback(completed, stats.total)
 
+    stats.layout_titled = _populate_layout_titles(conn, papers_dir, succeeded_ids)
     stats.elapsed_seconds = round(time.time() - start, 1)
     return stats
+
+
+def _populate_layout_titles(conn, papers_dir: Path, paper_ids: list[int]) -> int:
+    """Layout titles for freshly extracted papers. Best effort.
+
+    Runs here, in the parent, because boilerplate is corpus-wide and a worker
+    sees one paper. A failure leaves the papers pending for ``titles backfill``
+    and never fails the extraction that already succeeded.
+    """
+    if not paper_ids:
+        return 0
+    from . import layout
+    try:
+        return layout.backfill_titles(conn, papers_dir, paper_ids=paper_ids)["titled"]
+    except Exception as e:
+        logger.warning("layout titles skipped: %s", e)
+        return 0
 
 
 def reset_errors(conn: sqlite3.Connection, paper_ids: list[int]) -> int:

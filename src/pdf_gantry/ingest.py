@@ -183,6 +183,8 @@ def ingest_directory(
                             page_count = ?, is_scanned = ?, needs_ocr = ?,
                             is_encrypted = ?,
                             has_text = 0, has_markdown = 0, has_embeddings = 0,
+                            title_from_layout = NULL, title_layout_confidence = NULL,
+                            title_layout_at = NULL,
                             updated_at = ?
                         WHERE id = ?""",
                         (fhash, size, mtime, page_count, is_scanned, needs_ocr,

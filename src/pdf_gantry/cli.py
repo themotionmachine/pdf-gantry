@@ -422,6 +422,10 @@ def status(ctx, json_output):
                    " (retry: gantry enrich --retry-misses)")
         click.echo(f"  Metadata suspect:       {format_count(pending['metadata_suspect'])}")
         click.echo(f"  Manual metadata:        {format_count(pending['manual_metadata'])}")
+        click.echo(f"  Needs layout title:     {format_count(pending['needs_layout_title'])}"
+                   " (fill: gantry titles backfill)")
+        click.echo(f"  Layout titled:          {format_count(pending['layout_titled'])}")
+        click.echo(f"  No display title:       {format_count(pending['display_untitled'])}")
         if not fts_contentless_delete:
             click.echo("  Keyword index:          legacy; metadata edits don't reach it"
                        " (fix: gantry fts rebuild)")
@@ -569,6 +573,7 @@ def process(ctx, path, method, quality, workers, force, needs, has_prop, is_prop
             "failed": stats.failed,
             "elapsed_seconds": stats.elapsed_seconds,
             "method": method,
+            "layout_titled": stats.layout_titled,
         }, indent=2))
     else:
         click.echo(
@@ -2024,6 +2029,88 @@ def fts_rebuild(ctx, dry_run, json_output):
 
 
 # --- retry ---
+
+@cli.group()
+def titles():
+    """Titles read from page layout: unverified hints, kept apart from metadata."""
+
+
+@titles.command("backfill")
+@click.option("--ids", type=str, default=None,
+              help="Comma-separated paper IDs (default: every paper not yet attempted)")
+@click.option("--force", is_flag=True, help="Recompute papers already attempted")
+@click.option("--limit", type=int, default=None, help="Attempt at most N papers")
+@click.option("--dry-run", is_flag=True, help="Compute and report; write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def titles_backfill(ctx, ids, force, limit, dry_run, json_output):
+    """Read each paper's title from its page typography.
+
+    Opens PDFs. Takes the largest text near the top of page 1, skipping corpus
+    boilerplate, and stores it in title_from_layout with a high/low confidence.
+    Writes only those columns: papers.title is never touched, and a paper with
+    no result is stamped so it isn't retried. New papers get this from
+    `process` and `pipeline`.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if not cfg.db_path.exists():
+        _no_db(ctx, use_json)
+        return
+    require_papers_dir(ctx, cfg, use_json)
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+
+    from .layout import backfill_titles
+
+    conn = get_connection(cfg.db_path)
+    not_found: list[int] = []
+    if paper_ids is not None:
+        paper_ids, not_found = resolve_ids(conn, paper_ids)
+
+    progress_bar = None
+    task = None
+    if not use_json:
+        progress_bar = Progress(
+            BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=err_console,
+        )
+        task = progress_bar.add_task("Titles", total=None)
+        progress_bar.start()
+
+    def on_progress(current, total):
+        if progress_bar is not None:
+            progress_bar.update(task, completed=current, total=total)
+
+    try:
+        report = backfill_titles(conn, cfg.papers_dir, paper_ids=paper_ids, force=force,
+                                 limit=limit, dry_run=dry_run,
+                                 progress_callback=on_progress)
+    finally:
+        if progress_bar is not None:
+            progress_bar.stop()
+        conn.close()
+    report["not_found"] = not_found
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        click.echo(
+            f"{prefix}{format_count(report['selected'])} papers: "
+            f"{format_count(report['titled'])} titled ({report['high']} high, "
+            f"{report['low']} low confidence), {report['empty']} empty, "
+            f"{report['written']} written"
+        )
+        if not_found:
+            click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
+        for e in report["errors"]:
+            click.echo(f"  error [{e['id']}] {e['filename']}: {e['error']}", err=True)
+
+    if report["errors"] or not_found:
+        ctx.exit(EXIT_PARTIAL)
+
 
 @cli.command()
 @click.option("--max-attempts", type=int, default=None,

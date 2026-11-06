@@ -94,6 +94,7 @@ class ProcessStats:
     succeeded: int = 0
     failed: int = 0
     elapsed_seconds: float = 0.0
+    layout_titled: int = 0
 
 
 @dataclass
