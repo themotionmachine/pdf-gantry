@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
 from .fts import refresh_row
+from .openalex import RateLimitError
 from .queue import (
     MISS_SOURCE_PREFIX,
     bib_condition,
@@ -162,6 +163,7 @@ class EnrichStats:
     matched_by_title: int = 0
     no_match: int = 0
     api_errors: int = 0
+    rate_limited: bool = False
     suspect: int = 0
     skipped_manual: int = 0
     skipped_bib: int = 0
@@ -630,6 +632,9 @@ def enrich_documents(
                 metadata = prov["by_doi"](doi)
                 if metadata:
                     source = prov["doi_source"]
+            except RateLimitError:
+                stats.rate_limited = True
+                break
             except Exception:
                 stats.api_errors += 1
 
@@ -639,6 +644,9 @@ def enrich_documents(
                 metadata = prov["by_filename"](filename)
                 if metadata:
                     source = prov["filename_source"]
+            except RateLimitError:
+                stats.rate_limited = True
+                break
             except Exception:
                 stats.api_errors += 1
 
@@ -658,6 +666,9 @@ def enrich_documents(
                     if metadata:
                         source = prov["title_source"]
                         stats.matched_by_title += 1
+                except RateLimitError:
+                    stats.rate_limited = True
+                    break
                 except Exception:
                     stats.api_errors += 1
 

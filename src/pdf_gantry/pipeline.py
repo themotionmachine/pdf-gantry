@@ -213,6 +213,7 @@ def _enrich_stage(
     stats["enrich"] = {
         "total": es.total if es else 0,
         "matched": es.matched if es else 0,
+        "rate_limited": es.rate_limited if es else False,
         "no_match": es.no_match if es else 0,
         "api_errors": es.api_errors if es else 0,
         "suspect": es.suspect if es else 0,

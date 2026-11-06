@@ -269,3 +269,35 @@ def test_cli_queue_is_enrich_miss_and_manual(tmp_path, monkeypatch):
     assert r.output.strip().endswith("2")
     r = CliRunner().invoke(cli, ["queue", "--is", "manual-metadata", "--count"])
     assert r.output.strip().endswith("2")
+
+
+def _rate_limited(*_a, **_k):
+    raise openalex.RateLimitError("budget spent")
+
+
+def test_rate_limit_stops_the_run_and_records_no_miss(db, monkeypatch):
+    for pid in (1, 2, 3):
+        _seed(db, pid, raw_text="Some Title Of A Paper\nBody text here.")
+    calls = []
+    monkeypatch.setattr(openalex, "fetch_by_title",
+                        lambda *a, **k: calls.append(a) or _rate_limited())
+    monkeypatch.setattr(openalex, "fetch_by_filename", lambda *a, **k: None)
+    stats = enrich_documents(db, provider="openalex", rate_limit=0)
+    assert stats.rate_limited is True
+    assert len(calls) == 1
+    assert stats.no_match == 0
+    rows = db.execute("SELECT metadata_source, metadata_enriched_at FROM papers").fetchall()
+    assert all(r["metadata_source"] is None and r["metadata_enriched_at"] is None for r in rows)
+
+
+def test_enrich_cli_reports_rate_limit_as_partial(tmp_path, monkeypatch):
+    from .search_helpers import add_paper, new_db, point_cli_at
+    conn, db_path = new_db(tmp_path)
+    add_paper(conn, 1, "a.pdf", text="Some Title Of A Paper\nBody text here.")
+    conn.commit()
+    point_cli_at(tmp_path, monkeypatch, db_path)
+    monkeypatch.setattr(openalex, "fetch_by_title", _rate_limited)
+    monkeypatch.setattr(openalex, "fetch_by_filename", _rate_limited)
+    result = CliRunner().invoke(cli, ["enrich", "--ids", "1", "--json"])
+    assert result.exit_code == 3
+    assert json.loads(result.stdout)["rate_limited"] is True

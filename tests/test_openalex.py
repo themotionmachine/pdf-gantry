@@ -1,5 +1,7 @@
 """Tests for the OpenAlex metadata provider (issue #20)."""
 
+import pytest
+
 from pdf_gantry import openalex
 
 # --- reconstruct_abstract ---
@@ -166,3 +168,31 @@ def test_fetch_by_title_empty_results(monkeypatch):
     import httpx
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeResp(200, {"results": []}))
     assert openalex.fetch_by_title("nothing here") is None
+
+
+# --- rate limiting: a spent budget is not a miss ---
+
+@pytest.mark.parametrize("fetch,arg", [
+    (openalex.fetch_by_doi, "10.1/x"),
+    (openalex.fetch_by_title, "A Title"),
+    (openalex.fetch_by_filename, "smith_2020_paper.pdf"),
+])
+def test_fetchers_raise_on_429(monkeypatch, fetch, arg):
+    import httpx
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeResp(429, {}))
+    with pytest.raises(openalex.RateLimitError):
+        fetch(arg)
+
+
+def test_api_key_is_sent_when_configured(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params=None, timeout=None):
+        captured["params"] = params
+        return _FakeResp(404, {})
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setenv("GANTRY_OPENALEX_API_KEY", "k123")
+    openalex.fetch_by_title("A Title")
+    assert captured["params"]["api_key"] == "k123"

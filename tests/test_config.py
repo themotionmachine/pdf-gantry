@@ -307,3 +307,8 @@ def test_cli_config_init_writes_papers_dir(tmp_path, monkeypatch):
     assert result.exit_code == 0
     data = yaml.safe_load(config_file.read_text())
     assert data["papers_dir"] == str(papers)
+
+
+def test_config_openalex_api_key_env_override(monkeypatch):
+    monkeypatch.setenv("GANTRY_OPENALEX_API_KEY", "k123")
+    assert load_config().openalex_api_key == "k123"

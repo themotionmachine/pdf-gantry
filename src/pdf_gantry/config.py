@@ -40,6 +40,7 @@ class Config:
     vault_dir: Path | None = None
     bib_path: Path | None = None
     openalex_mailto: str | None = None
+    openalex_api_key: str | None = None
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -72,6 +73,8 @@ def load_config() -> Config:
             cfg.bib_path = _expand(data["bib_path"])
         if "openalex_mailto" in data and data["openalex_mailto"]:
             cfg.openalex_mailto = str(data["openalex_mailto"])
+        if data.get("openalex_api_key"):
+            cfg.openalex_api_key = str(data["openalex_api_key"])
 
         if "embedding" in data and isinstance(data["embedding"], dict):
             for k, v in data["embedding"].items():
@@ -99,6 +102,8 @@ def load_config() -> Config:
         cfg.bib_path = _expand(env_bib)
     if env_mailto := os.environ.get("GANTRY_OPENALEX_MAILTO"):
         cfg.openalex_mailto = env_mailto
+    if env_key := os.environ.get("GANTRY_OPENALEX_API_KEY"):
+        cfg.openalex_api_key = env_key
 
     return cfg
 
@@ -118,6 +123,8 @@ def save_config(cfg: Config) -> None:
         data["bib_path"] = str(cfg.bib_path)
     if cfg.openalex_mailto:
         data["openalex_mailto"] = cfg.openalex_mailto
+    if cfg.openalex_api_key:
+        data["openalex_api_key"] = cfg.openalex_api_key
 
     data["embedding"] = {
         "model": cfg.embedding.model,
@@ -152,6 +159,8 @@ def set_config_value(key: str, value: str) -> Config:
         cfg.bib_path = _expand(value) if value else None
     elif key == "openalex_mailto":
         cfg.openalex_mailto = value if value else None
+    elif key == "openalex_api_key":
+        cfg.openalex_api_key = value if value else None
     else:
         raise ValueError(f"Unknown config key: {key}")
     save_config(cfg)
