@@ -47,9 +47,12 @@ def suspicious_extraction_condition() -> str:
 #   - 'manual:<who>' -- set by `gantry meta set`. Legacy hand-SQL writes used
 #     free-form names containing "manual" (e.g. 'brev-manual-from-text').
 #     Manual metadata is never overwritten by enrich.
+#   - 'bib:<stem>' -- copied from a .bib by `gantry link pull`. Outranks any
+#     provider, so enrich never overwrites it.
 #   - NULL with no stamp -- never attempted.
 MISS_SOURCE_PREFIX = "none:"
 MANUAL_SOURCE_PREFIX = "manual:"
+BIB_SOURCE_PREFIX = "bib:"
 
 
 def miss_condition() -> str:
@@ -63,7 +66,15 @@ def miss_condition() -> str:
 
 def manual_condition() -> str:
     """SQL predicate for hand-set metadata (``meta set`` or legacy hand SQL)."""
-    return "(metadata_source LIKE 'manual:%' OR metadata_source LIKE '%manual%')"
+    return (
+        "((metadata_source LIKE 'manual:%' OR metadata_source LIKE '%manual%') "
+        "AND metadata_source NOT LIKE 'bib:%')"
+    )
+
+
+def bib_condition() -> str:
+    """SQL predicate for metadata pulled from a .bib (``link pull``)."""
+    return "(metadata_source LIKE 'bib:%')"
 
 
 def enriched_condition() -> str:
@@ -153,6 +164,8 @@ def build_filter_query(
                 conditions.append(miss_condition())
             elif p == "manual-metadata":
                 conditions.append(manual_condition())
+            elif p == "bib-metadata":
+                conditions.append(bib_condition())
 
     if has_errors:
         conditions.append("error_count > 0")
@@ -239,6 +252,7 @@ def pending_counts(
         "enrich_misses": miss_condition(),
         "metadata_suspect": "metadata_suspect = 1",
         "manual_metadata": manual_condition(),
+        "bib_metadata": bib_condition(),
         "needs_layout_title": layout_pending_condition(),
         "layout_titled": "(title_from_layout IS NOT NULL AND title_from_layout != '')",
         # Nothing to show but the filename.

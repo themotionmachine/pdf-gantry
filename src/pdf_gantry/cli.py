@@ -119,7 +119,7 @@ def filter_options(f):
     @click.option("--is", "is_prop", multiple=True,
                   type=click.Choice([
                       "scanned", "digital", "suspicious", "broken", "metadata-suspect",
-                      "encrypted", "enrich-miss", "manual-metadata",
+                      "encrypted", "enrich-miss", "manual-metadata", "bib-metadata",
                   ]),
                   help="Filter by document type")
     @click.option("--stale-embeddings", is_flag=True,
@@ -1569,8 +1569,13 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
 
     With no filters, enriches papers never attempted. A provider miss is
     recorded as metadata_source 'none:<provider>' and is not retried unless
-    --retry-misses is given. Metadata set with `gantry meta set` is never
-    overwritten; `gantry meta clear` releases it.
+    --retry-misses is given. Metadata set with `gantry meta set` or pulled with
+    `gantry link pull` is never overwritten; `gantry meta clear` releases it.
+
+    The title search queries with the layout title when one exists. With
+    --retry-misses a title hit must also be in the document and resemble the
+    layout title (similarity >= 0.75), or the paper stays a miss. JSON
+    titled_ids lists papers that gained a title, for re-embedding.
     """
     cfg = ctx.obj["config"]
     use_json = json_output or ctx.obj["json"]
@@ -1665,7 +1670,7 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         stats = enrich_documents(
             conn, paper_ids=paper_ids, limit=limit,
             progress_callback=on_progress,
-            provider=provider, mailto=mailto,
+            provider=provider, mailto=mailto, retry_misses=retry_misses,
         )
     finally:
         if progress_bar:
@@ -1683,6 +1688,9 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             "matched": stats.matched,
             "suspect": stats.suspect,
             "skipped_manual": stats.skipped_manual,
+            "skipped_bib": stats.skipped_bib,
+            "rejected_title": stats.rejected_title,
+            "titled_ids": stats.titled_ids,
             "not_found": not_found,
             "elapsed_seconds": stats.elapsed_seconds,
         }, indent=2))
@@ -1696,6 +1704,14 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
         click.echo(f"  No match found: {format_count(stats.no_match)}")
         if stats.skipped_manual:
             click.echo(f"  Skipped (manual metadata): {format_count(stats.skipped_manual)}")
+        if stats.skipped_bib:
+            click.echo(f"  Skipped (bib metadata): {format_count(stats.skipped_bib)}")
+        if stats.rejected_title:
+            click.echo(f"  Title hits rejected: {format_count(stats.rejected_title)}")
+        if stats.titled_ids:
+            ids_str = ",".join(str(i) for i in stats.titled_ids)
+            click.echo(f"  Newly titled: {len(stats.titled_ids)} "
+                       f"(re-embed: gantry embed --chunk --ids {ids_str} --force)")
         if not_found:
             click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
         if stats.api_errors:
@@ -3518,6 +3534,261 @@ def check(ctx, bib_path, do_apply, include_uncertain, force, threshold, json_out
             click.echo(
                 f"\n  To apply: gantry link check {bib_path} --apply"
             )
+
+
+def _load_bib(ctx, cfg, bib_path, use_json):
+    """Parsed entries and the bib path, or None after reporting the failure."""
+    bib_path = bib_path or cfg.bib_path
+    if bib_path is None:
+        _fail(ctx, "No .bib file specified. Pass a path or set bib_path in config.", use_json)
+        return None, None
+    from .link import parse_bib_file
+    entries = parse_bib_file(Path(bib_path))
+    if not entries:
+        _fail(ctx, f"No entries found in {bib_path}", use_json)
+        return None, None
+    return entries, Path(bib_path)
+
+
+def _bib_arg(f):
+    return click.argument(
+        "bib_path", required=False, type=click.Path(exists=True, path_type=Path),
+    )(f)
+
+
+@link.command()
+@_bib_arg
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Assign the top suggestion to the papers named by --ids")
+@click.option("--ids", default=None, help="Paper IDs to assign (required with --apply)")
+@click.option("--dry-run", is_flag=True, help="With --apply: report, write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def suggest(ctx, bib_path, do_apply, ids, dry_run, json_output):
+    """Suggest citekeys for papers with no citekey and no title.
+
+    A pair passes if the layout title resembles the bib title and the bib title
+    is in the document, or the filename has the first author's surname and the
+    year and the title is in the document's head. Layout titles are unverified,
+    so review before assigning: chapter/book and draft/final siblings are the
+    known false accepts, listed under alternates. Tiers: strong, title, weak
+    (low-confidence layout title), filename.
+
+    \b
+    Examples:
+      gantry link suggest prime.bib --json
+      gantry link suggest prime.bib --apply --ids 12,40
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if do_apply and ids is None:
+        raise click.UsageError("--apply needs --ids: assignment is per reviewed paper.", ctx=ctx)
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    entries, bib_path = _load_bib(ctx, cfg, bib_path, use_json)
+    if entries is None:
+        return
+
+    from .bibsync import apply_suggestions, suggest_links
+
+    conn = get_connection(cfg.db_path)
+    if do_apply:
+        found, not_found = resolve_ids(conn, paper_ids)
+        result = apply_suggestions(conn, entries, found, dry_run=dry_run)
+        conn.close()
+        result["not_found"] = not_found
+        if use_json:
+            click.echo(json.dumps(result, indent=2))
+        else:
+            prefix = "[DRY RUN] " if dry_run else ""
+            for a in result["applied"]:
+                click.echo(f"{prefix}[{a['id']}] @{a['citekey']} ({a['tier']})")
+            for r in result["refused"]:
+                click.echo(f"  refused [{r['id']}] @{r['citekey']}: "
+                           f"taken by paper {r['taken_by']}")
+            if result["no_suggestion"]:
+                ids_str = ", ".join(str(i) for i in result["no_suggestion"])
+                click.echo(f"  No suggestion: {ids_str}")
+            if not_found:
+                click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
+        if result["refused"] or result["no_suggestion"] or not_found:
+            ctx.exit(EXIT_PARTIAL if result["applied"] else EXIT_ERROR)
+        return
+
+    report = suggest_links(conn, entries, paper_ids=paper_ids)
+    conn.close()
+    report["bib_path"] = str(bib_path)
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        click.echo(f"{report['suggested']} of {report['papers_considered']} papers have a "
+                   f"candidate; {report['ambiguous']} ambiguous, "
+                   f"{report['citekey_taken']} with the key already taken")
+        for s in report["suggestions"]:
+            flags = "".join([
+                " AMBIGUOUS" if s["ambiguous"] else "",
+                f" TAKEN by {s['citekey_taken_by']}" if s["citekey_taken_by"] else "",
+            ])
+            click.echo(f"  [{s['id']}] {s['tier']} @{s['citekey']}{flags}")
+            click.echo(f"      file: {s['filename']}")
+            click.echo(f"      bib:  {s['bib_title']}")
+    if not report["suggestions"]:
+        ctx.exit(EXIT_NO_RESULTS)
+
+
+@link.command()
+@_bib_arg
+@click.option("--clear", "do_clear", is_flag=True,
+              help="Remove the citekeys of the flagged papers named by --ids")
+@click.option("--ids", default=None, help="Paper IDs to clear (required with --clear)")
+@click.option("--dry-run", is_flag=True, help="With --clear: report, write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def audit(ctx, bib_path, do_clear, ids, dry_run, json_output):
+    """Find linked papers whose document contradicts their bib entry.
+
+    Flags papers whose bib title is not in the document while the stored title
+    or a high-confidence layout title is. A layout title is always in its own
+    document, so basis 'layout' is the weakest evidence; check those by hand.
+    --clear removes the named citekeys and appends the old values to
+    citekey-clears.jsonl in the index directory.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if do_clear and ids is None:
+        raise click.UsageError("--clear needs --ids: removal is per reviewed paper.", ctx=ctx)
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    entries, bib_path = _load_bib(ctx, cfg, bib_path, use_json)
+    if entries is None:
+        return
+
+    from .bibsync import audit_links, clear_audited
+
+    conn = get_connection(cfg.db_path)
+    if do_clear:
+        found, not_found = resolve_ids(conn, paper_ids)
+        result = clear_audited(conn, entries, found, cfg.index_dir / "citekey-clears.jsonl",
+                               dry_run=dry_run)
+        conn.close()
+        result["not_found"] = not_found
+        if use_json:
+            click.echo(json.dumps(result, indent=2))
+        else:
+            prefix = "[DRY RUN] " if dry_run else ""
+            for c in result["cleared"]:
+                click.echo(f"{prefix}[{c['id']}] cleared @{c['citekey']}")
+            if result["not_flagged"]:
+                ids_str = ", ".join(str(i) for i in result["not_flagged"])
+                click.echo(f"  Not flagged, left alone: {ids_str}")
+            if not dry_run and result["cleared"]:
+                click.echo(f"  Old keys logged to {result['log_path']}")
+        if result["not_flagged"] or not_found:
+            ctx.exit(EXIT_PARTIAL if result["cleared"] else EXIT_ERROR)
+        return
+
+    report = audit_links(conn, entries)
+    conn.close()
+    report["bib_path"] = str(bib_path)
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        click.echo(f"{report['count']} of {report['checked']} linked papers flagged")
+        for f in report["flagged"]:
+            click.echo(f"  [{f['id']}] @{f['citekey']} ({f['citekey_source']}, "
+                       f"basis {f['basis']})")
+            click.echo(f"      bib:   {f['bib_title']}")
+            click.echo(f"      paper: {f['stored_title'] or f['layout_title']}")
+    if not report["flagged"]:
+        ctx.exit(EXIT_NO_RESULTS)
+
+
+@link.command()
+@_bib_arg
+@click.option("--ids", default=None, help="Comma-separated paper IDs (default: all linked)")
+@click.option("--dry-run", is_flag=True, help="Report the changes, write nothing")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def pull(ctx, bib_path, ids, dry_run, json_output):
+    """Copy title, authors, year, doi and abstract from the bib to linked papers.
+
+    Precedence is hand-set > bib > provider > layout. Hand-set rows are skipped;
+    other rows are filled or replaced only when the bib title is in the document;
+    a field the entry lacks is left alone. Rows get metadata_source 'bib:<stem>',
+    which enrich never overwrites. JSON newly_titled_ids lists papers to
+    re-embed, since chunks carry the title.
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    paper_ids = parse_ids_option(ctx, ids, use_json, "--ids")
+    entries, bib_path = _load_bib(ctx, cfg, bib_path, use_json)
+    if entries is None:
+        return
+
+    from .bibsync import pull_metadata
+
+    conn = get_connection(cfg.db_path)
+    not_found: list[int] = []
+    if paper_ids is not None:
+        paper_ids, not_found = resolve_ids(conn, paper_ids)
+    report = pull_metadata(conn, entries, bib_path.stem, paper_ids=paper_ids, dry_run=dry_run)
+    conn.close()
+    report["bib_path"] = str(bib_path)
+    report["not_found"] = not_found
+
+    if use_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        skipped = report["skipped"]
+        click.echo(f"{prefix}{len(report['updated_ids'])} of {report['considered']} papers "
+                   f"updated from {report['metadata_source']}; "
+                   f"{len(report['newly_titled_ids'])} newly titled")
+        click.echo("  Skipped: " + ", ".join(f"{k} {len(v)}" for k, v in skipped.items()))
+        if skipped["unverified"]:
+            click.echo("  Unverified rows: bib title not in document (see gantry link audit)")
+        if report["newly_titled_ids"]:
+            ids_str = ",".join(str(i) for i in report["newly_titled_ids"])
+            click.echo(f"  Re-embed: gantry embed --chunk --ids {ids_str} --force")
+    if not_found:
+        ctx.exit(EXIT_PARTIAL)
+
+
+@link.command()
+@_bib_arg
+@click.option("--format", "out_format", type=click.Choice(["text", "tsv"]), default="text",
+              help="Output format (--json overrides)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def missing(ctx, bib_path, out_format, json_output):
+    """List bib entries with no paper, by citekey, file= basename or doi."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    entries, bib_path = _load_bib(ctx, cfg, bib_path, use_json)
+    if entries is None:
+        return
+
+    from .bibsync import missing_entries
+
+    conn = get_connection(cfg.db_path)
+    rows = missing_entries(conn, entries)
+    conn.close()
+
+    columns = ("citekey", "type", "year", "author", "title", "doi")
+    if use_json:
+        click.echo(json.dumps({
+            "bib_path": str(bib_path), "total_entries": len(entries),
+            "count": len(rows), "entries": rows,
+        }, indent=2))
+    elif out_format == "tsv":
+        click.echo("\t".join(columns))
+        for r in rows:
+            cells = ("" if r[c] is None else " ".join(str(r[c]).split()) for c in columns)
+            click.echo("\t".join(cells))
+    else:
+        click.echo(f"{len(rows)} of {len(entries)} bib entries have no paper")
+        for r in rows:
+            click.echo(f"  @{r['citekey']} ({r['year'] or 'n.d.'}) {r['title'] or ''}")
+    if not rows:
+        ctx.exit(EXIT_NO_RESULTS)
 
 
 @link.command()
