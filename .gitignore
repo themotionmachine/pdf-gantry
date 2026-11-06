@@ -46,3 +46,6 @@ pdf-gantry-prd.md
 
 # uv lockfile (not tracked in this repo)
 uv.lock
+
+# Local validation data (DB copy for dry runs)
+.scratch/
