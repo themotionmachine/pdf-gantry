@@ -12,6 +12,40 @@ def run_pipeline(
     conn: sqlite3.Connection,
     papers_dir: Path,
     db_path: Path,
+    *,
+    dry_run: bool = False,
+    **options,
+) -> dict:
+    """Run the pipeline stages, then bring collection keys up to date.
+
+    Takes the keywords ``_run_stages`` documents. The refresh sits out here so
+    no early return in a stage can skip it. Stats gain ``collections`` when a
+    collections.db exists; a refresh failure lands there as ``{"error": ...}``.
+    """
+    stats = _run_stages(conn, papers_dir, db_path, dry_run=dry_run, **options)
+    if not dry_run and "error" not in stats:
+        _refresh_collections(conn, papers_dir, db_path, stats)
+    return stats
+
+
+def _refresh_collections(
+    conn: sqlite3.Connection, papers_dir: Path, db_path: Path, stats: dict
+) -> None:
+    try:
+        from .collections import refresh_if_present
+
+        result = refresh_if_present(Path(db_path).parent, conn, papers_dir)
+    except Exception as e:  # collections must never fail the pipeline
+        stats["collections"] = {"error": str(e)}
+        return
+    if result is not None:
+        stats["collections"] = result
+
+
+def _run_stages(
+    conn: sqlite3.Connection,
+    papers_dir: Path,
+    db_path: Path,
     workers: int = 1,
     limit: int | None = None,
     dry_run: bool = False,

@@ -35,3 +35,10 @@ def test_httpx_is_a_core_dependency():
 def test_openalex_module_imports():
     """The default-path provider module must import on a core install."""
     import pdf_gantry.openalex  # noqa: F401
+
+
+def test_embeddings_extra_caps_transformers_below_5():
+    """Nomic Embed V2 fails to load on transformers 5.x, so the extra must cap it."""
+    extras = tomllib.loads(PYPROJECT.read_text())["project"]["optional-dependencies"]
+    specs = [s.replace(" ", "") for s in extras["embeddings"]]
+    assert any(s.startswith("transformers") and "<5" in s for s in specs)
