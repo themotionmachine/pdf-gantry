@@ -1685,6 +1685,7 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             "matched_by_title": stats.matched_by_title,
             "no_match": stats.no_match,
             "api_errors": stats.api_errors,
+            "rate_limited": stats.rate_limited,
             "matched": stats.matched,
             "suspect": stats.suspect,
             "skipped_manual": stats.skipped_manual,
@@ -1716,6 +1717,13 @@ def enrich(ctx, needs, has_prop, is_prop, stale_embeddings, provider, mailto,
             click.echo(f"  Not in index: {', '.join(str(i) for i in not_found)}")
         if stats.api_errors:
             click.echo(f"  API errors: {format_count(stats.api_errors)}")
+        if stats.rate_limited:
+            click.echo("  Stopped: provider rate limit reached. Unattempted papers "
+                       "were left as they were. Set openalex_api_key for a "
+                       "separate budget.")
+
+    if stats.rate_limited:
+        ctx.exit(EXIT_PARTIAL)
 
 
 # --- verify ---
