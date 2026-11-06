@@ -168,10 +168,10 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | 2 | ran fine, no results |
   | 3 | partial failure (some documents succeeded, or some requested IDs/indices were missing) |
   | 4 | database error |
-  | 64 | usage error: unknown option or command, bad choice, missing argument |
+  | 64 | usage error: unknown option or command, bad choice, missing argument, unknown collection |
 
   An agent can branch on "no results" without parsing anything. A typo is never exit 2: usage errors exit 64, and when `--json` appears anywhere on the command line they print `{"error": "...", "usage": "...", "exit_code": 64}` on stdout.
-- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`. Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
+- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`; a refused `collection` write adds a stable `code` (`name_conflict`, `already_undone`, `undo_conflict`, `unknown_batch`). Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
 
   | Command | Envelope |
   |---------|----------|
@@ -185,6 +185,9 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | `queue` | `{count, documents: [...]}` |
   | `errors` | `{count, errors: [...]}` |
   | `schema` | `{schema_version, database, tables, views, relationships, common_joins}` |
+  | `collection show` | `{collection: {id, name, note, created_by, created_at}, ids, members: [{id, filename, title, display_title, citekey, added_by, added_at, why, batch_id, …}], missing, ambiguous}` |
+  | `collection list` | `{count, collections: [{id, name, note, count, resolved, missing, ambiguous, …}]}` |
+  | `collection history` | `{count, history: [{batch_id, op, by, why, at, count, undone, collection, …}]}` |
 - **State is queryable.** Processing status lives in boolean columns (`has_text`, `has_embeddings`, `needs_ocr`), so `gantry queue --needs embeddings` answers "what work is left?" in one call.
 
 If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, `gantry find "<title or author>"` for a known paper, and `gantry read <id> --index <a-b>` (or `--chunk <chunk_id> --context 2000`) to read passages. Exit code 2 means no results; 64 means the command itself was malformed."*
@@ -254,7 +257,7 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 
 | Command | Description |
 |---------|-------------|
-| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--queries-file PATH\|-` runs many queries with one model load |
+| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--collection NAME` scopes it to a collection (both together give the intersection; an unknown name exits 64); `--queries-file PATH\|-` runs many queries with one model load |
 | `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only`, `--format oneline`, `--restrict-to-ids` and `--queries-file` |
 | `gantry find <words>` | Known-item lookup over title, authors, year, citekey, DOI and filename: `find "Mind games"`, `find "Zhang 2022"`, `find "Flew & Martin"`. Every word must match some field; title matches rank first; each result reports `matched_fields`. `--ids-only` for piping |
 | `gantry read <id>` | Read a document's text, list its chunks (`--chunks`), read chunks by per-paper position (`--index 28-41`), or read one chunk by `chunk_id` (`--chunk`, which must belong to that paper) and expand it with `--context` |
@@ -265,6 +268,32 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 `<id>` in `read` and `info` accepts a paper ID, a filename, or a citekey (with or without `@`).
 
 **Raw SQL.** If you query `~/.gantry/index.db` directly, use the views `v_papers` and `v_chunks`. Both are keyed by `paper_id` (the underlying `chunks` table calls it `doc_id`, and a chunk's key is `chunk_id`, not `id`). `v_chunks` exposes `paper_id, chunk_id, chunk_index, section_header, page_start, text, char_offset`. Full text lives in `paper_text.raw_text` / `paper_text.markdown`. `gantry schema` prints all of this.
+
+### Collections
+
+A collection is a hand-curated set of papers. Agents can make them freely: every write names who made it (`--by`), gets a batch ID, and can be undone.
+
+| Command | Description |
+|---------|-------------|
+| `gantry collection create <name>` | New empty collection. `--note`, `--by`. Names are unique among live collections, ignoring case |
+| `gantry collection add <name> --ids <ids\|->` | Add papers. `--by`, `--why`. `-` reads IDs from stdin, so `search --ids-only` pipes straight in. Adding a member again is a no-op reported in `already_present` |
+| `gantry collection remove <name> --ids <ids\|->` | Remove papers. `--by`. Keeps a tombstone |
+| `gantry collection show <name>` | Members with who added them and why. `--ids-only` prints bare IDs and sends any missing count to stderr. Exit 2 when empty, 3 when members are missing or ambiguous |
+| `gantry collection list` | Collections with their counts |
+| `gantry collection rename <name> <new>` | Rename. `--by` |
+| `gantry collection delete <name>` | Delete. `--by`. Keeps a tombstone, members included |
+| `gantry collection undo <batch>` | Reverse one batch, and only what it did. `--by`. A membership re-added since is left alone and listed in `skipped` (exit 3). A taken name, or a collection renamed or filled since, refuses the undo (exit 1). Undoing twice is an error |
+| `gantry collection history [<name>]` | One row per batch, newest first. `--limit` |
+
+```bash
+gantry collection create governance --by claude
+gantry search "platform governance" --ids-only \
+  | gantry collection add governance --ids - --by claude --why "for chapter 3"
+gantry search "appeals" --collection governance
+gantry collection show governance --ids-only | gantry grep "oversight board" --ids -
+```
+
+Collections live in `collections.db` beside the index, mode 0600, and that file is the only thing these commands write. Paper IDs are not stable: renaming a file gives it a new ID. So a member is stored as file hash plus path and matched back to the index on each read: hash and path, then hash, then path. Where the papers directory is reachable, a row whose file is gone loses to one whose file exists, so the row a rename left behind yields to the new one. A member matching nothing is reported as `missing` and kept, because the paper may come back. One matching several rows equally well is reported as `ambiguous`. `gantry pipeline` writes moved keys back as its last step.
 
 ### Index management
 
