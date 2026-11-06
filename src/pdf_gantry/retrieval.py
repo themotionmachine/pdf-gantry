@@ -16,11 +16,12 @@ from dataclasses import dataclass, field
 
 from . import search as _search
 from .models import SearchResult
-from .utils import parse_authors
+from .utils import parse_authors, resolve_title
 
 # Result keys an agent can ask for with --fields. Order is the JSON key order.
 BASE_RESULT_FIELDS = (
-    "id", "filename", "path", "title", "year", "authors", "citekey",
+    "id", "filename", "path", "title", "display_title", "title_source",
+    "title_layout_confidence", "year", "authors", "citekey",
     "score", "snippet", "has_markdown", "has_embeddings",
 )
 COMPONENT_FIELDS = ("score_fts", "score_vector", "rank_fts", "rank_vector")
@@ -28,7 +29,8 @@ SEARCH_RESULT_FIELDS = BASE_RESULT_FIELDS + COMPONENT_FIELDS
 SEMANTIC_RESULT_FIELDS = BASE_RESULT_FIELDS
 # ``gantry info`` paper keys (chunks/top_chunk appear with --chunks/--query).
 INFO_FIELDS = (
-    "id", "filename", "path", "title", "authors", "year", "doi", "abstract",
+    "id", "filename", "path", "title", "display_title", "title_source",
+    "title_layout_confidence", "authors", "year", "doi", "abstract",
     "snippet", "page_count", "has_text", "has_markdown", "has_embeddings",
     "has_chunk_embeddings", "is_scanned", "error_count", "citekey",
     "citekey_source", "chunks", "top_chunk",
@@ -166,12 +168,15 @@ def paper_meta(conn: sqlite3.Connection, ids: list[int]) -> dict[int, dict]:
         return {}
     placeholders = ",".join("?" * len(ids))
     rows = conn.execute(
-        f"SELECT id, title, year, authors, citekey FROM papers WHERE id IN ({placeholders})",
+        "SELECT id, title, title_from_layout, title_layout_confidence, year, authors, "
+        f"citekey FROM papers WHERE id IN ({placeholders})",
         ids,
     ).fetchall()
     return {
         row["id"]: {
             "title": row["title"],
+            "title_from_layout": row["title_from_layout"],
+            "title_layout_confidence": row["title_layout_confidence"],
             "year": row["year"],
             "authors": parse_authors(row["authors"]),
             "citekey": row["citekey"],
@@ -182,11 +187,18 @@ def paper_meta(conn: sqlite3.Connection, ids: list[int]) -> dict[int, dict]:
 
 def result_dict(r: SearchResult, meta: dict[int, dict], *, components: bool = False) -> dict:
     m = meta.get(r.id, {})
+    title = m.get("title", r.title)
+    shown, source = resolve_title(title, m.get("title_from_layout"), r.filename)
     d = {
         "id": r.id,
         "filename": r.filename,
         "path": r.path,
-        "title": m.get("title", r.title),
+        "title": title,
+        "display_title": shown,
+        "title_source": source,
+        "title_layout_confidence": (
+            m.get("title_layout_confidence") if source == "layout" else None
+        ),
         "year": m.get("year"),
         "authors": m.get("authors", []),
         "citekey": m.get("citekey"),
@@ -232,12 +244,13 @@ def _clean_cell(value) -> str:
 
 
 def display_title(r: SearchResult, meta: dict[int, dict]) -> str:
-    title = meta.get(r.id, {}).get("title", r.title)
-    return _clean_cell(title) or r.filename
+    m = meta.get(r.id, {})
+    shown, _ = resolve_title(m.get("title", r.title), m.get("title_from_layout"), r.filename)
+    return _clean_cell(shown) or r.filename
 
 
 def oneline(r: SearchResult, meta: dict[int, dict], index: int | None = None) -> str:
-    """``id<TAB>score<TAB>year<TAB>citekey<TAB>title`` (title falls back to filename).
+    """``id<TAB>score<TAB>year<TAB>citekey<TAB>title`` (title falls back to layout, then filename).
 
     With ``index``, the line is prefixed by ``index<TAB>`` (multi-query).
     """

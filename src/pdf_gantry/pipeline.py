@@ -44,6 +44,7 @@ def run_pipeline(
         "enriched": 0,
         "embedded": 0,
         "errors": 0,
+        "layout_titled": 0,
         "new_files": [],
     }
 
@@ -114,6 +115,7 @@ def run_pipeline(
             )
             stats["processed"] = proc_stats.succeeded
             stats["errors"] += proc_stats.failed
+            stats["layout_titled"] = proc_stats.layout_titled
     else:
         # Get unprocessed papers (skip quarantined — see queue.quarantine_condition
         # — and encrypted papers, which classify_document() reports as "digital"
@@ -138,6 +140,7 @@ def run_pipeline(
             )
             stats["processed"] = proc_stats.succeeded
             stats["errors"] += proc_stats.failed
+            stats["layout_titled"] = proc_stats.layout_titled
 
     # --- Stage 2b: Enrich (before embed, so titles reach the vectors) ---
     if enrich:

@@ -2,6 +2,7 @@
 
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import bibtexparser
 
 _CITEKEY_CLEAN_RE = re.compile(r"[^a-z0-9]")
+_YEAR_RE = re.compile(r"\d{4}")
 
 
 @dataclass
@@ -20,6 +22,7 @@ class BibEntry:
     year: int | None
     doi: str | None
     file: str | None
+    abstract: str | None = None
 
 
 @dataclass
@@ -49,19 +52,46 @@ class LinkStats:
 
 
 _LATEX_CMD_RE = re.compile(r'\\[a-zA-Z]+\s*')
-_LATEX_ACCENT_RE = re.compile(r"""\\["'^`~=.uvHtcdbkr]\s*""")
-_LATEX_SYMBOL_RE = re.compile(r"\\&")
 _BRACES_RE = re.compile(r"[{}]")
 _MULTI_SPACE_RE = re.compile(r"\s+")
-_DOI_PREFIX_RE = re.compile(r"^https?://(doi\.org|dx\.doi\.org)/", re.IGNORECASE)
+_DOI_PREFIX_RE = re.compile(r"^(https?://(www\.)?(doi\.org|dx\.doi\.org)/|doi:\s*)", re.I)
+
+# Letter accents (\v, \c, ...) need the negative lookahead: without it, the
+# "\t" of \textit reads as a tie accent and leaves "extit".
+_LATEX_ACCENT_RE = re.compile(
+    r"""\\(?:(["'^`~=.])|([uvHcdbkr])(?![a-zA-Z]))\s*\{?\s*\\?([a-zA-Z])\}?"""
+)
+_COMBINING = {
+    "'": "\u0301", "`": "\u0300", "^": "\u0302", '"': "\u0308", "~": "\u0303",
+    "=": "\u0304", ".": "\u0307", "u": "\u0306", "v": "\u030c", "H": "\u030b",
+    "c": "\u0327", "d": "\u0323", "b": "\u0331", "k": "\u0328", "r": "\u030a",
+}
+_LATEX_LETTERS = {
+    "ss": "ß", "ae": "æ", "AE": "Æ", "oe": "œ", "OE": "Œ", "aa": "å", "AA": "Å",
+    "o": "ø", "O": "Ø", "l": "ł", "L": "Ł",
+}
+_LATEX_LETTER_RE = re.compile(r"\\(" + "|".join(_LATEX_LETTERS) + r")(?![a-zA-Z])\s*")
+_LATEX_ESCAPE_RE = re.compile(r"\\([&%$#_])")
+_CITATION_TAG_RE = re.compile(r"^\s*\[[A-Z]\]\s*")  # "[C] Title" reference-manager tags
 
 
-def _strip_latex(text: str) -> str:
-    text = _LATEX_SYMBOL_RE.sub("&", text)
-    text = _LATEX_ACCENT_RE.sub("", text)
+def _accent(m: re.Match) -> str:
+    return m.group(3) + _COMBINING[m.group(1) or m.group(2)]
+
+
+def clean_bib_text(text: str) -> str:
+    """A BibTeX field value as plain text."""
+    text = _LATEX_ACCENT_RE.sub(_accent, text)
+    text = _LATEX_LETTER_RE.sub(lambda m: _LATEX_LETTERS[m.group(1)], text)
+    text = _LATEX_ESCAPE_RE.sub(r"\1", text)
     text = _LATEX_CMD_RE.sub("", text)
     text = _BRACES_RE.sub("", text)
-    return _MULTI_SPACE_RE.sub(" ", text).strip()
+    text = text.replace("``", '"').replace("''", '"').replace("`", "'").replace("~", " ")
+    text = _CITATION_TAG_RE.sub("", text)
+    return unicodedata.normalize("NFC", _MULTI_SPACE_RE.sub(" ", text).strip())
+
+
+_strip_latex = clean_bib_text
 
 
 def normalize_title(title: str) -> str:
@@ -89,10 +119,13 @@ def parse_bib_file(bib_path: Path) -> list[BibEntry]:
     if not bib_path.exists():
         raise FileNotFoundError(f"Bibliography file not found: {bib_path}")
 
-    with open(bib_path) as f:
+    with open(bib_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
 
-    parser = bibtexparser.bparser.BibTexParser(common_strings=True)
+    # Keep biblatex types (@online, @report): they are entries like any other.
+    parser = bibtexparser.bparser.BibTexParser(
+        common_strings=True, ignore_nonstandard_types=False
+    )
     db = bibtexparser.loads(text, parser)
 
     entries = []
@@ -100,11 +133,8 @@ def parse_bib_file(bib_path: Path) -> list[BibEntry]:
         raw_title = e.get("title")
         display_title = _strip_latex(raw_title) if raw_title else None
 
-        year_str = e.get("year", "")
-        try:
-            year = int(year_str)
-        except (ValueError, TypeError):
-            year = None
+        year_match = _YEAR_RE.search(e.get("year") or e.get("date") or "")
+        year = int(year_match.group(0)) if year_match else None
 
         entries.append(BibEntry(
             citekey=e.get("ID", ""),
@@ -114,6 +144,7 @@ def parse_bib_file(bib_path: Path) -> list[BibEntry]:
             year=year,
             doi=e.get("doi"),
             file=e.get("file"),
+            abstract=clean_bib_text(e["abstract"]) if e.get("abstract") else None,
         ))
     return entries
 
@@ -179,9 +210,14 @@ def match_by_title(
 ) -> list[LinkMatch]:
     matches = []
     for paper in papers:
-        if not paper.get("title"):
+        # The layout title is a fallback so an untitled paper can join at all.
+        # It is unverified, so its matches stay "uncertain": they need
+        # --include-uncertain, however exact the string match looks.
+        hint_only = not paper.get("title")
+        title = paper.get("title_from_layout") if hint_only else paper["title"]
+        if not title:
             continue
-        norm_paper = normalize_title(paper["title"])
+        norm_paper = normalize_title(title)
         best_score = 0.0
         best_entry = None
 
@@ -211,6 +247,8 @@ def match_by_title(
                 confidence = "likely"
             elif confidence == "likely":
                 confidence = "certain"
+        if hint_only:
+            confidence = "uncertain"
 
         matches.append(LinkMatch(
             paper_id=paper["id"],
@@ -219,7 +257,7 @@ def match_by_title(
             source="title",
             confidence=confidence,
             score=best_score,
-            paper_title=paper.get("title"),
+            paper_title=title,
             bib_title=best_entry.title,
         ))
     return matches

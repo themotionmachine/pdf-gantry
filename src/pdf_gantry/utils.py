@@ -23,6 +23,20 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def resolve_title(
+    title: str | None, layout_title: str | None, filename: str
+) -> tuple[str, str]:
+    """(text to show, its source): metadata, then the layout hint, then filename.
+
+    ``title`` keeps meaning verified metadata; this is only what to display.
+    """
+    if title and title.strip():
+        return title, "metadata"
+    if layout_title and layout_title.strip():
+        return layout_title, "layout"
+    return filename, "filename"
+
+
 def format_size(size_bytes: int) -> str:
     """Format bytes as human-readable size."""
     for unit in ("B", "KB", "MB", "GB"):

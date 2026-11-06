@@ -6,10 +6,12 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from .fts import refresh_row
 from .queue import (
     MISS_SOURCE_PREFIX,
+    bib_condition,
     enriched_condition,
     manual_condition,
     miss_condition,
@@ -162,8 +164,11 @@ class EnrichStats:
     api_errors: int = 0
     suspect: int = 0
     skipped_manual: int = 0
+    skipped_bib: int = 0
+    rejected_title: int = 0
     matched: int = 0
     elapsed_seconds: float = 0.0
+    titled_ids: list[int] = dataclass_field(default_factory=list)
 
 
 def extract_doi(text: str, head_chars: int = DOI_HEAD_CHARS) -> str | None:
@@ -506,6 +511,23 @@ def _get_provider(provider: str, rate_limit: float, mailto: str | None) -> dict:
     return _openalex_provider(rate_limit, mailto)
 
 
+RESCUE_SIMILARITY = 0.75
+
+
+def _rescue_accepted(
+    provider_title: str | None, layout_title: str | None, raw_text: str
+) -> bool:
+    """Should a retried miss take this title-search hit?
+
+    Both tests are needed. Containment alone passes any work on the same
+    subject; similarity alone trusts a layout title that may be a masthead.
+    """
+    return (
+        title_containment(provider_title, raw_text) >= CONTAINMENT_THRESHOLD
+        and title_similarity(layout_title, provider_title) >= RESCUE_SIMILARITY
+    )
+
+
 def default_enrich_ids(conn: sqlite3.Connection, retry_misses: bool = False) -> list[int]:
     """IDs default ``enrich`` picks up: never attempted (and not hand-set),
     plus earlier provider misses when ``retry_misses``."""
@@ -529,8 +551,16 @@ def enrich_documents(
 
     Default selection (``paper_ids=None``) is papers never attempted; with
     ``retry_misses`` it also re-attempts earlier provider misses. Hand-set
-    metadata (``meta set`` / legacy hand SQL) is never overwritten, even when
-    named in ``paper_ids`` -- clear it with ``meta clear`` first.
+    metadata (``meta set`` / legacy hand SQL) and bib-sourced metadata
+    (``link pull``) are never overwritten, even when named in ``paper_ids`` --
+    clear it with ``meta clear`` first.
+
+    The title tier queries with the layout title when there is one, else the
+    linearized-text guess. With ``retry_misses`` it also requires agreement: a
+    paper retried here has already failed once, and its top search hit is
+    usually a different work, so a hit is taken only if it is in the document
+    and resembles the layout title (see ``_rescue_accepted``). Otherwise the
+    paper stays a miss and nothing is written.
 
     A miss writes ``metadata_source='none:<provider>'``. A lookup that raised
     (network or API error) with no match leaves the paper unstamped so the
@@ -540,13 +570,17 @@ def enrich_documents(
     start = time.time()
     prov = _get_provider(provider, rate_limit, mailto)
 
-    select = """SELECT p.id, p.filename, p.doi, pt.raw_text,
-            CASE WHEN p.metadata_source IS NOT NULL AND {manual}
-                 THEN 1 ELSE 0 END AS is_manual
+    def qualified(condition: str) -> str:
+        return condition.replace("metadata_source", "p.metadata_source")
+
+    select = f"""SELECT p.id, p.filename, p.doi, p.title, p.title_from_layout, pt.raw_text,
+            CASE WHEN p.metadata_source IS NOT NULL AND {qualified(manual_condition())}
+                 THEN 1 ELSE 0 END AS is_manual,
+            CASE WHEN p.metadata_source IS NOT NULL AND {qualified(bib_condition())}
+                 THEN 1 ELSE 0 END AS is_bib,
+            CASE WHEN p.metadata_source LIKE 'none:%' THEN 1 ELSE 0 END AS is_miss
         FROM papers p
-        LEFT JOIN paper_text pt ON pt.paper_id = p.id""".format(
-        manual=manual_condition().replace("metadata_source", "p.metadata_source")
-    )
+        LEFT JOIN paper_text pt ON pt.paper_id = p.id"""
     if paper_ids is not None:
         placeholders = ",".join("?" * len(paper_ids))
         rows = conn.execute(
@@ -562,7 +596,8 @@ def enrich_documents(
 
     manual_rows = [r for r in rows if r["is_manual"]]
     stats.skipped_manual = len(manual_rows)
-    rows = [r for r in rows if not r["is_manual"]]
+    stats.skipped_bib = sum(r["is_bib"] for r in rows)
+    rows = [r for r in rows if not r["is_manual"] and not r["is_bib"]]
 
     if limit:
         rows = rows[:limit]
@@ -579,6 +614,7 @@ def enrich_documents(
 
         metadata = None
         source = None
+        rejected = False
         errors_before = stats.api_errors
 
         # Try DOI first. A scraped doi is a hypothesis, not a fact: it is only
@@ -608,10 +644,17 @@ def enrich_documents(
 
         # Fallback: title search
         if not metadata and raw_text:
-            title_guess = _extract_title_from_text(raw_text, boilerplate)
+            layout_title = row["title_from_layout"]
+            title_guess = layout_title or _extract_title_from_text(raw_text, boilerplate)
             if title_guess:
                 try:
                     metadata = prov["by_title"](title_guess)
+                    if metadata and retry_misses and not _rescue_accepted(
+                        metadata.get("title"), layout_title, raw_text
+                    ):
+                        metadata = None
+                        rejected = True
+                        stats.rejected_title += 1
                     if metadata:
                         source = prov["title_source"]
                         stats.matched_by_title += 1
@@ -676,12 +719,16 @@ def enrich_documents(
             # Title/authors/abstract are indexed: keep keyword search current.
             refresh_row(conn, paper_id)
             stats.matched += 1
+            if metadata.get("title") and not row["title"]:
+                stats.titled_ids.append(paper_id)
             if suspect:
                 stats.suspect += 1
         elif stats.api_errors > errors_before:
             # A lookup raised: the provider never answered, so this is not
             # evidence of a miss. Leave it unstamped for the next run.
             pass
+        elif rejected and row["is_miss"]:
+            stats.no_match += 1  # still a miss, already recorded as one
         else:
             stats.no_match += 1
             # Record the miss explicitly, so "tried and found nothing" is

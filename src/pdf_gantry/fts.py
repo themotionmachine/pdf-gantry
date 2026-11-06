@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 TABLE = "papers_fts"
 TEMP_TABLE = "gantry_fts_rebuild"
 COLUMNS = ("filename", "title", "authors", "abstract", "text_content")
+# The indexed title: metadata when there is any, else the layout hint, so an
+# untitled paper is still findable by its title words.
+TITLE_SQL = "COALESCE(NULLIF(p.title, ''), p.title_from_layout)"
 
 
 def table_ddl(name: str = TABLE, *, if_not_exists: bool = False) -> str:
@@ -71,7 +74,7 @@ def _warn_legacy() -> None:
 def _current_values(conn: sqlite3.Connection, paper_id: int):
     """(filename, title, authors, abstract, text) now, or None if no text row."""
     row = conn.execute(
-        "SELECT p.filename, p.title, p.authors, p.abstract, pt.raw_text "
+        f"SELECT p.filename, {TITLE_SQL}, p.authors, p.abstract, pt.raw_text "
         "FROM papers p JOIN paper_text pt ON pt.paper_id = p.id WHERE p.id = ?",
         (paper_id,),
     ).fetchone()
@@ -82,7 +85,8 @@ def _current_values(conn: sqlite3.Connection, paper_id: int):
 
 def _metadata_values(conn: sqlite3.Connection, paper_id: int):
     row = conn.execute(
-        "SELECT filename, title, authors, abstract FROM papers WHERE id = ?", (paper_id,)
+        f"SELECT p.filename, {TITLE_SQL}, p.authors, p.abstract FROM papers p WHERE p.id = ?",
+        (paper_id,),
     ).fetchone()
     return tuple(v or "" for v in row) if row else ("", "", "", "")
 
@@ -162,7 +166,7 @@ def delete_row(conn: sqlite3.Connection, paper_id: int) -> None:
 
 _POPULATE_SQL = (
     "INSERT INTO {name}(rowid, " + ", ".join(COLUMNS) + ") "
-    "SELECT p.id, COALESCE(p.filename, ''), COALESCE(p.title, ''), "
+    f"SELECT p.id, COALESCE(p.filename, ''), COALESCE({TITLE_SQL}, ''), "
     "COALESCE(p.authors, ''), COALESCE(p.abstract, ''), COALESCE(pt.raw_text, '') "
     "FROM papers p JOIN paper_text pt ON pt.paper_id = p.id"
 )

@@ -8,7 +8,7 @@ import sqlite_vec
 
 from .fts import table_ddl as _fts_table_ddl
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # ---------------------------------------------------------------------------
 # Canonical DDL for tables that are created both by init_schema (fresh DB) and
@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS papers (
     -- Bibliography linking
     citekey TEXT,
     citekey_source TEXT,
+
+    -- Title read from page 1's typography (see layout.py). Deliberately not
+    -- `title`: that column means verified metadata, this one is a best guess
+    -- with no provider or human behind it, so treat it as an unverified hint.
+    -- title_layout_confidence is 'high' when the title stands out from the
+    -- body text by font size, else 'low'. title_layout_at records the attempt,
+    -- so a paper with no result isn't re-opened on every backfill.
+    title_from_layout TEXT,
+    title_layout_confidence TEXT,
+    title_layout_at TEXT,
 
     -- Timestamps
     indexed_at TEXT NOT NULL,
@@ -341,6 +351,18 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (7, now_iso()),
+        )
+        conn.commit()
+        version = 7
+
+    if version < 8:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(papers)").fetchall()}
+        for col in ("title_from_layout", "title_layout_confidence", "title_layout_at"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE papers ADD COLUMN {col} TEXT")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (8, now_iso()),
         )
         conn.commit()
 

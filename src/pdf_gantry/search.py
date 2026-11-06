@@ -474,7 +474,7 @@ def cascade_search(
     return results
 
 
-_FIND_FIELDS = ("title", "authors", "citekey", "year", "doi", "filename")
+_FIND_FIELDS = ("title", "title_from_layout", "authors", "citekey", "year", "doi", "filename")
 _FIND_STOPWORDS = {"&", "and", "et", "al", "etal", "+"}
 _EDGE_PUNCT = " \t.,;:()[]{}\"'`?!"
 _DOI_PREFIXES = ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
@@ -537,9 +537,11 @@ def find_papers(
 
     Ranking: exact/phrase title matches first, then all tokens in the title,
     then all tokens in bibliographic fields (authors/citekey/year), then
-    matches that needed the filename or DOI. Each result carries
-    ``matched_fields``, the fields at least one token matched, in the order
-    title, authors, citekey, year, doi, filename.
+    matches that needed the filename or DOI. The layout title is an unverified
+    hint, so a match on it ranks one tier below the same match on a title.
+    Each result carries ``matched_fields``, the fields at least one token
+    matched, in the order title, title_from_layout, authors, citekey, year,
+    doi, filename.
 
     Pure-DB and done in Python over the papers table (a few thousand short
     rows), which gives Unicode-aware folding that SQLite's LIKE lacks.
@@ -550,7 +552,8 @@ def find_papers(
     phrase = " ".join(_fold(fragment).split())
 
     rows = conn.execute(
-        """SELECT id, filename, path, title, authors, year, doi, page_count,
+        """SELECT id, filename, path, title, title_from_layout,
+                  title_layout_confidence, authors, year, doi, page_count,
                   has_text, has_markdown, has_embeddings, has_chunk_embeddings,
                   is_scanned, citekey
         FROM papers"""
@@ -560,6 +563,7 @@ def find_papers(
     for r in rows:
         fields = {
             "title": _fold(r["title"] or ""),
+            "title_from_layout": _fold(r["title_from_layout"] or ""),
             "authors": _fold(_authors_text(r["authors"])),
             "citekey": _fold(r["citekey"] or ""),
             "doi": _fold(r["doi"] or ""),
@@ -580,9 +584,12 @@ def find_papers(
             title = fields["title"]
             if title and (title == phrase or phrase in title):
                 tier = 0
-            elif all("title" in h for h in per_token):
+            elif all("title" in h for h in per_token) or phrase in fields["title_from_layout"]:
                 tier = 1
-            elif all(h & {"title", "authors", "citekey", "year"} for h in per_token):
+            elif all(
+                h & {"title", "title_from_layout", "authors", "citekey", "year"}
+                for h in per_token
+            ):
                 tier = 2
             else:
                 tier = 3
