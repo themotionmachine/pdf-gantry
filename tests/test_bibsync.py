@@ -323,12 +323,51 @@ def test_pull_fills_an_untitled_paper(db, entries):
     report = bibsync.pull_metadata(db, entries, "prime")
     row = _row(db, 1)
     assert row["title"] == 'Civic Trust in Northern Cities & "Towns"'
-    assert json.loads(row["authors"]) == ["Smith, Jane", "World Bank and Partners", "Café, René"]
+    assert json.loads(row["authors"]) == ["Jane Smith", "World Bank and Partners", "René Café"]
     assert row["year"] == 2020 and row["doi"] == "10.1000/abc"
     assert row["abstract"] == "We study trust."
     assert row["metadata_source"] == "bib:prime" and row["metadata_suspect"] == 0
     assert "T" in row["metadata_enriched_at"] and "T" in row["metadata_verified_at"]
     assert report["newly_titled_ids"] == [1] and report["updated_ids"] == [1]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Smith, Jane", "Jane Smith"),
+    ("Richards, Jr., Robert C.", "Robert C. Richards, Jr."),
+    ("European Commission", "European Commission"),
+    ("Gabriel, Iason, Arianna Manzini", "Gabriel, Iason, Arianna Manzini"),
+])
+def test_given_name_first_matches_stored_author_order(raw, expected):
+    assert bibsync.given_name_first(raw) == expected
+
+
+def test_pull_leaves_authors_alone_when_only_the_bib_order_differs(db, entries):
+    _trust_paper(db)
+    _set(db, 1, authors=json.dumps(["Jane Smith", "World Bank and Partners", "René Café"]))
+    report = bibsync.pull_metadata(db, entries, "prime", dry_run=True)
+    assert "authors" not in report["updates"][0]["changes"]
+
+
+def test_pull_keeps_a_doi_printed_in_the_document_head(db, entries):
+    add_paper(db, 1, "t.pdf", text=TRUST_TEXT + "\ndoi:10.2000/printed", citekey="smith2020trust")
+    _set(db, 1, doi="10.2000/printed")
+    bibsync.pull_metadata(db, entries, "prime")
+    assert _row(db, 1)["doi"] == "10.2000/printed"
+
+
+def test_pull_prefers_a_doi_the_document_prints_over_nothing_printed(db, entries):
+    add_paper(db, 1, "t.pdf", text=TRUST_TEXT + "\ndoi:10.1000/abc\nsee 10.2000/cited",
+              citekey="smith2020trust")
+    _set(db, 1, doi="10.2000/cited")
+    bibsync.pull_metadata(db, entries, "prime")
+    assert _row(db, 1)["doi"] == "10.1000/abc"
+
+
+def test_pull_replaces_a_provider_doi_the_document_does_not_print(db, entries):
+    _trust_paper(db)
+    _set(db, 1, doi="10.2000/stray")
+    bibsync.pull_metadata(db, entries, "prime")
+    assert _row(db, 1)["doi"] == "10.1000/abc"
 
 
 def test_pull_reaches_keyword_search(db, entries):

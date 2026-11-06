@@ -51,6 +51,9 @@ def _phrase(text: str | None) -> str:
     return " ".join(_NON_WORD_RE.sub(" ", folded.lower()).split())
 
 
+_NAME_SUFFIX_RE = re.compile(r"(?:Jr|Sr|II|III|IV)\.?", re.I)
+
+
 def split_authors(raw: str | None) -> list[str]:
     """A BibTeX author field as a list of clean names.
 
@@ -373,11 +376,25 @@ def clear_audited(
     return result
 
 
+def given_name_first(name: str) -> str:
+    """A BibTeX name in the "First Last" order stored author lists use.
+
+    Anything that isn't "Last, First" or "Last, Jr., First" is returned as is:
+    a comma-separated list in one name can't be reordered safely.
+    """
+    parts = [p.strip() for p in name.split(",")]
+    if len(parts) == 2 and all(parts):
+        return f"{parts[1]} {parts[0]}"
+    if len(parts) == 3 and all(parts) and _NAME_SUFFIX_RE.fullmatch(parts[1]):
+        return f"{parts[2]} {parts[0]}, {parts[1]}"
+    return name
+
+
 def _entry_values(entry: BibEntry) -> dict:
     """Fields a bib entry can supply, without the ones it lacks."""
     values = {
         "title": entry.title,
-        "authors": split_authors(entry.authors) or None,
+        "authors": [given_name_first(a) for a in split_authors(entry.authors)] or None,
         "year": entry.year,
         "doi": normalize_doi(entry.doi) if entry.doi else None,
         "abstract": entry.abstract,
@@ -385,11 +402,19 @@ def _entry_values(entry: BibEntry) -> dict:
     return {k: v for k, v in values.items() if v}
 
 
+def _printed_doi_wins(old: str, new: str, head: str | None) -> bool:
+    """Whether the document's own front matter backs the stored DOI over the bib's."""
+    text = (head or "").lower()
+    return old.lower() in text and new.lower() not in text
+
+
 def _field_changes(row, values: dict) -> dict:
     changes = {}
     for field, new in values.items():
         old = normalize_authors(row[field]) if field == "authors" else row[field]
-        if field == "doi" and old and normalize_doi(old) == new:
+        if field == "doi" and old and (
+            normalize_doi(old) == new or _printed_doi_wins(old, new, row["head"])
+        ):
             continue
         if old != new:
             changes[field] = {"old": old, "new": new}
