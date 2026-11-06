@@ -80,7 +80,10 @@ def main() -> None:
             misses.append((row["id"], title, entry.title))
 
     n = len(pairs)
-    pct = (lambda a, b: f"{a}/{b} = {a / b:.1%}" if b else "n/a")
+
+    def pct(a, b):
+        return f"{a}/{b} = {a / b:.1%}" if b else "n/a"
+
     print(f"eval pairs: {n} (threshold {args.threshold})")
     print(f"text extractor: {pct(text_ok, n)}")
     print(f"layout title:   {pct(layout_ok, n)} (produced {produced})")

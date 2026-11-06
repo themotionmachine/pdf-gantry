@@ -96,10 +96,13 @@ _CITATION_RE = re.compile(
 )
 _NOT_TITLE_RE = re.compile(
     r"\bauthor\S*\s*:|\b(?:recommended|suggested) citation\b|\bhow to cite\b|"
-    r"\bworking paper series\b|\b(?:scholarly|digital) commons\b", re.I
+    r"\bworking paper series\b|\b(?:scholarly|digital) commons\b|\beditorial board\b",
+    re.I,
 )
 _MASTHEAD_END_RE = re.compile(r"journal homepage|homepage:\s*www", re.I)
 _PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
+_CHAPTER_PREFIX_RE = re.compile(r"^chapter title:\s*", re.I)  # JSTOR chapter covers
+_NUMBERED_CLAUSE_RE = re.compile(r"^\d+\.\s")
 _EDGE_MARKS = " *†‡§¶"
 _AFFIL_MARK_RE = re.compile(r"\s+[a-z](?:,\s?[a-z*]+)*\*?(?=,|$)")
 _INITIAL_RE = re.compile(r"(?:^|\s)[A-Z]\.(?:\s|$)")
@@ -135,7 +138,7 @@ def clean_title(text: str, strip_marks: bool = True) -> str:
     # Letterspaced words are separated by a wider gap than their letters.
     words = [w.replace(" ", "") if _LETTERSPACED_RE.fullmatch(w) else w
              for w in re.split(r"\s{2,}", text.strip())]
-    text = " ".join(" ".join(words).split())
+    text = _CHAPTER_PREFIX_RE.sub("", " ".join(" ".join(words).split()))
     if strip_marks:
         text = text.rstrip(_EDGE_MARKS)
     tokens = text.split()
@@ -325,7 +328,10 @@ def _acceptable(text: str, size: float, body: float) -> bool:
         return False
     if _sentence_like(text) or looks_garbled(text):
         return False
-    if not contrast and (len(text) > NO_CONTRAST_MAX_CHARS or text[:1].islower()):
+    if not contrast and (
+        len(text) > NO_CONTRAST_MAX_CHARS or text[:1].islower()
+        or _NUMBERED_CLAUSE_RE.match(text)
+    ):
         return False
     return not _is_byline(text)
 

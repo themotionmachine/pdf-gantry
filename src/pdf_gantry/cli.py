@@ -25,6 +25,7 @@ from .utils import (
     resolve_identifier,
     resolve_identifiers,
     resolve_ids,
+    resolve_title,
 )
 
 # Exit codes
@@ -76,6 +77,16 @@ def parse_ids_option(ctx, value, use_json, flag_name="--ids"):
             click.echo(msg, err=True)
         ctx.exit(EXIT_ERROR)
         return None  # pragma: no cover - ctx.exit() raises SystemExit
+
+
+def _title_keys(row) -> dict:
+    """Additive display keys for a paper row (a dict or sqlite3.Row)."""
+    shown, source = resolve_title(row["title"], row["title_from_layout"], row["filename"])
+    return {
+        "display_title": shown,
+        "title_source": source,
+        "title_layout_confidence": row["title_layout_confidence"] if source == "layout" else None,
+    }
 
 
 def _print_not_found(label, ids, ids_only):
@@ -2483,6 +2494,7 @@ def find(ctx, fragment, limit, ids_only, json_output):
                     "id": r["id"],
                     "filename": r["filename"],
                     "title": r["title"],
+                    **_title_keys(r),
                     "authors": parse_authors(r.get("authors")),
                     "page_count": r["page_count"],
                     "has_text": bool(r["has_text"]),
@@ -2499,7 +2511,8 @@ def find(ctx, fragment, limit, ids_only, json_output):
         for r in results:
             ck = r.get("citekey")
             ck_str = f" @{ck}" if ck else ""
-            extra = f" — {r['title']}" if r["title"] else ""
+            keys = _title_keys(r)
+            extra = f" — {keys['display_title']}" if keys["title_source"] != "filename" else ""
             yr = f" ({r['year']})" if r.get("year") else ""
             via = ",".join(r["matched_fields"])
             click.echo(f"  [{r['id']:4d}] {r['filename']}{ck_str}{extra}{yr}  [{via}]")
@@ -2567,7 +2580,8 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
 
     placeholders = ",".join("?" * len(paper_ids))
     rows = [] if not paper_ids else conn.execute(
-        f"""SELECT p.id, p.filename, p.path, p.title, p.authors, p.year, p.doi,
+        f"""SELECT p.id, p.filename, p.path, p.title, p.title_from_layout,
+                   p.title_layout_confidence, p.authors, p.year, p.doi,
                    p.abstract, p.has_text, p.has_markdown, p.has_embeddings,
                    p.has_chunk_embeddings, p.page_count, p.is_scanned,
                    p.text_method, p.error_count, p.last_error,
@@ -2648,6 +2662,7 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
             "filename": r["filename"],
             "path": r["path"],
             "title": r["title"],
+            **_title_keys(r),
             "authors": parse_authors(r["authors"]),
             "year": r["year"],
             "doi": r["doi"],
@@ -2704,6 +2719,8 @@ def info(ctx, identifiers, ids, field_list, include_chunks, query, context_chars
             click.echo(f"[{d.get('id')}] {d.get('filename', '?')}")
             if d.get("title"):
                 click.echo(f"  Title: {d['title']}")
+            elif d.get("title_source") == "layout":
+                click.echo(f"  Title: {d['display_title']} (from layout, unverified)")
             if d.get("authors"):
                 click.echo(f"  Authors: {'; '.join(d['authors'])}")
             if d.get("year"):

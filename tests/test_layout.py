@@ -347,3 +347,21 @@ def test_doubled_title_collapses():
 def test_dangling_title_is_low_confidence(tmp_path):
     r = _title(tmp_path, [(120, 20, "Measuring Civic Trust in Cities of the")])
     assert r.confidence == "low"
+
+
+def test_jstor_chapter_prefix_is_stripped():
+    from pdf_gantry.layout import clean_title
+    assert clean_title("Chapter Title: DISCIPLINE, BUT DON'T PUNISH") == (
+        "DISCIPLINE, BUT DON'T PUNISH"
+    )
+
+
+def test_editorial_board_page_is_not_a_title(tmp_path):
+    r = _title(tmp_path, [(60, 24, "Journal of Affairs Editorial Board"),
+                          (120, 18, "Measuring Civic Trust in Cities")])
+    assert r.title == "Measuring Civic Trust in Cities"
+
+
+def test_numbered_clause_without_contrast_is_rejected(tmp_path):
+    path = _pdf(tmp_path, [[(100, 10, "2. Any writing, in whatever language")] + _body(120)])
+    assert extract_layout_title(path).title is None
