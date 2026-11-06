@@ -99,6 +99,13 @@ _NOT_TITLE_RE = re.compile(
     r"\bworking paper series\b|\b(?:scholarly|digital) commons\b|\beditorial board\b",
     re.I,
 )
+# The whole line is a periodical's name: a provider may even hold a record under
+# it, so the enrich rescue gate cannot catch this one downstream.
+_PERIODICAL_RE = re.compile(
+    r"^(?:the\s+)?(?:journal of\s+[\w&,' -]{3,60}"
+    r"|(?:[\w&'-]+\s+){1,5}(?:law review|law journal|journal|quarterly)(?:\s+forum)?)$",
+    re.I,
+)
 _MASTHEAD_END_RE = re.compile(r"journal homepage|homepage:\s*www", re.I)
 _PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
 _CHAPTER_PREFIX_RE = re.compile(r"^chapter title:\s*", re.I)  # JSTOR chapter covers
@@ -275,7 +282,7 @@ def _is_candidate(text: str, boilerplate) -> bool:
         return False
     if _LABEL_RE.match(text) or _DATE_RE.match(text):
         return False
-    if _CITATION_RE.search(text) or _NOT_TITLE_RE.search(text):
+    if _CITATION_RE.search(text) or _NOT_TITLE_RE.search(text) or _PERIODICAL_RE.match(text):
         return False
     if text.count(";") >= 2 or (text[:1].islower() and text.count(",") >= 2):
         return False  # a keyword list

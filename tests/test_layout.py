@@ -339,6 +339,20 @@ def test_footnote_marks_and_private_use_glyphs_are_stripped():
     assert clean_title("A Title Worth Noting ") == "A Title Worth Noting"
 
 
+@pytest.mark.parametrize("line", [
+    "HARVARD LAW REVIEW FORUM", "Yale Law Journal", "Journal of Democracy",
+    "The Political Quarterly",
+])
+def test_bare_periodical_name_is_not_a_title(tmp_path, line):
+    r = _title(tmp_path, [(60, 24, line), (120, 18, "Measuring Civic Trust in Cities")])
+    assert r.title == "Measuring Civic Trust in Cities"
+
+
+def test_title_mentioning_a_journal_survives(tmp_path):
+    r = _title(tmp_path, [(120, 20, "Why the Journal Article Still Matters to Scholars")])
+    assert r.title == "Why the Journal Article Still Matters to Scholars"
+
+
 def test_title_lost_to_an_image_font_keeps_no_leading_punctuation():
     from pdf_gantry.layout import clean_title
     assert clean_title(": Evaluating faithfulness") == "Evaluating faithfulness"
