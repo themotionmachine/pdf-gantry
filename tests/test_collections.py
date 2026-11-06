@@ -428,7 +428,7 @@ def test_add_sees_a_paper_held_under_a_drifted_key_and_refreshes_it(conn, index,
 
 
 def test_add_to_unknown_collection_fails(conn, index):
-    with pytest.raises(coll.UnknownCollection):
+    with pytest.raises(coll.UnknownCollectionError):
         coll.add(conn, index, "nope", [1], "t")
     assert coll.history(conn) == []
 
@@ -485,7 +485,7 @@ def test_remove_takes_every_membership_on_that_paper(conn, index, pdir):
 
 def test_names_are_unique_case_insensitively_among_live_only(conn):
     coll.create(conn, "Reading", by="t")
-    with pytest.raises(coll.NameConflict):
+    with pytest.raises(coll.NameConflictError):
         coll.create(conn, "rEADING", by="t")
     coll.delete(conn, "reading", "t")
     coll.create(conn, "READING", by="t")
@@ -494,9 +494,9 @@ def test_names_are_unique_case_insensitively_among_live_only(conn):
 
 def test_name_uniqueness_folds_beyond_ascii(conn):
     coll.create(conn, "Étude", by="t")
-    with pytest.raises(coll.NameConflict):
+    with pytest.raises(coll.NameConflictError):
         coll.create(conn, "éTUDE", by="t")
-    with pytest.raises(coll.NameConflict):
+    with pytest.raises(coll.NameConflictError):
         coll.create(conn, "Étude", by="t")  # decomposed
 
 
@@ -517,14 +517,14 @@ def test_rename_keeps_the_id_and_members(conn, index):
     out = coll.rename(conn, "c", "d", "t")
     assert out["id"] == made["id"] and out["name"] == "d" and out["old_name"] == "c"
     assert coll.resolve(conn, index, "d")["ids"] == [a]
-    with pytest.raises(coll.UnknownCollection):
+    with pytest.raises(coll.UnknownCollectionError):
         coll.resolve(conn, index, "c")
 
 
 def test_rename_refuses_a_taken_name_but_allows_a_case_change(conn):
     coll.create(conn, "a", by="t")
     coll.create(conn, "b", by="t")
-    with pytest.raises(coll.NameConflict):
+    with pytest.raises(coll.NameConflictError):
         coll.rename(conn, "a", "B", "t")
     assert coll.rename(conn, "a", "A", "t")["name"] == "A"
 
@@ -546,7 +546,7 @@ def test_history_filters_by_name_and_limits(conn):
     assert [h["op"] for h in coll.history(conn, "a")] == ["create"]
     assert [h["op"] for h in coll.history(conn, "b2")] == ["rename", "create"]
     assert len(coll.history(conn, limit=1)) == 1
-    with pytest.raises(coll.UnknownCollection):
+    with pytest.raises(coll.UnknownCollectionError):
         coll.history(conn, "nope")
 
 
@@ -586,13 +586,13 @@ def test_undoing_twice_is_a_clean_error(conn, index):
     batch = seeded(conn, index, a)["batch_id"]
     coll.undo(conn, batch, "t")
     before = len(coll.history(conn))
-    with pytest.raises(coll.AlreadyUndone):
+    with pytest.raises(coll.AlreadyUndoneError):
         coll.undo(conn, batch, "t")
     assert len(coll.history(conn)) == before
 
 
 def test_undo_unknown_batch_is_a_clean_error(conn):
-    with pytest.raises(coll.UnknownBatch):
+    with pytest.raises(coll.UnknownBatchError):
         coll.undo(conn, "nope", "t")
 
 
@@ -654,7 +654,7 @@ def test_undo_delete_brings_back_the_collection_and_members(conn, index):
     a = add_paper(index, "a.pdf", "H")
     seeded(conn, index, a)
     batch = coll.delete(conn, "c", "t")["batch_id"]
-    with pytest.raises(coll.UnknownCollection):
+    with pytest.raises(coll.UnknownCollectionError):
         coll.resolve(conn, index, "c")
     coll.undo(conn, batch, "t")
     assert coll.resolve(conn, index, "c")["ids"] == [a]
@@ -664,7 +664,7 @@ def test_undo_delete_refuses_when_the_name_is_taken(conn, index):
     coll.create(conn, "c", by="t")
     batch = coll.delete(conn, "c", "t")["batch_id"]
     coll.create(conn, "C", by="t")
-    with pytest.raises(coll.UndoConflict):
+    with pytest.raises(coll.UndoConflictError):
         coll.undo(conn, batch, "t")
     assert [h["undone"] for h in coll.history(conn) if h["batch_id"] == batch] == [False]
     assert len(coll.list_collections(conn)) == 1
@@ -681,7 +681,7 @@ def test_undo_rename_refuses_if_the_old_name_was_taken(conn):
     coll.create(conn, "a", by="t")
     batch = coll.rename(conn, "a", "b", "t")["batch_id"]
     coll.create(conn, "a", by="t")
-    with pytest.raises(coll.UndoConflict):
+    with pytest.raises(coll.UndoConflictError):
         coll.undo(conn, batch, "t")
 
 
@@ -689,7 +689,7 @@ def test_undo_rename_refuses_if_renamed_again(conn):
     coll.create(conn, "a", by="t")
     batch = coll.rename(conn, "a", "b", "t")["batch_id"]
     coll.rename(conn, "b", "c", "t")
-    with pytest.raises(coll.UndoConflict):
+    with pytest.raises(coll.UndoConflictError):
         coll.undo(conn, batch, "t")
     assert [c["name"] for c in coll.list_collections(conn)] == ["c"]
 
@@ -705,7 +705,7 @@ def test_undo_create_refuses_to_take_later_members_with_it(conn, index):
     a = add_paper(index, "a.pdf", "H")
     batch = coll.create(conn, "c", by="t")["batch_id"]
     coll.add(conn, index, "c", [a], "t")
-    with pytest.raises(coll.UndoConflict):
+    with pytest.raises(coll.UndoConflictError):
         coll.undo(conn, batch, "t")
     assert coll.resolve(conn, index, "c")["ids"] == [a]
 
@@ -714,7 +714,7 @@ def test_undo_inside_a_deleted_collection_is_refused(conn, index):
     a = add_paper(index, "a.pdf", "H")
     batch = seeded(conn, index, a)["batch_id"]
     coll.delete(conn, "c", "t")
-    with pytest.raises(coll.UndoConflict):
+    with pytest.raises(coll.UndoConflictError):
         coll.undo(conn, batch, "t")
 
 

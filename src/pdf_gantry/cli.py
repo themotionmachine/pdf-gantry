@@ -1,6 +1,8 @@
 """Click CLI entry point and command group."""
 
 import json
+import sqlite3
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -961,13 +963,16 @@ _QUERIES_FILE_OPTION = click.option(
                    "(e.g. id,title,year,authors,citekey)")
 @click.option("--restrict-to-ids", "restrict_to_ids", type=str, default=None,
               help="Comma-separated paper IDs; scope the search to only these papers")
+@click.option("--collection", "collection_name", type=str, default=None,
+              help="Scope the search to this collection's members; with "
+                   "--restrict-to-ids, to the intersection of the two")
 @click.option("--ids-only", "ids_only", is_flag=True,
               help="Emit bare ranked paper IDs, one per line (for piping)")
 @_FORMAT_OPTION
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, components,
-           field_list, restrict_to_ids, ids_only, out_format, json_output):
+           field_list, restrict_to_ids, collection_name, ids_only, out_format, json_output):
     """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only.
 
     JSON 'mode': hybrid | vector_fallback (FTS5 rejected the query, vector
@@ -995,6 +1000,13 @@ def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, compon
     restrict_not_found: list[int] = []
     if restrict_ids is not None:
         restrict_ids, restrict_not_found = resolve_ids(conn, restrict_ids)
+    if collection_name is not None:
+        try:
+            restrict_ids = _restrict_to_collection(
+                ctx, cfg, conn, collection_name, restrict_ids, use_json)
+        except (click.ClickException, click.exceptions.Exit):
+            conn.close()
+            raise
 
     embed = None if fts_only else _cached_embedder(cfg)
     outcomes = []
@@ -2366,6 +2378,8 @@ def pipeline(ctx, files, filename, limit, workers, do_enrich, provider, dry_run,
                 stats[key] += fs.get(key, 0)
             stats["new_files"] += fs.get("new_files", [])
             stats["ids"] += fs.get("ids", [])
+        if "collections" in per_file[-1]:  # the last refresh saw every earlier file
+            stats["collections"] = per_file[-1]["collections"]
         if do_enrich:
             stats["enrich"] = {
                 key: sum(fs.get("enrich", {}).get(key, 0) for fs in per_file)
@@ -3969,3 +3983,340 @@ def append(ctx, bib_path, file_prefix, dry_run, json_output):
         }, indent=2))
     else:
         click.echo(f"Appended {len(assigned)} entries to {bib_path}")
+
+
+# --- collection ---
+
+_IDS_HELP = ("Paper IDs, comma/space/newline separated (search --ids-only output "
+             "works), or '-' to read them from stdin")
+_BY_OPTION = click.option("--by", required=True, help="Who is making this change")
+_JSON_OPTION = click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+
+
+@contextmanager
+def _collection_errors(ctx, use_json):
+    """Yield the collections module; map its failures onto the shared exit codes.
+
+    A bad collection name is bad input, so it exits 64 like any usage error and
+    can never read as "no results". Refusals (a name conflict, a second undo)
+    exit 1 with a stable ``code``.
+    """
+    from . import collections as coll
+
+    def report(payload, code):
+        click.echo(json.dumps(payload) if use_json else payload["error"], err=not use_json)
+        ctx.exit(code)
+
+    try:
+        yield coll
+    except coll.UnknownCollectionError as e:
+        raise click.UsageError(str(e)) from e
+    except coll.CollectionError as e:
+        report({"error": str(e), "code": e.code}, EXIT_ERROR)
+    except sqlite3.Error as e:
+        report({"error": f"Collections database error: {e}"}, EXIT_DB_ERROR)
+
+
+def _collection_exit(ctx, *, done, problems):
+    """Exit 2 if nothing was done, 3 if done with problems, otherwise return."""
+    if problems:
+        ctx.exit(EXIT_PARTIAL if done else EXIT_NO_RESULTS)
+
+
+def _open_index_readonly(ctx, cfg, use_json):
+    """A mode=ro index.db connection: collection commands never write that file."""
+    if not cfg.db_path.exists():
+        _fail(ctx, "No database found. Run 'gantry ingest' first.", use_json)
+    return sqlite3.connect(f"{cfg.db_path.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def _read_ids(ctx, value, use_json):
+    """Parse --ids, reading stdin for '-'. Exit 2 when an empty pipe gave no ids."""
+    if value == "-":
+        value = click.get_text_stream("stdin").read()
+    ids = parse_ids_option(ctx, value, use_json, "--ids")
+    if not ids:
+        msg = "No paper IDs given."
+        click.echo(json.dumps({"error": msg}) if use_json else msg, err=not use_json)
+        ctx.exit(EXIT_NO_RESULTS)
+    return ids
+
+
+def _problem_summary(result):
+    parts = [f"{len(result[key])} {key}" for key in ("missing", "ambiguous") if result[key]]
+    return ", ".join(parts)
+
+
+def _restrict_to_collection(ctx, cfg, index_conn, name, restrict_ids, use_json):
+    """--collection as a --restrict-to-ids value, intersected with any given one."""
+    with _collection_errors(ctx, use_json) as coll:
+        side = coll.connect_readonly(cfg)
+        if side is None:
+            raise coll.UnknownCollectionError(f"Unknown collection: {name}")
+        try:
+            result = coll.resolve(side, index_conn, name, papers_dir=cfg.papers_dir)
+        finally:
+            side.close()
+    if _problem_summary(result):
+        click.echo(f"Collection {name}: not searched: {_problem_summary(result)}", err=True)
+    if restrict_ids is None:
+        return result["ids"]
+    members = set(result["ids"])
+    return [i for i in restrict_ids if i in members]
+
+
+@cli.group()
+def collection():
+    """Hand-curated paper collections, stored in collections.db beside the index.
+
+    Members are tracked by file hash and path, so they survive renames that
+    change a paper's ID. Writes need --by and get a batch ID that `undo`
+    reverses; removing and deleting keep tombstones. Exit 3 means some members
+    or IDs could not be resolved, 64 an unknown collection.
+    """
+
+
+@collection.command("create")
+@click.argument("name")
+@click.option("--note", default=None, help="What this collection is for")
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def collection_create(ctx, name, note, by, json_output):
+    """Create an empty collection. Names are unique ignoring case."""
+    use_json = json_output or ctx.obj["json"]
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(ctx.obj["config"])
+        try:
+            out = coll.create(conn, name, note=note, by=by)
+        finally:
+            conn.close()
+    click.echo(json.dumps(out, indent=2) if use_json
+               else f"Created {out['name']} (batch {out['batch_id']})")
+
+
+@collection.command("add")
+@click.argument("name")
+@click.option("--ids", required=True, help=_IDS_HELP)
+@_BY_OPTION
+@click.option("--why", default=None, help="Why these papers belong here")
+@_JSON_OPTION
+@click.pass_context
+def collection_add(ctx, name, ids, by, why, json_output):
+    """Add papers. Adding a member again changes nothing and is not an error."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    paper_ids = _read_ids(ctx, ids, use_json)
+    index = _open_index_readonly(ctx, cfg, use_json)
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(cfg)
+        try:
+            out = coll.add(conn, index, name, paper_ids, by, why=why, papers_dir=cfg.papers_dir)
+        finally:
+            conn.close()
+            index.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        click.echo(f"Added {len(out['added'])}, already present "
+                   f"{len(out['already_present'])} (batch {out['batch_id']})")
+        _print_not_found("Not in index", out["not_found"], ids_only=False)
+    _collection_exit(ctx, done=out["added"] or out["already_present"],
+                     problems=out["not_found"])
+
+
+@collection.command("remove")
+@click.argument("name")
+@click.option("--ids", required=True, help=_IDS_HELP)
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def collection_remove(ctx, name, ids, by, json_output):
+    """Remove papers, keeping a tombstone so `undo` can restore them."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    paper_ids = _read_ids(ctx, ids, use_json)
+    index = _open_index_readonly(ctx, cfg, use_json)
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(cfg)
+        try:
+            out = coll.remove(conn, name, paper_ids, by, index, papers_dir=cfg.papers_dir)
+        finally:
+            conn.close()
+            index.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        click.echo(f"Removed {len(out['removed'])} (batch {out['batch_id']})")
+        _print_not_found("Not in collection", out["not_found"], ids_only=False)
+        _print_not_found("Ambiguous, not removed", out["ambiguous"], ids_only=False)
+    _collection_exit(ctx, done=out["removed"], problems=out["not_found"] + out["ambiguous"])
+
+
+@collection.command("show")
+@click.argument("name")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare paper IDs, one per line (for piping); problems go to stderr")
+@_JSON_OPTION
+@click.pass_context
+def collection_show(ctx, name, ids_only, json_output):
+    """Show current members. Exit 2 if empty, 3 if any are missing or ambiguous.
+
+    Missing members are never dropped: the paper left the index, and they
+    return if it does. Ambiguous ones match several papers equally well.
+    """
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect_readonly(cfg)
+        if conn is None:
+            raise coll.UnknownCollectionError(f"Unknown collection: {name}")
+        try:
+            index = _open_index_readonly(ctx, cfg, use_json)
+            try:
+                out = coll.resolve(conn, index, name, papers_dir=cfg.papers_dir)
+            finally:
+                index.close()
+        finally:
+            conn.close()
+
+    if ids_only:
+        for pid in out["ids"]:
+            click.echo(pid)
+        if _problem_summary(out):
+            click.echo(_problem_summary(out), err=True)
+    elif use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        c = out["collection"]
+        click.echo(f"{c['name']}: {len(out['ids'])} members" +
+                   (f" ({c['note']})" if c["note"] else ""))
+        for m in out["members"]:
+            ck = f" @{m['citekey']}" if m["citekey"] else ""
+            click.echo(f"  [{m['id']}] {m['display_title']}{ck}")
+        for m in out["missing"]:
+            click.echo(f"  missing: {m['filename']}")
+        for m in out["ambiguous"]:
+            ids_str = ", ".join(str(i) for i in m["candidates"])
+            click.echo(f"  ambiguous: {m['filename']} (could be {ids_str})")
+
+    if out["missing"] or out["ambiguous"]:
+        ctx.exit(EXIT_PARTIAL)
+    if not out["ids"]:
+        ctx.exit(EXIT_NO_RESULTS)
+
+
+@collection.command("list")
+@_JSON_OPTION
+@click.pass_context
+def collection_list(ctx, json_output):
+    """List collections with their member counts."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    rows = []
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect_readonly(cfg)
+        if conn is not None:
+            index = _open_index_readonly(ctx, cfg, use_json) if cfg.db_path.exists() else None
+            try:
+                rows = coll.list_collections(conn, index, papers_dir=cfg.papers_dir)
+            finally:
+                conn.close()
+                if index is not None:
+                    index.close()
+    if use_json:
+        click.echo(json.dumps({"count": len(rows), "collections": rows}, indent=2))
+    else:
+        for c in rows:
+            click.echo(f"{c['name']}\t{c['count']}" + (f"\t{c['note']}" if c["note"] else ""))
+
+
+@collection.command("rename")
+@click.argument("name")
+@click.argument("new_name")
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def collection_rename(ctx, name, new_name, by, json_output):
+    """Rename a collection; its members and history stay with it."""
+    use_json = json_output or ctx.obj["json"]
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(ctx.obj["config"])
+        try:
+            out = coll.rename(conn, name, new_name, by)
+        finally:
+            conn.close()
+    click.echo(json.dumps(out, indent=2) if use_json
+               else f"Renamed {out['old_name']} to {out['name']} (batch {out['batch_id']})")
+
+
+@collection.command("delete")
+@click.argument("name")
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def collection_delete(ctx, name, by, json_output):
+    """Delete a collection, keeping a tombstone so `undo` can bring it back."""
+    use_json = json_output or ctx.obj["json"]
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(ctx.obj["config"])
+        try:
+            out = coll.delete(conn, name, by)
+        finally:
+            conn.close()
+    click.echo(json.dumps(out, indent=2) if use_json
+               else f"Deleted {out['name']} (batch {out['batch_id']})")
+
+
+@collection.command("undo")
+@click.argument("batch")
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def collection_undo(ctx, batch, by, json_output):
+    """Reverse one batch from `history`, and only what it actually did.
+
+    Rows that can no longer be reversed are listed in "skipped" (exit 3). A
+    conflict over the whole collection, such as a taken name, refuses the undo.
+    """
+    use_json = json_output or ctx.obj["json"]
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect(ctx.obj["config"])
+        try:
+            out = coll.undo(conn, batch, by)
+        finally:
+            conn.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        click.echo(f"Undid {out['op']} {out['undone']}: {out['reversed']} reversed, "
+                   f"{len(out['skipped'])} skipped (batch {out['batch_id']})")
+    if out["skipped"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
+@collection.command("history")
+@click.argument("name", required=False)
+@click.option("--limit", type=int, default=50, show_default=True, help="Max batches")
+@_JSON_OPTION
+@click.pass_context
+def collection_history(ctx, name, limit, json_output):
+    """List write batches, newest first, for one collection or all of them."""
+    use_json = json_output or ctx.obj["json"]
+    rows = []
+    with _collection_errors(ctx, use_json) as coll:
+        conn = coll.connect_readonly(ctx.obj["config"])
+        if conn is None and name is not None:
+            raise coll.UnknownCollectionError(f"Unknown collection: {name}")
+        if conn is not None:
+            try:
+                rows = coll.history(conn, name, limit=limit)
+            finally:
+                conn.close()
+    if use_json:
+        click.echo(json.dumps({"count": len(rows), "history": rows}, indent=2))
+    else:
+        for h in rows:
+            flag = " (undone)" if h["undone"] else ""
+            click.echo(f"{h['batch_id']}\t{h['at']}\t{h['op']}\t{h['collection'] or '-'}"
+                       f"\t{h['count']}\t{h['by']}{flag}")

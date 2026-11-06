@@ -84,23 +84,23 @@ class CollectionError(Exception):
     code = "error"
 
 
-class UnknownCollection(CollectionError):
+class UnknownCollectionError(CollectionError):
     code = "unknown_collection"
 
 
-class NameConflict(CollectionError):
+class NameConflictError(CollectionError):
     code = "name_conflict"
 
 
-class UnknownBatch(CollectionError):
+class UnknownBatchError(CollectionError):
     code = "unknown_batch"
 
 
-class AlreadyUndone(CollectionError):
+class AlreadyUndoneError(CollectionError):
     code = "already_undone"
 
 
-class UndoConflict(CollectionError):
+class UndoConflictError(CollectionError):
     code = "undo_conflict"
 
 
@@ -321,7 +321,7 @@ def _name_holder(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
 def _find(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     row = _name_holder(conn, name)
     if row is None:
-        raise UnknownCollection(f"Unknown collection: {name}")
+        raise UnknownCollectionError(f"Unknown collection: {name}")
     return row
 
 
@@ -500,7 +500,7 @@ def history(conn, name=None, limit=50) -> list[dict]:
             "SELECT id FROM collections WHERE name_key = ?", (_name_key(name),)
         )]
         if not ids:
-            raise UnknownCollection(f"Unknown collection: {name}")
+            raise UnknownCollectionError(f"Unknown collection: {name}")
         where = f"WHERE collection_id IN ({','.join('?' * len(ids))})"
         params = ids
     rows = conn.execute(
@@ -528,7 +528,7 @@ def create(conn, name, note=None, by=None) -> dict:
     cleaned = _clean_name(name)
     with _tx(conn):
         if _name_holder(conn, cleaned) is not None:
-            raise NameConflict(f"A collection named {cleaned!r} already exists.")
+            raise NameConflictError(f"A collection named {cleaned!r} already exists.")
         cid = conn.execute(
             "INSERT INTO collections (name, name_key, note, created_by, created_at)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -636,7 +636,7 @@ def rename(conn, name, new_name, by) -> dict:
         row = _find(conn, name)
         holder = _name_holder(conn, cleaned)
         if holder is not None and holder["id"] != row["id"]:
-            raise NameConflict(f"A collection named {cleaned!r} already exists.")
+            raise NameConflictError(f"A collection named {cleaned!r} already exists.")
         batch_id = _open_batch(conn, "rename", by, row["id"], cleaned,
                                detail={"old": row["name"], "new": cleaned})
         _set_name(conn, row["id"], cleaned)
@@ -667,7 +667,7 @@ def delete(conn, name, by) -> dict:
 
 def _require_live(collection: sqlite3.Row) -> None:
     if collection["removed_at"] is not None:
-        raise UndoConflict(
+        raise UndoConflictError(
             f"Collection {collection['name']!r} is deleted; undo its delete first."
         )
 
@@ -716,19 +716,21 @@ def _undo_rename(conn, batch, collection, undo_batch, by) -> tuple[int, list[dic
     _require_live(collection)
     names = json.loads(batch["detail"])
     if collection["name"] != names["new"]:
-        raise UndoConflict(
+        raise UndoConflictError(
             f"Collection has been renamed to {collection['name']!r} since this batch."
         )
     holder = _name_holder(conn, names["old"])
     if holder is not None and holder["id"] != collection["id"]:
-        raise UndoConflict(f"The name {names['old']!r} is now taken by a live collection.")
+        raise UndoConflictError(f"The name {names['old']!r} is now taken by a live collection.")
     _set_name(conn, collection["id"], names["old"])
     return 1, []
 
 
 def _undo_delete(conn, batch, collection, undo_batch, by) -> tuple[int, list[dict]]:
     if _name_holder(conn, collection["name"]) is not None:
-        raise UndoConflict(f"The name {collection['name']!r} is now taken by a live collection.")
+        raise UndoConflictError(
+            f"The name {collection['name']!r} is now taken by a live collection."
+        )
     conn.execute(
         "UPDATE collections SET removed_at = NULL, removed_by = NULL, removed_batch_id = NULL"
         " WHERE id = ?",
@@ -741,7 +743,7 @@ def _undo_create(conn, batch, collection, undo_batch, by) -> tuple[int, list[dic
     _require_live(collection)
     held = len(_live_memberships(conn, collection["id"]))
     if held:
-        raise UndoConflict(
+        raise UndoConflictError(
             f"Collection {collection['name']!r} has {held} member(s) this batch did not "
             "add. Undo those batches, or delete the collection."
         )
@@ -774,9 +776,9 @@ def undo(conn, batch_id, by) -> dict:
             "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
         ).fetchone()
         if batch is None:
-            raise UnknownBatch(f"Unknown batch: {batch_id}")
+            raise UnknownBatchError(f"Unknown batch: {batch_id}")
         if batch["undone_by"] is not None:
-            raise AlreadyUndone(
+            raise AlreadyUndoneError(
                 f"Batch {batch_id} was already undone by {batch['undone_by']}."
             )
         reverse = _UNDO.get(batch["op"])
