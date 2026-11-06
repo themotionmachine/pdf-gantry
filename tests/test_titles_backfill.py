@@ -124,6 +124,14 @@ def test_process_populates_in_parent_and_keyword_search_finds_it(lib):
     assert _row(conn, "a.pdf")["title_from_layout"].startswith("Zebrafish")
 
 
+def test_pipeline_populates_and_reports(lib):
+    from pdf_gantry.pipeline import run_pipeline
+    conn, papers, db_path = lib
+    stats = run_pipeline(conn, papers, db_path, workers=1)
+    assert stats["layout_titled"] == 2
+    assert _row(conn, "b.pdf")["title_from_layout"].startswith("Quokka")
+
+
 def test_bad_pdf_does_not_fail_processing(lib, monkeypatch):
     conn, papers, db_path = lib
 

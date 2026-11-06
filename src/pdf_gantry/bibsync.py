@@ -288,7 +288,8 @@ def audit_links(conn: sqlite3.Connection, entries: list[BibEntry]) -> dict:
     title, or a high-confidence layout title, is. A layout title comes from the
     document, so it is in the document by construction: ``basis`` says which
     title carried the flag, and ``layout`` alone is the weakest case. A
-    low-confidence layout title carries nothing. Listed strongest first.
+    low-confidence layout title carries nothing, and a title that matches the
+    entry clears the paper. Listed strongest first.
     """
     by_key = {e.citekey: e for e in entries}
     rows = conn.execute(
@@ -312,8 +313,10 @@ def audit_links(conn: sqlite3.Connection, entries: list[BibEntry]) -> dict:
         stored = title_containment(row["title"], row["head"]) >= CONTAINMENT_THRESHOLD
         hint = row["title_from_layout"] if row["title_layout_confidence"] == "high" else None
         layout = title_containment(hint, row["head"]) >= CONTAINMENT_THRESHOLD
-        if not (stored or layout):
-            continue
+        agreement = max(title_similarity(row["title"], entry.title),
+                        title_similarity(row["title_from_layout"], entry.title))
+        if not (stored or layout) or agreement >= SIMILARITY_GATE:
+            continue  # a title matching the entry outweighs a containment miss
         flagged.append({
             "id": row["id"],
             "filename": row["filename"],
@@ -324,10 +327,7 @@ def audit_links(conn: sqlite3.Connection, entries: list[BibEntry]) -> dict:
             "layout_title": row["title_from_layout"],
             "bib_containment": round(bib_score, 3),
             "basis": "both" if stored and layout else "stored" if stored else "layout",
-            "title_similarity": round(
-                max(title_similarity(row["title"], entry.title),
-                    title_similarity(row["title_from_layout"], entry.title)), 3
-            ),
+            "title_similarity": round(agreement, 3),
         })
     order = {"both": 0, "stored": 1, "layout": 2}
     flagged.sort(key=lambda f: (order[f["basis"]], f["title_similarity"], f["id"]))

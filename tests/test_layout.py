@@ -339,6 +339,11 @@ def test_footnote_marks_and_private_use_glyphs_are_stripped():
     assert clean_title("A Title Worth Noting ") == "A Title Worth Noting"
 
 
+def test_title_lost_to_an_image_font_keeps_no_leading_punctuation():
+    from pdf_gantry.layout import clean_title
+    assert clean_title(": Evaluating faithfulness") == "Evaluating faithfulness"
+
+
 def test_doubled_title_collapses():
     from pdf_gantry.layout import clean_title
     assert clean_title("Civic Trust Today Civic Trust Today") == "Civic Trust Today"

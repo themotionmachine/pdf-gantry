@@ -140,7 +140,7 @@ def clean_title(text: str, strip_marks: bool = True) -> str:
              for w in re.split(r"\s{2,}", text.strip())]
     text = _CHAPTER_PREFIX_RE.sub("", " ".join(" ".join(words).split()))
     if strip_marks:
-        text = text.rstrip(_EDGE_MARKS)
+        text = text.rstrip(_EDGE_MARKS).lstrip(" :;,.-–—")
     tokens = text.split()
     half = len(tokens) // 2
     if half >= 2 and len(tokens) % 2 == 0 and tokens[:half] == tokens[half:]:

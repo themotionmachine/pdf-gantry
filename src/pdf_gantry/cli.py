@@ -2351,9 +2351,10 @@ def pipeline(ctx, files, filename, limit, workers, do_enrich, provider, dry_run,
     else:
         per_file = [{"file": n, **run(n)} for n in names]
         stats = {"ingested": 0, "processed": 0, "enriched": 0, "embedded": 0,
-                 "errors": 0, "new_files": [], "ids": []}
+                 "errors": 0, "layout_titled": 0, "new_files": [], "ids": []}
         for fs in per_file:
-            for key in ("ingested", "processed", "enriched", "embedded", "errors"):
+            for key in ("ingested", "processed", "enriched", "embedded", "errors",
+                        "layout_titled"):
                 stats[key] += fs.get(key, 0)
             stats["new_files"] += fs.get("new_files", [])
             stats["ids"] += fs.get("ids", [])

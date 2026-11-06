@@ -274,6 +274,15 @@ def test_audit_counts_high_confidence_layout_only(db, entries):
     assert bibsync.audit_links(db, entries)["flagged"][0]["basis"] == "layout"
 
 
+def test_audit_trusts_a_title_that_agrees_with_the_bib(db, entries):
+    # Hyphenation can hide the bib title's words from containment, but a title
+    # that matches the entry is not evidence of a wrong link.
+    hyphenated = "Zebrafish Govern-ance Sys-tems in Practice"
+    add_paper(db, 1, "w.pdf", text=hyphenated, citekey="doe2021web")
+    _layout(db, 1, hyphenated)
+    assert bibsync.audit_links(db, entries)["flagged"] == []
+
+
 def test_audit_ignores_papers_without_text(db, entries):
     add_paper(db, 1, "w.pdf", text="", title="Whatever", citekey="doe2021web")
     assert bibsync.audit_links(db, entries)["flagged"] == []

@@ -204,6 +204,7 @@ Zotero manages references; it does not give an agent chunk-level retrieval over 
 | `gantry embed` | Generate chunk-level embeddings; `--ids <ids> --force` re-embeds specific papers (deletes their old vectors and resets the flag) |
 | `gantry ocr` | OCR scanned PDFs with Surya |
 | `gantry enrich` | Fetch metadata (title, authors, year, DOI, abstract) from OpenAlex or Semantic Scholar |
+| `gantry titles backfill` | Read each paper's title from its page typography into `title_from_layout`. Opens PDFs; `--ids`, `--force`, `--limit`, `--dry-run`, `--json`. New papers get this from `process` and `pipeline` |
 | `gantry pipeline [FILE...]` | Run the full chain: ingest → process → embed. `--enrich` adds metadata lookup before embedding. Positional files (or `--file`) scope it to those PDFs: `gantry pipeline paper.pdf --enrich --json` adds one paper end to end and reports its `ids` |
 | `gantry meta set\|clear\|normalize` | Hand metadata edits in code rather than raw SQL (see below) |
 
@@ -226,7 +227,15 @@ Semantic Scholar is still available with `--provider semantic-scholar`, but with
 
 A paper the provider can't match is recorded as `metadata_source = 'none:<provider>'`, so "tried and missed" is distinguishable from "never tried". Misses aren't retried by default; `gantry enrich --retry-misses` re-attempts them, and `gantry queue --is enrich-miss` lists them. A lookup that fails on a network or API error leaves the paper untouched, so the next run tries it again.
 
+The title search queries with the layout title when a paper has one. Under `--retry-misses` a title hit must also be present in the document and resemble the layout title (similarity at least 0.75); anything else stays a miss and writes nothing, so a retry can't leave a wrong title behind. The DOI tier is unchanged. JSON `titled_ids` lists the papers that gained a title, and `rejected_title` counts the hits turned down.
+
 `gantry pipeline --enrich` runs enrichment after text extraction and before embedding, because each chunk is embedded with its paper's title prepended. Its JSON reports `enriched`, an `enrich` block of counts, and `titled_after_embed`: papers that were already embedded before they got a title, ready for `gantry embed --chunk --ids … --force`.
+
+#### Layout titles
+
+About half the library has no provider metadata, so `gantry titles backfill` reads a title off the page: the largest text in the top 60% of page 1, skipping corpus boilerplate, cover sheets, labels, bylines and citation lines, and returning nothing for a garbled text layer. It writes `title_from_layout` and `title_layout_confidence` (`high` when the font stands out from the body text, else `low`).
+
+Treat it as an unverified hint. It scores 88% against bib titles (`eval/title_harness.py`), but those papers are the well-formed ones, and a blind sample of untitled papers scored far lower. So `title` keeps meaning verified metadata and is never filled from layout. `search`, `semantic`, `info` and `find` add `display_title` and `title_source` (`metadata`, `layout` or `filename`) to their JSON, plus `title_layout_confidence` when the source is layout; `--format oneline` and plain text show the same fallback. Keyword search indexes the layout title when a paper has no title, and `find` matches it one rank below a verified title. A `link check` match on a layout title is always `uncertain`.
 
 #### Editing metadata by hand
 
@@ -261,7 +270,7 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 
 | Command | Description |
 |---------|-------------|
-| `gantry status` | Coverage and database stats, plus pending-work counts (`needs_text`, `needs_embeddings`, `needs_chunk_embeddings`, `needs_enrich`, `enrich_misses`, `metadata_suspect`, `manual_metadata`) matching what the next default run would pick up |
+| `gantry status` | Coverage and database stats, plus pending-work counts (`needs_text`, `needs_embeddings`, `needs_chunk_embeddings`, `needs_enrich`, `enrich_misses`, `metadata_suspect`, `manual_metadata`, `bib_metadata`, `needs_layout_title`) matching what the next default run would pick up, and `layout_titled` and `display_untitled` (papers showing only a filename) |
 | `gantry queue` | Documents matching a filter (`--needs`, `--has`, `--is`) |
 | `gantry errors` / `gantry retry` | Inspect and re-run failures |
 | `gantry queue --is broken` | Papers quarantined after too many failures (`error_count >= processing.max_retries`, default 3) |
@@ -276,6 +285,10 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 |---------|-------------|
 | `gantry link init <path>` | Generate a `.bib` file from enriched metadata |
 | `gantry link check <bib>` | Reconcile PDFs against a BibTeX file, assign citekeys |
+| `gantry link suggest <bib>` | Candidate citekeys for papers with no citekey and no title, with evidence, a tier (`strong`, `title`, `weak`, `filename`) and any sibling entries. `--apply --ids 1,2` assigns the top candidate to those papers only and refuses a citekey already taken |
+| `gantry link audit <bib>` | Linked papers whose bib title is not in the document while their stored or layout title is. `--clear --ids 1,2` removes those citekeys and appends the old values to `citekey-clears.jsonl` in the index directory |
+| `gantry link pull <bib>` | Copy title, authors, year, DOI and abstract from entries onto linked papers. Precedence is hand-set > bib > provider > layout; only rows whose bib title is in the document change. Records `metadata_source = 'bib:<stem>'`, which `enrich` never overwrites, and reports `newly_titled_ids` for re-embedding |
+| `gantry link missing <bib>` | Bib entries with no paper by citekey, `file=` basename or DOI. `--json` or `--format tsv` |
 | `gantry vault check` | Cross-reference papers against an Obsidian vault (read-only) |
 
 ## Configuration
@@ -292,7 +305,7 @@ Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables overri
 
 - **Change detection:** PDFs are SHA-256 hashed at ingest; only new or changed files are reprocessed.
 - **Extraction:** PyMuPDF4LLM by default, Marker as an optional higher-quality backend.
-- **Search:** contentless FTS5 (`contentless_delete=1`) for keywords, over filename, title, authors, abstract and text, refreshed whenever `process`, `ocr`, `enrich` or `meta` changes any of them, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable, and to vector-only if FTS5 rejects a raw `--fts-syntax` query. Each result's `snippet` is the passage that matched: the best vector chunk, else the chunk containing the most query terms, else a window of text around the first term. It is not the first 200 characters of the file, which are usually a masthead.
+- **Search:** contentless FTS5 (`contentless_delete=1`) for keywords, over filename, title, authors, abstract and text, refreshed whenever `process`, `ocr`, `enrich`, `meta`, `link pull` or `titles backfill` changes any of them, 768-d Nomic Embed V2 vectors in sqlite-vec for semantics, reciprocal rank fusion for hybrid. Hybrid degrades gracefully to FTS if the embedding model is unavailable, and to vector-only if FTS5 rejects a raw `--fts-syntax` query. Each result's `snippet` is the passage that matched: the best vector chunk, else the chunk containing the most query terms, else a window of text around the first term. It is not the first 200 characters of the file, which are usually a masthead.
 - **Chunks:** documents are split into addressable chunks with per-chunk embeddings, so retrieval can land on a passage instead of a paper.
 - **Chunk pages:** each chunk records the physical PDF pages it came from (`page_start`/`page_end`, 1-based). The markdown has no page breaks, so `process` locates each chunk's text in PyMuPDF's per-page text (head/tail probes, then word overlap, then interpolation between neighbours); OCR chunks take the page from their `## Page N` section. On a 150k-chunk corpus this places 99.9% of chunks, 97.6% by direct text match. Pages appear in `grep`, `info --query`, `info --chunks` and `read --chunk(s)`.
 - **Scanned PDFs:** classified at ingest and routed to the OCR queue.
