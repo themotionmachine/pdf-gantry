@@ -2412,8 +2412,9 @@ def pipeline(ctx, files, filename, limit, workers, do_enrich, provider, dry_run,
                 stats[key] += fs.get(key, 0)
             stats["new_files"] += fs.get("new_files", [])
             stats["ids"] += fs.get("ids", [])
-        if "collections" in per_file[-1]:  # the last refresh saw every earlier file
-            stats["collections"] = per_file[-1]["collections"]
+        for sidecar in ("collections", "reading"):  # the last refresh saw every earlier file
+            if sidecar in per_file[-1]:
+                stats[sidecar] = per_file[-1][sidecar]
         if do_enrich:
             stats["enrich"] = {
                 key: sum(fs.get("enrich", {}).get(key, 0) for fs in per_file)
@@ -4353,4 +4354,251 @@ def collection_history(ctx, name, limit, json_output):
         for h in rows:
             flag = " (undone)" if h["undone"] else ""
             click.echo(f"{h['batch_id']}\t{h['at']}\t{h['op']}\t{h['collection'] or '-'}"
+                       f"\t{h['count']}\t{h['by']}{flag}")
+
+
+# --- inbox ---
+
+
+@contextmanager
+def _reading_errors(ctx, use_json):
+    """Yield the reading module; map its failures onto the shared exit codes.
+
+    An unknown item or a bad argument is bad input and exits 64. Refusals (a
+    retired item, an undo conflict, a second undo) exit 1 with a stable ``code``.
+    """
+    from . import reading as rd
+
+    def report(payload, code):
+        click.echo(json.dumps(payload) if use_json else payload["error"], err=not use_json)
+        ctx.exit(code)
+
+    try:
+        yield rd
+    except (rd.UnknownItemError, rd.InvalidArgumentError) as e:
+        raise click.UsageError(str(e)) from e
+    except rd.ReadingError as e:
+        report({"error": str(e), "code": e.code}, EXIT_ERROR)
+    except sqlite3.Error as e:
+        report({"error": f"Reading database error: {e}"}, EXIT_DB_ERROR)
+
+
+def _inbox_read(ctx, cfg, use_json, fn):
+    """Run ``fn(conn, index)`` on a read-only reading.db, or return [] without one."""
+    with _reading_errors(ctx, use_json) as rd:
+        conn = rd.connect_readonly(cfg)
+        if conn is None:
+            return []
+        try:
+            index = _open_index_readonly(ctx, cfg, use_json)
+            try:
+                return fn(rd, conn, index)
+            finally:
+                index.close()
+        finally:
+            conn.close()
+
+
+def _print_items(ctx, items, *, ids_only, use_json):
+    """Print items as JSON, bare paper IDs or text; exit 2 if none, 3 if any
+    could not be resolved to a paper."""
+    unresolved = [i for i in items if i["paper_id"] is None]
+    if ids_only:
+        for pid in dict.fromkeys(i["paper_id"] for i in items if i["paper_id"] is not None):
+            click.echo(pid)
+        counts = [f"{sum(i['resolution'] == k for i in unresolved)} {k}"
+                  for k in ("missing", "ambiguous")
+                  if any(i["resolution"] == k for i in unresolved)]
+        if counts:
+            click.echo(", ".join(counts), err=True)
+    elif use_json:
+        click.echo(json.dumps({"count": len(items), "items": items}, indent=2))
+    else:
+        from .reading import VERDICT_MARKS
+
+        for i in items:
+            pid = i["paper_id"] if i["paper_id"] is not None else i["resolution"]
+            when = (i["due_at"] or "")[:16].replace("T", " ") or "done"
+            mark = VERDICT_MARKS.get(i["last_verdict"], "")
+            where = f" p.{i['passage']['page']}" if i["passage"] else ""
+            click.echo(f"  [{i['item_id']}] {pid}\t{when}\t{mark}\t{i['title']}{where}")
+    if unresolved:
+        ctx.exit(EXIT_PARTIAL)
+    if not items:
+        ctx.exit(EXIT_NO_RESULTS)
+
+
+@cli.group()
+def inbox():
+    """A spaced-repetition reading inbox, stored in reading.db beside the index.
+
+    Papers (or passages of them) enter with `add`, come back with `due`, and
+    are rescheduled by `review`. Items are tracked by file hash and path, so
+    they survive renames that change a paper's ID. Writes need --by and get a
+    batch ID that `undo` reverses. Exit 2 means nothing to show, 3 that some
+    items or IDs could not be resolved, 64 an unknown item or bad argument.
+    """
+
+
+@inbox.command("add")
+@click.option("--ids", required=True, help=_IDS_HELP)
+@_BY_OPTION
+@click.option("--why", default=None, help="Why these should be read")
+@click.option("--source", type=click.Choice(["manual", "agent"]), default="manual",
+              show_default=True, help="Who suggested them: a person, or an agent")
+@click.option("--page", type=click.IntRange(min=1), default=None,
+              help="Enqueue one passage on this 1-based page instead of the whole paper")
+@click.option("--quote", default=None, help="The passage's text (needs --page)")
+@click.option("--note", default=None, help="A note on the passage (needs --page)")
+@_JSON_OPTION
+@click.pass_context
+def inbox_add(ctx, ids, by, why, source, page, quote, note, json_output):
+    """Add papers, due now. Adding a paper already in the inbox is a no-op
+    reported in already_present; a paper may hold several passages."""
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    if page is None and (quote is not None or note is not None):
+        raise click.UsageError("--quote and --note describe a passage: give --page too.")
+    passage = {"page": page, "quote": quote, "note": note} if page is not None else None
+    paper_ids = _read_ids(ctx, ids, use_json)
+    index = _open_index_readonly(ctx, cfg, use_json)
+    with _reading_errors(ctx, use_json) as rd:
+        conn = rd.connect(cfg)
+        try:
+            out = rd.enqueue(conn, index, paper_ids, by, why=why, source=source,
+                             passage=passage, papers_dir=cfg.papers_dir)
+        finally:
+            conn.close()
+            index.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        click.echo(f"Added {len(out['added'])}, already present "
+                   f"{len(out['already_present'])} (batch {out['batch_id']})")
+        _print_not_found("Not in index", out["not_found"], ids_only=False)
+    _collection_exit(ctx, done=out["added"] or out["already_present"],
+                     problems=out["not_found"])
+
+
+@inbox.command("list")
+@click.option("--status", type=click.Choice(["active", "due", "scheduled", "done", "all"]),
+              default="active", show_default=True,
+              help="active is due plus scheduled; all includes done")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare paper IDs, one per line; problems go to stderr")
+@_JSON_OPTION
+@click.pass_context
+def inbox_list(ctx, status, ids_only, json_output):
+    """List inbox items, oldest first. Exit 2 if none, 3 if any are missing or ambiguous."""
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+    rows = _inbox_read(ctx, cfg, use_json, lambda rd, conn, index: rd.items(
+        conn, index, status=status, papers_dir=cfg.papers_dir))
+    _print_items(ctx, rows, ids_only=ids_only, use_json=use_json)
+
+
+@inbox.command("due")
+@click.option("--limit", type=click.IntRange(min=1), default=None, help="Max items")
+@click.option("--ids-only", "ids_only", is_flag=True,
+              help="Emit bare paper IDs, one per line; problems go to stderr")
+@_JSON_OPTION
+@click.pass_context
+def inbox_due(ctx, limit, ids_only, json_output):
+    """Items due now, longest-waiting first. Exit 2 if nothing is due."""
+    cfg = ctx.obj["config"]
+    use_json = (json_output or ctx.obj["json"]) and not ids_only
+    rows = _inbox_read(ctx, cfg, use_json, lambda rd, conn, index: rd.due(
+        conn, index, limit=limit, papers_dir=cfg.papers_dir))
+    _print_items(ctx, rows, ids_only=ids_only, use_json=use_json)
+
+
+@inbox.command("review")
+@click.argument("item_id", type=int)
+@click.argument("verdict", type=click.Choice(["key", "good", "doubt", "later", "done"]))
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def inbox_review(ctx, item_id, verdict, by, json_output):
+    """Record a verdict on an item and reschedule it.
+
+    \b
+    key   (!!)  essential: interval x3, at least a week
+    good  (!)   interval x2 (the first review gives a day)
+    doubt (?)   back in 1-2 days
+    later (→)   not now: interval x1.5, no penalty
+    done  (x)   retire it
+    """
+    cfg = ctx.obj["config"]
+    use_json = json_output or ctx.obj["json"]
+    index = _open_index_readonly(ctx, cfg, use_json) if cfg.db_path.exists() else None
+    with _reading_errors(ctx, use_json) as rd:
+        conn = rd.connect(cfg)
+        try:
+            out = rd.review(conn, item_id, verdict, by, index_conn=index,
+                            papers_dir=cfg.papers_dir)
+        finally:
+            conn.close()
+            if index is not None:
+                index.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    elif out["status"] == "done":
+        click.echo(f"Item {item_id} done (batch {out['batch_id']})")
+    else:
+        click.echo(f"Item {item_id} due {out['due_at']} in {out['interval_days']:g} days "
+                   f"(batch {out['batch_id']})")
+
+
+@inbox.command("undo")
+@click.argument("batch")
+@_BY_OPTION
+@_JSON_OPTION
+@click.pass_context
+def inbox_undo(ctx, batch, by, json_output):
+    """Reverse one batch from `history`.
+
+    Undoing an add removes the items it made, keeping tombstones; undoing a
+    review restores the item's schedule from before it (a `done` comes back).
+    A review undo is refused (exit 1) if the item was reviewed again or
+    removed since. Rows that can no longer be reversed are listed in
+    "skipped" (exit 3).
+    """
+    use_json = json_output or ctx.obj["json"]
+    with _reading_errors(ctx, use_json) as rd:
+        conn = rd.connect(ctx.obj["config"])
+        try:
+            out = rd.undo(conn, batch, by)
+        finally:
+            conn.close()
+    if use_json:
+        click.echo(json.dumps(out, indent=2))
+    else:
+        click.echo(f"Undid {out['op']} {out['undone']}: {out['reversed']} reversed, "
+                   f"{len(out['skipped'])} skipped (batch {out['batch_id']})")
+    if out["skipped"]:
+        ctx.exit(EXIT_PARTIAL)
+
+
+@inbox.command("history")
+@click.option("--limit", type=int, default=50, show_default=True, help="Max batches")
+@_JSON_OPTION
+@click.pass_context
+def inbox_history(ctx, limit, json_output):
+    """List write batches, newest first."""
+    use_json = json_output or ctx.obj["json"]
+    rows = []
+    with _reading_errors(ctx, use_json) as rd:
+        conn = rd.connect_readonly(ctx.obj["config"])
+        if conn is not None:
+            try:
+                rows = rd.history(conn, limit=limit)
+            finally:
+                conn.close()
+    if use_json:
+        click.echo(json.dumps({"count": len(rows), "history": rows}, indent=2))
+    else:
+        for h in rows:
+            flag = " (undone)" if h["undone"] else ""
+            what = h["verdict"] or (h["item_id"] if h["item_id"] is not None else "-")
+            click.echo(f"{h['batch_id']}\t{h['at']}\t{h['op']}\t{what}"
                        f"\t{h['count']}\t{h['by']}{flag}")
