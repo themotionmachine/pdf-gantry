@@ -1,6 +1,6 @@
 """Data classes for Paper, SearchResult, and related types."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -45,6 +45,11 @@ class SearchResult:
     score_vector: float | None = None
     rank_fts: int | None = None
     rank_vector: int | None = None
+    # Work folding (works.collapse; search --works). copies: the work's other
+    # member ids, library-wide.
+    work_key: str | None = None
+    canonical_id: int | None = None
+    copies: list[int] = field(default_factory=list)
 
 
 @dataclass
