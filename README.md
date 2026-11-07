@@ -168,10 +168,10 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | 2 | ran fine, no results |
   | 3 | partial failure (some documents succeeded, or some requested IDs/indices were missing) |
   | 4 | database error |
-  | 64 | usage error: unknown option or command, bad choice, missing argument, unknown collection |
+  | 64 | usage error: unknown option or command, bad choice, missing argument, unknown collection or inbox item |
 
   An agent can branch on "no results" without parsing anything. A typo is never exit 2: usage errors exit 64, and when `--json` appears anywhere on the command line they print `{"error": "...", "usage": "...", "exit_code": 64}` on stdout.
-- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`; a refused `collection` write adds a stable `code` (`name_conflict`, `already_undone`, `undo_conflict`, `unknown_batch`). Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
+- **Stable JSON envelopes.** Keys are only ever added, never renamed. Errors from any command under `--json` are `{"error": "..."}`; a refused `collection` write adds a stable `code` (`name_conflict`, `already_undone`, `undo_conflict`, `unknown_batch`), and so does a refused `inbox` write (`item_retired`, `already_undone`, `undo_conflict`, `unknown_batch`). Paper-level records carry `id` (the paper ID); `read` also keeps its older `paper_id`, and chunk records carry both `id`/`paper_id` and the chunk's own `chunk_id`.
 
   | Command | Envelope |
   |---------|----------|
@@ -188,6 +188,9 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
   | `collection show` | `{collection: {id, name, note, created_by, created_at}, ids, members: [{id, filename, title, display_title, citekey, added_by, added_at, why, batch_id, …}], missing, ambiguous}` |
   | `collection list` | `{count, collections: [{id, name, note, count, resolved, missing, ambiguous, …}]}` |
   | `collection history` | `{count, history: [{batch_id, op, by, why, at, count, undone, collection, …}]}` |
+  | `inbox list`, `inbox due` | `{count, items: [{item_id, paper_id, resolution, candidates, file_hash, path, title, citekey, source, by, why, added_at, passage, status, due_at, interval_days, reviews, last_verdict, …}]}` |
+  | `inbox add` | `{batch_id, added, already_present, not_found, items: [{paper_id, item_id, status}]}` |
+  | `inbox history` | `{count, history: [{batch_id, op, by, why, at, count, item_id, verdict, undone, …}]}` |
 - **State is queryable.** Processing status lives in boolean columns (`has_text`, `has_embeddings`, `needs_ocr`), so `gantry queue --needs embeddings` answers "what work is left?" in one call.
 
 If you point an agent at gantry, a system-prompt note like this is enough: *"You have `gantry` for searching a local paper library. Use `gantry search <query> --ids-only` to find papers (bare IDs, one per line; add `--restrict-to-ids <ids>` to scope a search to a candidate set), `gantry info --ids <ids> --query <topic> --json` to get each paper's most relevant passage, `gantry find "<title or author>"` for a known paper, and `gantry read <id> --index <a-b>` (or `--chunk <chunk_id> --context 2000`) to read passages. Exit code 2 means no results; 64 means the command itself was malformed."*
@@ -294,6 +297,29 @@ gantry collection show governance --ids-only | gantry grep "oversight board" --i
 ```
 
 Collections live in `collections.db` beside the index, mode 0600, and that file is the only thing these commands write. Paper IDs are not stable: renaming a file gives it a new ID. So a member is stored as file hash plus path and matched back to the index on each read: hash and path, then hash, then path. Where the papers directory is reachable, a row whose file is gone loses to one whose file exists, so the row a rename left behind yields to the new one. A member matching nothing is reported as `missing` and kept, because the paper may come back. One matching several rows equally well is reported as `ambiguous`. `gantry pipeline` writes moved keys back as its last step.
+
+### Reading inbox
+
+The inbox is a spaced-repetition queue of papers to read, and of passages within them. An item enters due now; each `review` gives a verdict and schedules the next time it comes back. Like collections, every write names who made it (`--by`), gets a batch ID, and can be undone.
+
+| Command | Description |
+|---------|-------------|
+| `gantry inbox add --ids <ids\|->` | Add papers, due now. `--by`, `--why`, `--source manual\|agent`. `--page N` (1-based) with optional `--quote` and `--note` adds a passage instead. A paper holds any number of passages but one whole-paper item: adding it again is a no-op reported in `already_present` |
+| `gantry inbox due` | Items due now, longest-waiting first. `--limit`, `--ids-only`. Exit 2 when nothing is due |
+| `gantry inbox list` | Items by `--status`: `active` (the default: due or scheduled), `due`, `scheduled`, `done` or `all`. `--ids-only` |
+| `gantry inbox review <item> <verdict>` | `key` (!!) triples the interval, at least a week; `good` (!) doubles it; `doubt` (?) brings it back in 1–2 days; `later` (→) grows it 1.5×, no penalty; `done` (x) retires it. A first review starts from one day. `--by` |
+| `gantry inbox undo <batch>` | Undoing an add tombstones its items. Undoing a review puts back the item's schedule from before it, so an undone `done` returns to the inbox. A review undo is refused (exit 1) if the item was reviewed again or removed since. `--by` |
+| `gantry inbox history` | One row per batch, newest first. `--limit` |
+
+```bash
+gantry search "content moderation appeals" --ids-only -n 3 \
+  | gantry inbox add --ids - --by claude --source agent --why "for chapter 3"
+gantry inbox add --ids 412 --page 7 --quote "the appeal is the product" --by ryan
+gantry inbox due
+gantry inbox review 5 good --by ryan
+```
+
+The inbox lives in `reading.db` beside the index, mode 0600, and that file is the only thing these commands write. Items are keyed and matched exactly as collection members are, so they follow a paper through a rename, and `missing` or `ambiguous` items are reported (`resolution`, exit 3) rather than dropped. `reading.db` also holds an append-only log of reader opens (`reading.record_open`, used by Ramelli), which is not batched and not undoable. Times are UTC ISO strings. `gantry pipeline` writes moved item keys back as its last step, and never creates the file.
 
 ### Index management
 
