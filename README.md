@@ -57,6 +57,18 @@ $ printf '%s\n' "deepfakes elections" "content moderation" | gantry search --que
 
 With `--json` this returns `{"queries": [{"query", "mode", "total", "returned", "results", "not_found"}, ...]}`. With `--format oneline`, each line starts with the 0-based query index. `--ids-only` prints the de-duplicated union of hits, in the order they were first seen.
 
+A library collects the same paper more than once: a publisher PDF and a preprint, a renamed re-download. `--works` folds those copies into one result, so `-n 10` means ten papers rather than ten files:
+
+```bash
+$ gantry search "niche construction free energy" --works --fields id,work_key,canonical_id,copies --json -n 5
+```
+
+Each result then carries, for example, `{"id": 645, "work_key": "work:326", "canonical_id": 326, "copies": [326]}`: two downloads of one paper, returned once.
+
+The result keeps the id of the copy that matched (so page numbers in that copy stay right). `work_key` is `work:<smallest member id>`, `canonical_id` is the copy to prefer (it has a citekey, then the best metadata source: manual, then bib, then OpenAlex; then not suspect, then has text, then the newest), and `copies` lists the work's other ids across the whole library. Plain text output lists the copies after each hit; `--format oneline` is unchanged. Without `--works`, output is exactly as before.
+
+Two rows are the same work when they have the same file hash; or the same DOI, with titles that agree (similarity at least 0.75, or one contained in the other) and page counts within 2; or the same metadata `title` and `year`, for titles of five or more words that aren't generic ("Introduction to the special issue…", "Book review…") and page counts within 2. A row flagged `metadata_suspect` takes neither DOI nor title evidence, and when both rows have a title read off page 1, those must agree too, so two chapters stamped with their book's DOI stay apart. A wrong merge would hide a paper, so the rules lean toward showing a duplicate. Python callers get the same through `pdf_gantry.works.works_for(conn, ids)` and `collapse(conn, results, limit)`, which only read and work on a `mode=ro` connection.
+
 To ask "which of *these* papers discuss X?", scope a search to a candidate set instead of searching globally and filtering client-side:
 
 ```bash
@@ -158,7 +170,7 @@ Gantry holds to a few rules so that agents (and scripts) can rely on it:
 - **`--json` on every command.** Structured output goes to stdout; progress bars and chatter go to stderr. Pipes stay clean.
 - **`--fields` trims payloads.** Ask for `id,filename,top_chunk` and that is all you get. Tokens are the budget; spend them on content. An unknown field name gets a warning on stderr that lists the valid names; it is not dropped silently.
 - **One shape per concept.** `authors` is always a JSON list of names (`[]` when unknown) in `search`, `semantic`, `info`, `find` and `read`. Search results carry `title`, `year`, `authors` and `citekey`.
-- **Counts say what they count.** In `search`/`semantic` JSON, `returned` is the number of results in the response. `total` is the global FTS5 match count for `search --fts` without `--restrict-to-ids`, regardless of `-n`. Hybrid and semantic search rank rather than match, so there `total` equals `returned`. The `mode` field reports the retrieval path that actually ran: `hybrid`, `vector_fallback` (FTS5 rejected the query, so the results are vector-only), `fts` (embeddings unavailable), `fts_only` (`--fts`), or, for `semantic`, `cascade` or `doc`.
+- **Counts say what they count.** In `search`/`semantic` JSON, `returned` is the number of results in the response. `total` is the global FTS5 match count for `search --fts` without `--restrict-to-ids`, regardless of `-n`. Hybrid and semantic search rank rather than match, so there `total` equals `returned`. With `search --works`, `total` counts works, except a global `--fts` count larger than the over-fetch, which still counts matching files. The `mode` field reports the retrieval path that actually ran: `hybrid`, `vector_fallback` (FTS5 rejected the query, so the results are vector-only), `fts` (embeddings unavailable), `fts_only` (`--fts`), or, for `semantic`, `cascade` or `doc`.
 - **Exit codes carry meaning.**
 
   | Code | Meaning |
@@ -257,7 +269,7 @@ gantry meta normalize --dry-run --json   # report repairs to hand-written rows
 
 | Command | Description |
 |---------|-------------|
-| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--collection NAME` scopes it to a collection (both together give the intersection; an unknown name exits 64); `--queries-file PATH\|-` runs many queries with one model load |
+| `gantry search <query>` | Hybrid search (FTS5 + vector, fused with RRF); `--fts` for keyword-only, `--fts-syntax` for raw FTS5 syntax. `--ids-only` emits bare ranked IDs for piping; `--format oneline` emits `id score year citekey title`; `--restrict-to-ids` scopes the search to a candidate set; `--collection NAME` scopes it to a collection (both together give the intersection; an unknown name exits 64); `--queries-file PATH\|-` runs many queries with one model load; `--works` folds copies of the same paper into one result (adds `work_key`, `canonical_id`, `copies`) |
 | `gantry semantic <query>` | Pure vector similarity search; also supports `--ids-only`, `--format oneline`, `--restrict-to-ids` and `--queries-file` |
 | `gantry find <words>` | Known-item lookup over title, authors, year, citekey, DOI and filename: `find "Mind games"`, `find "Zhang 2022"`, `find "Flew & Martin"`. Every word must match some field; title matches rank first; each result reports `matched_fields`. `--ids-only` for piping |
 | `gantry read <id>` | Read a document's text, list its chunks (`--chunks`), read chunks by per-paper position (`--index 28-41`), or read one chunk by `chunk_id` (`--chunk`, which must belong to that paper) and expand it with `--context` |

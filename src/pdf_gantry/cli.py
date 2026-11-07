@@ -803,7 +803,7 @@ def _output_format(fmt, ids_only, json_flag):
 
 
 def _emit_query_results(ctx, outcomes, *, out_fmt, multi, fields, components,
-                        restrict_not_found, score_fmt):
+                        restrict_not_found, score_fmt, works=False):
     """Render one or many QueryOutcomes and set the exit code.
 
     Exit: 2 if no query returned results (and none failed); otherwise 3 if
@@ -837,7 +837,8 @@ def _emit_query_results(ctx, outcomes, *, out_fmt, multi, fields, components,
             "returned": o.returned,
             "mode": o.mode,
             "results": [
-                select_fields(result_dict(r, meta, components=with_components), fields)
+                select_fields(result_dict(r, meta, components=with_components, works=works),
+                              fields)
                 for r in o.results
             ],
             "not_found": restrict_not_found,
@@ -885,8 +886,13 @@ def _emit_query_results(ctx, outcomes, *, out_fmt, multi, fields, components,
             for rank, r in enumerate(o.results, 1):
                 ck = meta.get(r.id, {}).get("citekey")
                 ck_str = f" @{ck}" if ck else ""
+                copies_str = ""
+                if works and r.copies:
+                    n = len(r.copies)
+                    copies_str = (f"  [{n} other cop{'y' if n == 1 else 'ies'}: "
+                                  f"{','.join(map(str, r.copies))}]")
                 click.echo(f" {rank:2d}. [{r.id}] {display_title(r, meta)}{ck_str}"
-                           f"  ({score_fmt.format(r.score)})")
+                           f"  ({score_fmt.format(r.score)}){copies_str}")
                 has_components = r.score_fts is not None or r.score_vector is not None
                 if components and has_components and o.mode == "hybrid":
                     fts_str = f"fts={r.score_fts:.2f}" if r.score_fts is not None else "fts=--"
@@ -968,25 +974,38 @@ _QUERIES_FILE_OPTION = click.option(
                    "--restrict-to-ids, to the intersection of the two")
 @click.option("--ids-only", "ids_only", is_flag=True,
               help="Emit bare ranked paper IDs, one per line (for piping)")
+@click.option("--works", "fold_works", is_flag=True,
+              help="Fold copies of the same paper (same file, or agreeing DOI or "
+                   "title+year) into one result: the best-ranked copy, with its own id. "
+                   "JSON results gain work_key, canonical_id and copies (the work's "
+                   "other ids); text output lists the copies. -n counts works.")
 @_FORMAT_OPTION
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.pass_context
 def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, components,
-           field_list, restrict_to_ids, collection_name, ids_only, out_format, json_output):
+           field_list, restrict_to_ids, collection_name, ids_only, fold_works, out_format,
+           json_output):
     """Search across indexed PDFs. Hybrid (FTS5 + vector) by default; --fts for FTS only.
 
     JSON 'mode': hybrid | vector_fallback (FTS5 rejected the query, vector
     only) | fts (embeddings unavailable) | fts_only (--fts).
     """
-    from .retrieval import SEARCH_RESULT_FIELDS, FtsSyntaxError, run_search, split_fields
+    from .retrieval import (
+        SEARCH_RESULT_FIELDS,
+        WORK_FIELDS,
+        FtsSyntaxError,
+        run_search,
+        split_fields,
+    )
 
     cfg = ctx.obj["config"]
     out_fmt = _output_format(out_format, ids_only, json_output or ctx.obj["json"])
     use_json = out_fmt == "json"
 
     queries, multi = _resolve_query_args(ctx, query, queries_file, use_json)
-    fields, unknown = split_fields(field_list, SEARCH_RESULT_FIELDS)
-    _warn_unknown_fields(unknown, SEARCH_RESULT_FIELDS)
+    valid_fields = SEARCH_RESULT_FIELDS + (WORK_FIELDS if fold_works else ())
+    fields, unknown = split_fields(field_list, valid_fields)
+    _warn_unknown_fields(unknown, valid_fields)
     restrict_ids = parse_ids_option(ctx, restrict_to_ids, use_json, "--restrict-to-ids")
 
     if not cfg.db_path.exists():
@@ -1016,7 +1035,10 @@ def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, compon
         for q in queries:
             try:
                 o = run_search(conn, q, embed=embed, fts_only=fts_only, fts_syntax=fts_syntax,
-                               limit=limit, restrict_ids=restrict_ids)
+                               limit=limit * 2 if fold_works else limit,
+                               restrict_ids=restrict_ids)
+                if fold_works:
+                    _fold_outcome(conn, o, limit)
             except FtsSyntaxError as e:
                 if not multi:
                     fatal = str(e)
@@ -1039,8 +1061,20 @@ def search(ctx, query, queries_file, limit, hybrid, fts_only, fts_syntax, compon
     _emit_query_results(
         ctx, outcomes, out_fmt=out_fmt, multi=multi, fields=fields,
         components=components, restrict_not_found=restrict_not_found,
-        score_fmt="{:.2f}",
+        score_fmt="{:.2f}", works=fold_works,
     )
+
+
+def _fold_outcome(conn, o, limit):
+    """search --works: one result per work. ``total`` counts works when every
+    match was fetched (rank modes, --restrict-to-ids); a global --fts count
+    larger than the over-fetch still counts matching files."""
+    from .works import collapse
+
+    fetched_all = o.total == len(o.results)
+    o.results = collapse(conn, o.results, limit)
+    if fetched_all:
+        o.total = len(o.results)
 
 
 # --- queue ---

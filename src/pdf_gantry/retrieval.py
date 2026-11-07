@@ -26,6 +26,8 @@ BASE_RESULT_FIELDS = (
 )
 COMPONENT_FIELDS = ("score_fts", "score_vector", "rank_fts", "rank_vector")
 SEARCH_RESULT_FIELDS = BASE_RESULT_FIELDS + COMPONENT_FIELDS
+# Added by ``search --works`` (see works.py).
+WORK_FIELDS = ("work_key", "canonical_id", "copies")
 SEMANTIC_RESULT_FIELDS = BASE_RESULT_FIELDS
 # ``gantry info`` paper keys (chunks/top_chunk appear with --chunks/--query).
 INFO_FIELDS = (
@@ -185,7 +187,8 @@ def paper_meta(conn: sqlite3.Connection, ids: list[int]) -> dict[int, dict]:
     }
 
 
-def result_dict(r: SearchResult, meta: dict[int, dict], *, components: bool = False) -> dict:
+def result_dict(r: SearchResult, meta: dict[int, dict], *, components: bool = False,
+                works: bool = False) -> dict:
     m = meta.get(r.id, {})
     title = m.get("title", r.title)
     shown, source = resolve_title(title, m.get("title_from_layout"), r.filename)
@@ -212,6 +215,10 @@ def result_dict(r: SearchResult, meta: dict[int, dict], *, components: bool = Fa
         d["score_vector"] = r.score_vector
         d["rank_fts"] = r.rank_fts
         d["rank_vector"] = r.rank_vector
+    if works:
+        d["work_key"] = r.work_key
+        d["canonical_id"] = r.canonical_id
+        d["copies"] = list(r.copies)
     return d
 
 
