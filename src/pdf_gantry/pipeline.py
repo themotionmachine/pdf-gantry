@@ -16,30 +16,33 @@ def run_pipeline(
     dry_run: bool = False,
     **options,
 ) -> dict:
-    """Run the pipeline stages, then bring collection keys up to date.
+    """Run the pipeline stages, then bring sidecar keys up to date.
 
-    Takes the keywords ``_run_stages`` documents. The refresh sits out here so
-    no early return in a stage can skip it. Stats gain ``collections`` when a
-    collections.db exists; a refresh failure lands there as ``{"error": ...}``.
+    Takes the keywords ``_run_stages`` documents. The refreshes sit out here so
+    no early return in a stage can skip them. Stats gain ``collections`` when a
+    collections.db exists and ``reading`` when a reading.db does; a refresh
+    failure lands there as ``{"error": ...}``.
     """
     stats = _run_stages(conn, papers_dir, db_path, dry_run=dry_run, **options)
     if not dry_run and "error" not in stats:
-        _refresh_collections(conn, papers_dir, db_path, stats)
+        _refresh_sidecar("collections", conn, papers_dir, db_path, stats)
+        _refresh_sidecar("reading", conn, papers_dir, db_path, stats)
     return stats
 
 
-def _refresh_collections(
-    conn: sqlite3.Connection, papers_dir: Path, db_path: Path, stats: dict
+def _refresh_sidecar(
+    name: str, conn: sqlite3.Connection, papers_dir: Path, db_path: Path, stats: dict
 ) -> None:
     try:
-        from .collections import refresh_if_present
+        from importlib import import_module
 
-        result = refresh_if_present(Path(db_path).parent, conn, papers_dir)
-    except Exception as e:  # collections must never fail the pipeline
-        stats["collections"] = {"error": str(e)}
+        module = import_module(f".{name}", __package__)
+        result = module.refresh_if_present(Path(db_path).parent, conn, papers_dir)
+    except Exception as e:  # a sidecar must never fail the pipeline
+        stats[name] = {"error": str(e)}
         return
     if result is not None:
-        stats["collections"] = result
+        stats[name] = result
 
 
 def _run_stages(

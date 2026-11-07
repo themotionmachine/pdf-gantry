@@ -77,3 +77,15 @@ def test_works_on_a_plain_read_only_connection(index, tmp_path):
     finally:
         ro.close()
     assert idx.by_id[a].title == "T"
+
+
+def test_load_index_for_holds_every_row_a_key_could_match(index):
+    a = add_paper(index, "a.pdf", "H")
+    b = add_paper(index, "b.pdf", "H")
+    c = add_paper(index, "c.pdf", "OTHER")
+    add_paper(index, "unrelated.pdf", "U")
+    idx = identity.load_index_for(index, [("H", "c.pdf")])
+    assert set(idx.by_id) == {a, b, c}
+    assert identity.match(idx, "H", "c.pdf").ambiguous  # same answer as the full index
+    assert identity.match(identity.load_index(index), "H", "c.pdf").ambiguous
+    assert identity.load_index_for(index, []).papers == []

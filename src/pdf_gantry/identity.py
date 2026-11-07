@@ -58,12 +58,36 @@ class Index:
         return Index(self.papers)
 
 
+_COLUMNS = "id, path, filename, file_hash, title, title_from_layout, citekey"
+_CHUNK = 400  # stays well under SQLite's bound-parameter limit
+
+
 def load_index(index_conn: sqlite3.Connection, papers_dir=None) -> Index:
-    rows = index_conn.execute(
-        "SELECT id, path, filename, file_hash, title, title_from_layout, citekey"
-        " FROM papers ORDER BY id"
-    ).fetchall()
+    rows = index_conn.execute(f"SELECT {_COLUMNS} FROM papers ORDER BY id").fetchall()
     return Index([Paper(*tuple(r)) for r in rows], papers_dir)
+
+
+def load_index_for(index_conn: sqlite3.Connection, keys, papers_dir=None) -> Index:
+    """An ``Index`` of just the rows that share a hash or a path with ``keys``.
+
+    ``match`` only ever looks at ``by_hash[file_hash]`` and ``by_path[path]``,
+    so for these keys it answers exactly as the full index would, without
+    reading every paper. For hot read paths such as reading.state_for.
+    """
+    hashes = sorted({h for h, _ in keys})
+    paths = sorted({p for _, p in keys})
+    found: dict[int, Paper] = {}
+    for column, values in (("file_hash", hashes), ("path", paths)):
+        for i in range(0, len(values), _CHUNK):
+            part = values[i:i + _CHUNK]
+            rows = index_conn.execute(
+                f"SELECT {_COLUMNS} FROM papers WHERE {column} IN"
+                f" ({','.join('?' * len(part))})",
+                part,
+            ).fetchall()
+            for r in rows:
+                found.setdefault(r[0], Paper(*tuple(r)))
+    return Index([found[i] for i in sorted(found)], papers_dir)
 
 
 def decide(tier: list[Paper]) -> Match:
