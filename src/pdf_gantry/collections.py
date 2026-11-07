@@ -7,7 +7,7 @@ connection has no row factory.
 
 ``papers.id`` is not stable (a rename gives a new row and leaves the old one
 until a manual ``gantry prune``), so a membership is keyed on file_hash + path
-and matched back onto ``papers`` at read time by ``_match``, the one function
+and matched back onto ``papers`` at read time by ``identity.match``, the one function
 resolve, collections_for, refresh, add and remove all share.
 """
 
@@ -18,10 +18,10 @@ import sqlite3
 import unicodedata
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .identity import Index, Paper, load_index, match
 from .utils import resolve_title
 
 SCHEMA_VERSION = 1
@@ -198,95 +198,6 @@ def _tx(conn: sqlite3.Connection):
     conn.execute("COMMIT")
 
 
-# --- matching ---
-
-
-@dataclass(frozen=True)
-class _Paper:
-    id: int
-    path: str
-    filename: str
-    file_hash: str
-    title: str | None
-    layout_title: str | None
-    citekey: str | None
-
-
-@dataclass(frozen=True)
-class _Match:
-    paper: _Paper | None = None
-    candidates: tuple[int, ...] = ()
-
-    @property
-    def ambiguous(self) -> bool:
-        return bool(self.candidates)
-
-
-class _Index:
-    """One ``papers`` query, keyed for matching, with a cached liveness check."""
-
-    def __init__(self, papers: list[_Paper], papers_dir=None):
-        self.papers = papers
-        self.by_id = {p.id: p for p in papers}
-        self.by_path = {p.path: p for p in papers}
-        self.by_hash: dict[str, list[_Paper]] = defaultdict(list)
-        for p in papers:
-            self.by_hash[p.file_hash].append(p)
-        # An unreachable papers_dir says nothing about any one file (Quern
-        # calls over SSH): skip the check rather than call everything gone.
-        self.papers_dir = Path(papers_dir) if papers_dir and Path(papers_dir).is_dir() else None
-        self._live: dict[str, bool] = {}
-
-    def is_live(self, paper: _Paper) -> bool:
-        if paper.path not in self._live:
-            self._live[paper.path] = (self.papers_dir / paper.path).exists()
-        return self._live[paper.path]
-
-    def without_liveness(self) -> "_Index":
-        return _Index(self.papers)
-
-
-def _load_index(index_conn: sqlite3.Connection, papers_dir=None) -> _Index:
-    rows = index_conn.execute(
-        "SELECT id, path, filename, file_hash, title, title_from_layout, citekey"
-        " FROM papers ORDER BY id"
-    ).fetchall()
-    return _Index([_Paper(*tuple(r)) for r in rows], papers_dir)
-
-
-def _decide(tier: list[_Paper]) -> _Match:
-    if len(tier) == 1:
-        return _Match(paper=tier[0])
-    return _Match(candidates=tuple(p.id for p in tier))
-
-
-def _match(index: _Index, file_hash: str, path: str) -> _Match:
-    """Find the paper a stored key points at now.
-
-    Tiers: hash and path, then hash only, then path only. With a papers_dir, a
-    live candidate in any tier beats a dead one in a better tier, so a stale
-    row left by a rename yields to the live row with the same hash. If nothing
-    is live the best dead row still resolves: its text and chunks serve reads,
-    and an evicted file is not a lost paper.
-    """
-    same_hash = index.by_hash.get(file_hash, [])
-    at_path = index.by_path.get(path)
-    tiers = (
-        [p for p in same_hash if p.path == path],
-        [p for p in same_hash if p.path != path],
-        [at_path] if at_path and at_path.file_hash != file_hash else [],
-    )
-    if index.papers_dir:
-        for tier in tiers:
-            live = [p for p in tier if index.is_live(p)]
-            if live:
-                return _decide(live)
-    for tier in tiers:
-        if tier:
-            return _decide(tier)
-    return _Match()
-
-
 # --- helpers ---
 
 
@@ -356,7 +267,7 @@ def _tombstone(conn, membership_id: int, by: str, batch_id: str) -> None:
     )
 
 
-def _collides(conn, membership: sqlite3.Row, paper: _Paper) -> bool:
+def _collides(conn, membership: sqlite3.Row, paper: Paper) -> bool:
     """Would moving ``membership`` onto ``paper``'s key clash with a live sibling?"""
     return conn.execute(
         "SELECT 1 FROM memberships WHERE collection_id = ? AND file_hash = ? AND path = ?"
@@ -365,11 +276,11 @@ def _collides(conn, membership: sqlite3.Row, paper: _Paper) -> bool:
     ).fetchone() is not None
 
 
-def _has_drifted(membership: sqlite3.Row, paper: _Paper) -> bool:
+def _has_drifted(membership: sqlite3.Row, paper: Paper) -> bool:
     return (membership["file_hash"], membership["path"]) != (paper.file_hash, paper.path)
 
 
-def _persist_keys(conn, membership: sqlite3.Row, paper: _Paper) -> None:
+def _persist_keys(conn, membership: sqlite3.Row, paper: Paper) -> None:
     conn.execute(
         "UPDATE memberships SET file_hash = ?, path = ?, filename = ?, title = ?, citekey = ?"
         " WHERE id = ?",
@@ -409,14 +320,14 @@ def _stored(m: sqlite3.Row) -> dict:
     }
 
 
-def _resolved(memberships: list[sqlite3.Row], index: _Index) -> dict:
+def _resolved(memberships: list[sqlite3.Row], index: Index) -> dict:
     ids: list[int] = []
     members: list[dict] = []
     missing: list[dict] = []
     ambiguous: list[dict] = []
     seen: set[int] = set()
     for m in memberships:
-        found = _match(index, m["file_hash"], m["path"])
+        found = match(index, m["file_hash"], m["path"])
         if found.ambiguous:
             ambiguous.append({**_stored(m), "candidates": list(found.candidates)})
         elif found.paper is None:
@@ -444,7 +355,7 @@ def _resolved(memberships: list[sqlite3.Row], index: _Index) -> dict:
 def list_collections(conn, index_conn=None, papers_dir=None) -> list[dict]:
     """Live collections by name. ``count`` is stored memberships; with
     ``index_conn`` each also carries resolved, missing and ambiguous counts."""
-    index = _load_index(index_conn, papers_dir) if index_conn is not None else None
+    index = load_index(index_conn, papers_dir) if index_conn is not None else None
     out = []
     rows = conn.execute(
         "SELECT * FROM collections WHERE removed_at IS NULL ORDER BY name_key"
@@ -464,14 +375,14 @@ def resolve(conn, index_conn, name, papers_dir=None) -> dict:
     """Current ids, members, missing and ambiguous for a collection. Never writes."""
     row = _find(conn, name)
     result = _resolved(_live_memberships(conn, row["id"]),
-                       _load_index(index_conn, papers_dir))
+                       load_index(index_conn, papers_dir))
     return {"collection": _collection_dict(row), **result}
 
 
 def collections_for(conn, index_conn, paper_id, papers_dir=None) -> list[dict]:
     """Live collections this paper belongs to. Read-only. An ambiguous
     membership counts for no paper until it is settled."""
-    index = _load_index(index_conn, papers_dir)
+    index = load_index(index_conn, papers_dir)
     if paper_id not in index.by_id:
         return []
     rows = conn.execute(
@@ -481,7 +392,7 @@ def collections_for(conn, index_conn, paper_id, papers_dir=None) -> list[dict]:
     ).fetchall()
     out: dict[int, dict] = {}
     for m in rows:
-        found = _match(index, m["file_hash"], m["path"])
+        found = match(index, m["file_hash"], m["path"])
         if found.paper is not None and found.paper.id == paper_id:
             out.setdefault(m["collection_id"], {
                 "id": m["collection_id"],
@@ -544,7 +455,7 @@ def add(conn, index_conn, name, paper_ids, by, why=None, papers_dir=None) -> dic
     """Add papers. Idempotent: a paper a membership already resolves to is
     reported in already_present, and that membership's key is brought up to date."""
     _require_by(by)
-    index = _load_index(index_conn, papers_dir)
+    index = load_index(index_conn, papers_dir)
     added: list[int] = []
     present: list[int] = []
     not_found: list[int] = []
@@ -554,7 +465,7 @@ def add(conn, index_conn, name, paper_ids, by, why=None, papers_dir=None) -> dic
         keys = {(m["file_hash"], m["path"]) for m in memberships}
         held: dict[int, sqlite3.Row] = {}
         for m in memberships:
-            found = _match(index, m["file_hash"], m["path"])
+            found = match(index, m["file_hash"], m["path"])
             if found.paper is not None:
                 held.setdefault(found.paper.id, m)
         batch_id = _open_batch(conn, "add", by, row["id"], row["name"], why=why)
@@ -593,7 +504,7 @@ def remove(conn, name, paper_ids, by, index_conn, papers_dir=None) -> dict:
     candidate of an ambiguous membership is reported, not guessed at.
     """
     _require_by(by)
-    index = _load_index(index_conn, papers_dir)
+    index = load_index(index_conn, papers_dir)
     plain = index.without_liveness()
     removed: list[int] = []
     not_found: list[int] = []
@@ -604,11 +515,11 @@ def remove(conn, name, paper_ids, by, index_conn, papers_dir=None) -> dict:
         stale: dict[int, list[sqlite3.Row]] = defaultdict(list)
         contested: set[int] = set()
         for m in _live_memberships(conn, row["id"]):
-            found = _match(index, m["file_hash"], m["path"])
+            found = match(index, m["file_hash"], m["path"])
             contested.update(found.candidates)
             if found.paper is not None:
                 current[found.paper.id].append(m)
-            exact = _match(plain, m["file_hash"], m["path"])
+            exact = match(plain, m["file_hash"], m["path"])
             if exact.paper is not None and exact.paper != found.paper:
                 stale[exact.paper.id].append(m)
         batch_id = _open_batch(conn, "remove", by, row["id"], row["name"])
@@ -803,12 +714,12 @@ def refresh(conn, index_conn, papers_dir) -> dict:
     Covers deleted collections too, so undoing a delete finds current keys.
     Missing and ambiguous memberships are counted and left exactly as they are.
     """
-    index = _load_index(index_conn, papers_dir)
+    index = load_index(index_conn, papers_dir)
     rows = conn.execute("SELECT * FROM memberships WHERE removed_at IS NULL").fetchall()
     missing = ambiguous = 0
-    drifted: list[tuple[sqlite3.Row, _Paper]] = []
+    drifted: list[tuple[sqlite3.Row, Paper]] = []
     for m in rows:
-        found = _match(index, m["file_hash"], m["path"])
+        found = match(index, m["file_hash"], m["path"])
         if found.ambiguous:
             ambiguous += 1
         elif found.paper is None:
