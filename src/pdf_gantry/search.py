@@ -231,6 +231,54 @@ def semantic_search(
     return results
 
 
+def _chunk_only_results(
+    conn: sqlite3.Connection,
+    query_vector: bytes,
+    limit: int,
+    restrict_ids: list[int] | None = None,
+) -> list[SearchResult]:
+    """
+    Rank papers that have chunk embeddings but no paper embedding by their
+    best chunk's cosine similarity.
+
+    `pipeline` writes chunk embeddings only, so without this a fresh index
+    has no vector signal in hybrid search at all. Unrestricted, it runs one
+    chunk KNN (k generous, since other papers' chunks compete for slots) and
+    only when such papers exist; restricted, it scopes the comparison to the
+    given papers via ``best_chunk_per_doc``.
+    """
+    only = "has_embeddings = 0 AND has_chunk_embeddings = 1"
+    if restrict_ids is not None:
+        placeholders = ",".join("?" * len(restrict_ids))
+        ids = [r[0] for r in conn.execute(
+            f"SELECT id FROM papers WHERE {only} AND id IN ({placeholders})", restrict_ids,
+        )]
+        best = list(best_chunk_per_doc(conn, query_vector, ids).values())
+    else:
+        if not conn.execute(f"SELECT 1 FROM papers WHERE {only} LIMIT 1").fetchone():
+            return []
+        best_by_doc: dict[int, ChunkResult] = {}
+        for cr in chunk_search(conn, query_vector, limit=max(limit * 10, 200)):
+            if cr.doc_id not in best_by_doc:
+                best_by_doc[cr.doc_id] = cr  # KNN order: first is closest
+        if not best_by_doc:
+            return []
+        placeholders = ",".join("?" * len(best_by_doc))
+        keep = {r[0] for r in conn.execute(
+            f"SELECT id FROM papers WHERE {only} AND id IN ({placeholders})", list(best_by_doc),
+        )}
+        best = [cr for doc_id, cr in best_by_doc.items() if doc_id in keep]
+
+    best.sort(key=lambda cr: cr.score, reverse=True)
+    return [
+        SearchResult(
+            id=cr.doc_id, filename=cr.filename, path=cr.path, title=cr.title,
+            score=cr.score, has_markdown=True, has_embeddings=False,
+        )
+        for cr in best[:limit]
+    ]
+
+
 def hybrid_search(
     conn: sqlite3.Connection,
     query: str,
@@ -273,10 +321,14 @@ def hybrid_search(
         status["mode"] = "vector_fallback"
         status["fts_error"] = str(e)
 
-    # Get semantic results
+    # Get semantic results: paper vectors, plus best chunk for chunk-only papers
     sem_results = semantic_search(
         conn, query_vector, limit=fetch_limit, restrict_ids=restrict_ids, snippets=False,
     )
+    sem_results = sorted(
+        sem_results + _chunk_only_results(conn, query_vector, fetch_limit, restrict_ids),
+        key=lambda r: r.score, reverse=True,
+    )[:fetch_limit]
 
     # Build RRF scores and track component data
     rrf_scores: dict[int, float] = {}
