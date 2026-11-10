@@ -25,6 +25,8 @@ htmlcov/
 
 # Runtime data (the index lives in ~/.pdf-gantry, not in the repo)
 *.db
+*.db-shm
+*.db-wal
 *.faiss
 *.pkl
 

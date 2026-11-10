@@ -230,10 +230,11 @@ Zotero manages references; it does not give an agent chunk-level retrieval over 
 
 Most flat PDF folders carry almost no metadata, so `gantry enrich` backfills it from a scholarly index and writes it onto each paper (`title`, `authors`, `year`, `doi`, `abstract`). With metadata in place, `gantry link init` can generate a real `.bib`.
 
-It defaults to **OpenAlex**: no API key, broad coverage, and a "polite pool" that runs faster when requests carry your email. Set it once and every run uses it:
+It defaults to **OpenAlex**: broad coverage, and a "polite pool" that runs faster when requests carry your email. Without an API key OpenAlex gives each IP a small daily budget, enough for a trial batch but not a whole library, so for a full run get a free key and set it too. Set both once and every run uses them:
 
 ```bash
 gantry config set openalex_mailto you@example.com
+gantry config set openalex_api_key YOUR_KEY
 gantry enrich --dry-run        # how many papers would be touched
 gantry enrich --limit 20       # small batch to eyeball quality first
 gantry enrich                  # the whole library
@@ -244,6 +245,8 @@ For each paper it tries, in order: exact DOI lookup (from the `doi` column, else
 Semantic Scholar is still available with `--provider semantic-scholar`, but without an API key it rate-limits hard, which is why OpenAlex is the default. By default `enrich` only touches papers it has never tried; pass `--ids`, `--has`/`--needs`/`--is` filters or `--limit` to scope it.
 
 A paper the provider can't match is recorded as `metadata_source = 'none:<provider>'`, so "tried and missed" is distinguishable from "never tried". Misses aren't retried by default; `gantry enrich --retry-misses` re-attempts them, and `gantry queue --is enrich-miss` lists them. A lookup that fails on a network or API error leaves the paper untouched, so the next run tries it again.
+
+When OpenAlex answers with a rate limit (HTTP 429), `enrich` stops rather than recording the remaining papers as misses. Those papers stay untried for the next run, JSON reports `rate_limited: true`, and the exit code is 3.
 
 The title search queries with the layout title when a paper has one. Under `--retry-misses` a title hit must also be present in the document and resemble the layout title (similarity at least 0.75); anything else stays a miss and writes nothing, so a retry can't leave a wrong title behind. The DOI tier is unchanged. JSON `titled_ids` lists the papers that gained a title, and `rejected_title` counts the hits turned down.
 
@@ -366,7 +369,7 @@ gantry config show
 gantry config set papers_dir ~/Papers
 ```
 
-Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables override it (`GANTRY_PAPERS_DIR`, `GANTRY_INDEX_DIR`, `GANTRY_VAULT_DIR`, `GANTRY_OPENALEX_MAILTO`). The two settings that matter: `papers_dir`, any flat folder of PDFs, and optionally `vault_dir` for Obsidian cross-referencing. Set `openalex_mailto` to use OpenAlex's faster polite pool during `gantry enrich`.
+Config lives at `~/.gantry/config.yaml`; `GANTRY_*` environment variables override it (`GANTRY_PAPERS_DIR`, `GANTRY_INDEX_DIR`, `GANTRY_VAULT_DIR`, `GANTRY_OPENALEX_MAILTO`, `GANTRY_OPENALEX_API_KEY`). The two settings that matter: `papers_dir`, any flat folder of PDFs, and optionally `vault_dir` for Obsidian cross-referencing. Set `openalex_mailto` to use OpenAlex's faster polite pool during `gantry enrich`, and `openalex_api_key` for a daily budget large enough to enrich a whole library. `config show` never prints the key.
 
 ## How it works
 
