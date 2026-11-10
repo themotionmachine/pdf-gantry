@@ -147,12 +147,14 @@ Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 git clone https://github.com/themotionmachine/pdf-gantry.git
 cd pdf-gantry
 uv venv --python 3.11
-uv pip install -e ".[all]" --python .venv/bin/python
+uv pip install -e ".[embeddings]" --python .venv/bin/python
 
-.venv/bin/gantry config init    # point it at your PDF folder
+.venv/bin/gantry config set papers_dir ~/Papers   # your folder of PDFs
 .venv/bin/gantry pipeline       # ingest → extract text → embed
 .venv/bin/gantry search "your first query"
 ```
+
+`gantry config init` asks the same questions interactively; `config set` is the form an agent can run.
 
 The base install covers ingestion, extraction, and keyword search. Heavier features are opt-in extras:
 
@@ -162,6 +164,16 @@ uv pip install -e ".[ocr]"        # scanned PDFs (Surya)
 uv pip install -e ".[quality]"    # higher-quality extraction (Marker)
 uv pip install -e ".[all]"        # everything
 ```
+
+### Setting up with an agent
+
+You can point a coding agent at this repo and ask it to set gantry up. The Quickstart above is the whole procedure. A few things worth knowing before you do:
+
+- **Install `.[embeddings]`, not `.[all]`.** `all` adds the OCR (Surya) and Marker stacks, which are much larger and only matter for scanned PDFs or higher-quality extraction.
+- **The first run downloads the embedding model.** `pipeline` fetches Nomic Embed V2 (about 1.8 GB, plus its model code) from Hugging Face once. Embedding then runs locally. To make sure nothing reaches the network afterwards, set `HF_HUB_OFFLINE=1`.
+- **`pipeline` keeps documents on your machine.** It reads, extracts and embeds locally. Only `gantry enrich` (or `pipeline --enrich`) calls an outside service: it sends each paper's DOI, title and filename-derived author and year to OpenAlex. Skip it for confidential documents. It is also built for scholarly papers, so it won't find patents or legal filings.
+- **Whatever your agent reads, its model provider sees.** Gantry returns passages to the agent, and the agent sends them to its model. Decide that the same way you would for pasting the text in yourself.
+- **Check the result with a semantic query.** `gantry status` should show every paper with text and chunk embeddings, and `gantry search` should find a document by meaning, not only by its exact words.
 
 ## The agent contract
 
