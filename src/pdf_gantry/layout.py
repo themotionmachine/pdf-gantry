@@ -110,6 +110,9 @@ _MASTHEAD_END_RE = re.compile(r"journal homepage|homepage:\s*www", re.I)
 _PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
 _CHAPTER_PREFIX_RE = re.compile(r"^chapter title:\s*", re.I)  # JSTOR chapter covers
 _NUMBERED_CLAUSE_RE = re.compile(r"^\d+\.\s")
+_FEDERAL_REGISTER_RE = re.compile(r"Federal Register\s*/\s*Vol\.\s*\d+", re.I)
+# Bold lines in a Federal Register document's opening block that are not title.
+_FR_NOT_TITLE_RE = re.compile(r"^\[|^RIN\b|^\d+\s+CFR\b|^BILLING CODE\b", re.I)
 _EDGE_MARKS = " *†‡§¶"
 _AFFIL_MARK_RE = re.compile(r"\s+[a-z](?:,\s?[a-z*]+)*\*?(?=,|$)")
 _INITIAL_RE = re.compile(r"(?:^|\s)[A-Z]\.(?:\s|$)")
@@ -382,6 +385,43 @@ def _title_from_lines(lines: list[_Line], height: float, boilerplate) -> LayoutT
 
 
 
+def _federal_register_title(page) -> str | None:
+    """Title of the Federal Register document a PDF is for, or None.
+
+    A govinfo PDF starts on the page where its document begins, so page 1
+    often ends the previous document, and may hold a whole short one, before
+    ours starts. Ours is the last to start there. Each document opens with
+    one bold block: agency, docket or RIN line, title, then the AGENCY:
+    label. Lines are read in content order, which in these PDFs runs column
+    by column; sorting by height would interleave the columns.
+    """
+    lines: list[tuple[str, bool, float]] = []  # (text, bold, y)
+    for block in page.get_text("dict", flags=0)["blocks"]:
+        for line in block.get("lines", []):
+            spans = [s for s in line["spans"] if s["text"].strip()]
+            if not spans:
+                continue
+            text = " ".join("".join(s["text"] for s in spans).split())
+            bold = all(s["flags"] & 16 or "bold" in s["font"].lower() for s in spans)
+            lines.append((text, bold, line["bbox"][1]))
+    top = 0.1 * (page.rect.height or 792)
+    if not any(y < top and _FEDERAL_REGISTER_RE.search(t) for t, _, y in lines):
+        return None
+    starts = [i for i, (t, _, _) in enumerate(lines) if t.startswith("AGENCY:")]
+    if not starts:
+        return None
+    parts: list[str] = []
+    for text, bold, _ in reversed(lines[:starts[-1]]):
+        if not bold or text.isupper() or _FR_NOT_TITLE_RE.match(text):
+            break
+        parts.append(text)
+    title = ""
+    for part in reversed(parts):  # "AI-" + "Assisted" keeps its hyphen
+        title = f"{title}{part}" if title.endswith("-") or not title else f"{title} {part}"
+    title = clean_title(title)
+    return title if len(title) >= MIN_TITLE_CHARS else None
+
+
 def extract_layout_title(pdf_path: Path, boilerplate=frozenset()) -> LayoutTitle:
     """Pick a title from the first pages of a PDF.
 
@@ -399,6 +439,9 @@ def extract_layout_title(pdf_path: Path, boilerplate=frozenset()) -> LayoutTitle
     try:
         if doc.needs_pass or doc.page_count == 0:
             return LayoutTitle()
+        federal_register = _federal_register_title(doc[0])
+        if federal_register:
+            return LayoutTitle(federal_register, "high", 1)
         tried = 0
         covers = 0
         for number in range(min(doc.page_count, MAX_PAGES + MAX_COVER_PAGES)):

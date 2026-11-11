@@ -266,7 +266,7 @@ The title search queries with the layout title when a paper has one. Under `--re
 
 #### Layout titles
 
-About half the library has no provider metadata, so `gantry titles backfill` reads a title off the page: the largest text in the top 60% of page 1, skipping corpus boilerplate, cover sheets, labels, bylines and citation lines, and returning nothing for a garbled text layer. It writes `title_from_layout` and `title_layout_confidence` (`high` when the font stands out from the body text, else `low`).
+About half the library has no provider metadata, so `gantry titles backfill` reads a title off the page: the largest text in the top 60% of page 1, skipping corpus boilerplate, cover sheets, labels, bylines and citation lines, and returning nothing for a garbled text layer. It writes `title_from_layout` and `title_layout_confidence` (`high` when the font stands out from the body text, else `low`). Federal Register PDFs get their own rule: page 1 often ends the previous document, so the title comes from the bold block before the last `AGENCY:` label on that page.
 
 Treat it as an unverified hint. It scores 88% against bib titles (`eval/title_harness.py`), but those papers are the well-formed ones, and a blind sample of untitled papers scored far lower. So `title` keeps meaning verified metadata and is never filled from layout. `search`, `semantic`, `info` and `find` add `display_title` and `title_source` (`metadata`, `layout` or `filename`) to their JSON, plus `title_layout_confidence` when the source is layout; `--format oneline` and plain text show the same fallback. Keyword search indexes the layout title when a paper has no title, and `find` matches it one rank below a verified title. A `link check` match on a layout title is always `uncertain`.
 
