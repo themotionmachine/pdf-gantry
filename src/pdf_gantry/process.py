@@ -1,7 +1,9 @@
 """Text extraction and markdown conversion from PDFs."""
 
+import contextlib
 import logging
 import sqlite3
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -30,9 +32,54 @@ def extract_text_pymupdf(pdf_path: Path) -> tuple[str, str]:
     raw_text = "\n".join(raw_pages)
 
     # Markdown extraction — table_strategy="lines" handles booktabs-style tables
-    markdown = pymupdf4llm.to_markdown(str(pdf_path), table_strategy="lines")
+    with _parser_messages_captured():
+        markdown = pymupdf4llm.to_markdown(str(pdf_path), table_strategy="lines")
 
     return raw_text, markdown
+
+
+# Distinct PyMuPDF4LLM messages seen in this process since the last drain.
+_PARSER_MESSAGES: list[str] = []
+
+
+class _MessageSink:
+    """File-like sink that keeps each distinct non-blank message line once."""
+
+    def write(self, text: str) -> int:
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("===") and line not in _PARSER_MESSAGES:
+                _PARSER_MESSAGES.append(line)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _parser_messages_captured():
+    """
+    Keep PyMuPDF4LLM's chatter off stdout while it runs.
+
+    to_markdown announces its OCR engine on every call, through
+    pymupdf.message (stdout) after a bare print(). On stdout that corrupts
+    `--json`; once per PDF it makes a working run look stuck. Both are
+    collected here and reported once per run by process_documents.
+    """
+    previous = fitz._g_out_message
+    sink = _MessageSink()
+    fitz.set_messages(stream=sink)
+    try:
+        with contextlib.redirect_stdout(sink):
+            yield
+    finally:
+        fitz._g_out_message = previous
+
+
+def _drain_parser_messages() -> list[str]:
+    messages = list(_PARSER_MESSAGES)
+    _PARSER_MESSAGES.clear()
+    return messages
 
 
 # Module-level cache for Marker models (loaded once per worker process)
@@ -84,11 +131,24 @@ def _process_single(
     papers_dir: str,
     db_path: str,
     method: str,
-) -> tuple[int, bool, str | None]:
+) -> tuple[int, bool, str | None, list[str]]:
     """
     Process a single PDF. Runs in a worker process.
-    Returns (paper_id, success, error_message).
+    Returns (paper_id, success, error_message, parser_messages).
     """
+    paper_id, success, error = _process_single_inner(
+        paper_id, pdf_path, papers_dir, db_path, method,
+    )
+    return paper_id, success, error, _drain_parser_messages()
+
+
+def _process_single_inner(
+    paper_id: int,
+    pdf_path: str,
+    papers_dir: str,
+    db_path: str,
+    method: str,
+) -> tuple[int, bool, str | None]:
     from .db import get_connection
 
     try:
@@ -245,9 +305,10 @@ def process_documents(
     # Use workers=1 to run in-process for simplicity with small batches
     if workers <= 1:
         for row in rows:
-            pid, success, error = _process_single(
+            pid, success, error, messages = _process_single(
                 row["id"], row["path"], str(papers_dir), str(db_path), method
             )
+            _merge_messages(stats.parser_messages, messages)
             if success:
                 stats.succeeded += 1
                 succeeded_ids.append(pid)
@@ -266,7 +327,8 @@ def process_documents(
                 for row in rows
             }
             for future in as_completed(futures):
-                pid, success, error = future.result()
+                pid, success, error, messages = future.result()
+                _merge_messages(stats.parser_messages, messages)
                 if success:
                     stats.succeeded += 1
                     succeeded_ids.append(pid)
@@ -276,9 +338,18 @@ def process_documents(
                 if progress_callback:
                     progress_callback(completed, stats.total)
 
+    for message in stats.parser_messages:
+        print(f"PDF parser: {message}", file=sys.stderr)
+
     stats.layout_titled = _populate_layout_titles(conn, papers_dir, succeeded_ids)
     stats.elapsed_seconds = round(time.time() - start, 1)
     return stats
+
+
+def _merge_messages(into: list[str], messages: list[str]) -> None:
+    for message in messages:
+        if message not in into:
+            into.append(message)
 
 
 def _populate_layout_titles(conn, papers_dir: Path, paper_ids: list[int]) -> int:
