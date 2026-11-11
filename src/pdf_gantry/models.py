@@ -100,6 +100,8 @@ class ProcessStats:
     failed: int = 0
     elapsed_seconds: float = 0.0
     layout_titled: int = 0
+    # Distinct PyMuPDF4LLM messages from this run, in first-seen order.
+    parser_messages: list[str] = field(default_factory=list)
 
 
 @dataclass

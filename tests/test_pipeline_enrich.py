@@ -117,7 +117,7 @@ def test_run_pipeline_single_file_rerun_does_not_crash(tmp_path, papers_dir):
 def test_cli_pipeline_positional_file(env):
     r = CliRunner().invoke(cli, ["pipeline", "test_climate.pdf", "--json"])
     assert r.exit_code == 0, r.output
-    data = json.loads(r.output)
+    data = json.loads(r.stdout)
     assert data["processed"] == 1
     conn = _conn(env)
     names = [x[0] for x in conn.execute("SELECT filename FROM papers WHERE has_text = 1")]
@@ -131,7 +131,7 @@ def test_cli_pipeline_positional_full_path_inside_papers_dir(env, papers_dir):
         cli, ["pipeline", str(papers_dir / "test_climate.pdf"), "--json"]
     )
     assert r.exit_code == 0, r.output
-    assert json.loads(r.output)["processed"] == 1
+    assert json.loads(r.stdout)["processed"] == 1
 
 
 def test_cli_pipeline_path_outside_papers_dir_is_error(env, tmp_path, sample_pdf):
@@ -140,13 +140,13 @@ def test_cli_pipeline_path_outside_papers_dir_is_error(env, tmp_path, sample_pdf
     shutil.copy(sample_pdf, outside / "x.pdf")
     r = CliRunner().invoke(cli, ["pipeline", str(outside / "x.pdf"), "--json"])
     assert r.exit_code == 1
-    assert "papers directory" in json.loads(r.output)["error"]
+    assert "papers directory" in json.loads(r.stdout)["error"]
 
 
 def test_cli_pipeline_missing_file_is_error(env):
     r = CliRunner().invoke(cli, ["pipeline", "Nonexistent.pdf", "--json"])
     assert r.exit_code == 1, r.output
-    assert "not found" in json.loads(r.output)["error"].lower()
+    assert "not found" in json.loads(r.stdout)["error"].lower()
 
 
 def test_cli_pipeline_multiple_positional_files(env):
@@ -154,7 +154,7 @@ def test_cli_pipeline_multiple_positional_files(env):
         cli, ["pipeline", "test_climate.pdf", "ml_nlp_paper.pdf", "--json"]
     )
     assert r.exit_code == 0, r.output
-    data = json.loads(r.output)
+    data = json.loads(r.stdout)
     assert data["processed"] == 2
     assert len(data["files"]) == 2
     assert sorted(data["ids"]) == [1, 2]
@@ -167,7 +167,7 @@ def test_cli_pipeline_file_enrich_one_shot(env, monkeypatch):
         cli, ["pipeline", "--file", "test_climate.pdf", "--enrich", "--json"]
     )
     assert r.exit_code == 0, r.output
-    data = json.loads(r.output)
+    data = json.loads(r.stdout)
     assert data["enriched"] == 1
     assert data["enrich"]["matched"] == 1
     conn = _conn(env)
@@ -185,5 +185,5 @@ def test_cli_pipeline_file_enrich_skips_already_enriched(env, monkeypatch):
     CliRunner().invoke(cli, ["pipeline", "test_climate.pdf", "--enrich", "--json"])
     r = CliRunner().invoke(cli, ["pipeline", "test_climate.pdf", "--enrich", "--json"])
     assert r.exit_code == 0, r.output
-    assert json.loads(r.output)["enriched"] == 0
+    assert json.loads(r.stdout)["enriched"] == 0
     assert calls == ["test_climate.pdf"]

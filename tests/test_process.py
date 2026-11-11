@@ -185,7 +185,7 @@ def test_cli_process_default_sweep_skips_encrypted(
 
     result = CliRunner().invoke(cli, ["process", "--json"])
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     # Only the 2 normal papers are selected — the locked one is excluded,
     # not attempted-and-failed.
     assert data["total"] == 2
@@ -222,7 +222,7 @@ def test_cli_process_force_reselects_processed(tmp_path, papers_dir, monkeypatch
 
     r1 = runner.invoke(cli, ["process", "--json"])
     assert r1.exit_code == 0, r1.output
-    assert json.loads(r1.output)["succeeded"] >= 1
+    assert json.loads(r1.stdout)["succeeded"] >= 1
 
     # Everything is processed now — the default filter selects nothing.
     r2 = runner.invoke(cli, ["process", "--json"])
@@ -231,7 +231,7 @@ def test_cli_process_force_reselects_processed(tmp_path, papers_dir, monkeypatch
     # --force re-selects the already-processed papers.
     r3 = runner.invoke(cli, ["process", "--force", "--json"])
     assert r3.exit_code == 0, r3.output
-    data = json.loads(r3.output)
+    data = json.loads(r3.stdout)
     assert data["total"] >= 1
     assert data["succeeded"] >= 1
 
